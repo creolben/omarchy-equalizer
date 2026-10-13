@@ -241,15 +241,41 @@ auto_preamp_db() {
     '
 }
 
+# The most gain a hand-set preamp may hold for this band set: exactly the value
+# automatic headroom would pick, so the post-preamp peak still lands at 0 dBFS and
+# the limiter's -1 dBFS ceiling only ever sees the last dB. Anything above it is
+# gain the limiter has to remove on every sample, which is what "loud, flat and
+# grainy" sounds like -- and because the limiter hides it, the panel used to give
+# no clue at all. A cut-only curve has a ceiling of 0 dB: the preamp is headroom,
+# not a volume control, and Magic Boost is the stage that exists to make things
+# louder.
+preamp_ceiling_db() { auto_preamp_db "${1:-[]}"; }
+
+# Print a line to stderr when a value was clamped, so a hand-run command says what
+# it did rather than silently storing something else.
+clamp_warn() {
+  printf 'Preamp %s dB is above the headroom ceiling for this curve (%s dB); using %s dB.\n' \
+    "$1" "$2" "$2" >&2
+}
+
 # With headroom auto the preamp is not the user's to set: it is recomputed from
-# the bands on every change, so the chain's peak never exceeds 0 dB. Manual keeps
-# the stored value, which is what a hand-tuned profile expects. A state written
-# before the field existed reads as auto, the safe default.
+# the bands on every change. Manual keeps the stored value -- that is what a
+# hand-tuned profile expects -- but never above the curve's ceiling, so no edit
+# (band, mode, preset, import, reset) can leave the chain over its headroom. Every
+# command funnels through here, which is what makes that guarantee hold. A state
+# written before the field existed reads as auto, the safe default.
 apply_headroom() {
-  local state="$1" headroom
+  local state="$1" headroom ceiling preamp
   headroom="$(jq -r '.headroom // "auto"' <<<"$state")"
   if [[ $headroom == auto ]]; then
     state="$(jq -c --argjson p "$(auto_preamp_db "$(active_bands "$state")")" '.preamp = $p' <<<"$state")"
+  else
+    ceiling="$(preamp_ceiling_db "$(active_bands "$state")")"
+    preamp="$(jq -r '.preamp // 0' <<<"$state")"
+    if [[ $(jq -n --argjson p "$preamp" --argjson c "$ceiling" '$p > $c') == true ]]; then
+      clamp_warn "$preamp" "$ceiling"
+      state="$(jq -c --argjson p "$ceiling" '.preamp = $p' <<<"$state")"
+    fi
   fi
   printf '%s\n' "$state"
 }
@@ -269,21 +295,30 @@ preset_read() {
 }
 
 preset_list_json() {
-  local builtin_json='[]' name
+  local files=() builtin_json='[]'
   if [[ -d $builtin_presets ]]; then
     for f in "$builtin_presets"/*.json; do
       [[ -e $f ]] || continue
-      name="$(basename "$f" .json)"
-      builtin_json="$(jq -c --arg n "$name" '. + [{ name: $n, builtin: true }]' <<<"$builtin_json")"
+      files+=("$f")
     done
   fi
+  if ((${#files[@]})); then
+    # One jq for every built-in file, not one per file: the panel polls status
+    # while it is open, and a process per preset on every poll is a process storm.
+    # A built-in names itself in its own file, which is also what makes the list
+    # independent of how the file happens to be called.
+    builtin_json="$(jq -c -s '
+      map({ name: (.name // ""), description: (.description // null), order: (.order // 999) })
+      | map(select(.name != ""))' "${files[@]}")"
+  fi
   presets_ensure
-  # A user preset with the same name as a built-in never reaches here:
-  # save-preset refuses the collision, so the two lists cannot disagree.
+  # Built-ins first, in the order their files declare (Flat, tone, genre, speech,
+  # situation), then the user's own presets alphabetically. A user preset with a
+  # built-in's name never reaches here: save-preset refuses the collision.
   jq -c -n --argjson b "$builtin_json" --argjson u "$(cat "$user_presets")" '
-    (($b | map(.name)) + ($u | keys)) as $names
-    | ($names | unique | sort) as $sorted
-    | [ $sorted[] as $n | { name: $n, builtin: ($b | map(.name) | index($n) != null) } ]
+    ($b | sort_by(.order, .name) | map(. + { builtin: true }))
+    + ($u | keys | sort | map({ name: ., builtin: false,
+                                description: ($u[.].description // null), order: 999 }))
   '
 }
 
@@ -326,8 +361,7 @@ lsp_available() { [[ -f $lsp_dir/limiter_mono.ttl && -f $lsp_dir/mb_compressor_m
 boost_values() {
   local level="${1:-off}" enabled cr at rt mk
   local -a al
-  # The split is bass 0..200 Hz, mid 200..4000 Hz, treble 4000..20000 Hz; the
-  # disabled bands sit at the top so their range is empty.
+  # The split is bass 0..200 Hz, mid 200..4000 Hz, treble 4000..20000 Hz.
   local -a fre=(200 4000 20000 20000 20000 20000 20000 20000)
   local i bi ce
   case "$level" in
@@ -337,11 +371,27 @@ boost_values() {
     medium | *) enabled=1; al=(-24 -22 -22); cr=3; at=8; rt=120; mk=7 ;;
   esac
   printf 'enabled %s\nmode 1\nofe 0\nife 0\ng_in 1\ng_out 1\ndrywet 100\n' "$enabled"
+  # cbe_N ("Compression band enable N+1") is the toggle that actually splits the
+  # extra bands; the plugin's defaults alternate 0/1 across cbe_1..cbe_7, so
+  # without writing them the mid band folds into the bass band and the stage
+  # compresses ~10 Hz..4 kHz as one wide band. Band 1 always exists; the split
+  # needs cbe_1 and cbe_2 on, the rest off.
+  printf 'cbe_1 1\ncbe_2 1\ncbe_3 0\ncbe_4 0\ncbe_5 0\ncbe_6 0\ncbe_7 0\n'
   for ((i = 0; i < 8; i++)); do
     if ((i < 3)); then bi=$i; ce=1; else bi=2; ce=0; fi
-    printf 'ce_%d %s\nkn_%d %s\nal_%d %s\ncr_%d %s\nat_%d %s\nrt_%d %s\nmk_%d %s\nfre_%d %d\n' \
+    printf 'ce_%d %s\nkn_%d %s\nal_%d %s\ncr_%d %s\nat_%d %s\nrt_%d %s\nmk_%d %s\n' \
       "$i" "$ce" "$i" "$(db_to_mult -6)" "$i" "$(db_to_mult "${al[$bi]}")" \
-      "$i" "$cr" "$i" "$at" "$i" "$rt" "$i" "$(db_to_mult "$mk")" "$i" "${fre[$i]}"
+      "$i" "$cr" "$i" "$at" "$i" "$rt" "$i" "$(db_to_mult "$mk")"
+  done
+  # The crossover ladder: sf_N is "Split frequency N+1", the INPUT that ends band N.
+  # fre_N ("Frequency range end N") is an OUTPUT -- a value the plugin reports, not one
+  # it accepts -- so writing it did nothing except log eight "control can not be set"
+  # warnings at every start while the plugin kept its own default ladder, which put the
+  # three enabled compressors on 0..40, 40..100 and 100..252 Hz. The splits above the
+  # treble band sit at the top of the plugin's range, so those bands -- whose compressors
+  # are off -- have no width to act on.
+  for ((i = 0; i < 7; i++)); do
+    printf 'sf_%d %d\n' "$((i + 1))" "${fre[$i]}"
   done
 }
 
@@ -460,6 +510,20 @@ write_fragment() {
   mv "$fragment.tmp" "$fragment"
 }
 
+# The preamp and headroom are live controls, so a hand-set preamp used to live on
+# in the running graph while the fragment on disk still carried the value from the
+# last rebuild -- the config on disk did not describe what you were hearing, and a
+# later restart came up with a different chain. Rewrite the fragment with every
+# preamp change; it costs one file write, and the two can no longer disagree.
+sync_fragment() {
+  local state="$1" target
+  target="$(jq -r '.targetSink // ""' <<<"$state")"
+  # Keep an existing fragment in step; do not create one on a machine that has
+  # never been enabled, where there is no target to name and nothing to read it.
+  [[ -n $target || -f $fragment ]] || return 0
+  write_fragment "$state" "$target"
+}
+
 # The rate the graph instantiates the builtin biquads with. The response curve
 # needs it: 16 kHz sits much closer to Nyquist at 44.1 kHz than at 48 kHz, and
 # the curve is drawn from the same formulas the filters run.
@@ -576,9 +640,10 @@ sink_present() {
 
 # The physical output the equalizer should play into.
 current_default_sink() { pactl get-default-sink 2>/dev/null; }
-
-# Resolve through any DSP sink already in place (the Asahi speaker tuning, or an
-# earlier copy of this equalizer) down to the hardware output.
+# The physical output whose volume and mute the user really hears: resolve through
+# any DSP sink (the Asahi speaker tuning, an earlier EasyEffects) down to the
+# hardware it feeds. Used when the EQ is switched off and a default output has to
+# be restored to something that still exists.
 physical_output() {
   local sink
   sink="$(current_default_sink)"
@@ -591,7 +656,30 @@ physical_output() {
     resolved="$(omarchy-audio-output-sink 2>/dev/null)"
     [[ -n $resolved ]] && sink="$resolved"
   fi
-  [[ -z $sink ]] && sink="$(pactl list sinks short 2>/dev/null | awk '$2 !~ /^omarchy_equalizer/ {print $2; exit}')"
+  [[ -z $sink ]] && sink="$(first_output_sink)"
+  printf '%s\n' "$sink"
+}
+
+first_output_sink() {
+  pactl list sinks short 2>/dev/null | awk -v self="$sink_name" '$2 != self {print $2; exit}'
+}
+
+# Where the chain should play. A DSP sink that is already selected is a
+# destination, not something to resolve past: chaining in front of it keeps that
+# correction in the signal path, and the volume the user sees still lands on the
+# hardware underneath. Resolving through it to the hardware (which is what
+# physical_output and omarchy-audio-output-sink are for) would silently drop the
+# speaker tuning for as long as the equalizer was on -- on an Asahi laptop that is
+# the largest single improvement to the built-in speakers.
+chain_target() {
+  local sink
+  sink="$(current_default_sink)"
+  # While the equalizer is on, the default sink IS the equalizer; what it plays
+  # into is the remembered target, not itself.
+  if [[ $sink == "$sink_name" ]]; then
+    sink="$(state_read | jq -r '.targetSink // empty')"
+  fi
+  [[ -z $sink ]] && sink="$(first_output_sink)"
   printf '%s\n' "$sink"
 }
 
@@ -700,7 +788,7 @@ cmd_enable() {
   fi
 
   default="$(current_default_sink)"
-  target="$(physical_output)"
+  target="$(chain_target)"
   [[ -n $target ]] || die "No output sink to equalize."
 
   write_fragment "$state" "$target"
@@ -752,7 +840,7 @@ cmd_retarget() {
   sink_present || return 0
   default="$(current_default_sink)"
   [[ -n $default && $default != "$sink_name" ]] || return 0
-  target="$(physical_output)"
+  target="$(chain_target)"
   [[ -n $target && $target != "$sink_name" ]] || return 0
   state="$(jq -c --arg prev "$default" --arg tgt "$target" '.previousDefaultSink = $prev | .targetSink = $tgt' <<<"$state")"
   state_write "$state"
@@ -982,18 +1070,31 @@ cmd_reset() {
 
 # The preamp is one live control, so unlike a band's type it never needs a
 # restart -- only the multiplier changes. Setting it by hand is also how the user
-# takes over from automatic headroom.
+# takes over from automatic headroom, and the ceiling is what keeps that hand from
+# stacking gain the limiter then has to remove from every sample: the stored value
+# is clamped to the curve's own headroom (see apply_headroom) and the command says
+# so on stderr instead of silently storing something else.
 cmd_set_preamp() {
-  local db="${1:-0}" state
+  local db="${1:-0}" state ceiling
   need_number "$db"
   state="$(state_read)"
+  ceiling="$(preamp_ceiling_db "$(active_bands "$state")")"
+  if [[ $(jq -n --argjson v "$db" --argjson c "$ceiling" '$v > $c') == true ]]; then
+    clamp_warn "$db" "$ceiling"
+    db="$ceiling"
+  fi
   state="$(jq -c --argjson v "$db" '.preamp = $v | .headroom = "manual"' <<<"$state")"
   state_write "$state"
+  # The preamp is live-only, so the fragment on disk would otherwise keep the
+  # value from the last rebuild and a later restart would come up on a different
+  # chain than the one that was tuned.
+  sync_fragment "$state"
   if sink_present; then live_apply_preamp "$db" || true; fi
 }
 
 # Switching back to auto recomputes the preamp from the bands and pushes the new
-# multiplier live; manual only stores the label, because the preamp does not move.
+# multiplier live; manual only stores the label and enforces the ceiling, because
+# the preamp does not move on its own.
 cmd_set_headroom() {
   local value="${1:-}" state
   case "$value" in
@@ -1002,11 +1103,10 @@ cmd_set_headroom() {
   esac
   state="$(state_read)"
   state="$(jq -c --arg v "$value" '.headroom = $v' <<<"$state")"
-  if [[ $value == auto ]]; then
-    state="$(apply_headroom "$state")"
-  fi
+  state="$(apply_headroom "$state")"
   state_write "$state"
-  if [[ $value == auto ]] && sink_present; then
+  sync_fragment "$state"
+  if sink_present; then
     live_apply_preamp "$(jq -r '.preamp // 0' <<<"$state")" || true
   fi
 }
@@ -1031,6 +1131,9 @@ cmd_set_limiter() {
   state="$(state_read)"
   state="$(jq -c --arg v "$value" '.limiter = $v' <<<"$state")"
   state_write "$state"
+  # Like the preamp, the toggle is live-only: rewrite the fragment so a restart
+  # does not resurrect the value from the last graph rebuild.
+  sync_fragment "$state"
   if ! lsp_available; then
     lsp_inactive_warn
   elif sink_present; then
@@ -1047,6 +1150,7 @@ cmd_set_boost() {
   state="$(state_read)"
   state="$(jq -c --arg v "$value" '.boost = $v' <<<"$state")"
   state_write "$state"
+  sync_fragment "$state" # as for the limiter: live-only, keep the fragment in step
   if ! lsp_available; then
     lsp_inactive_warn
   elif sink_present; then
@@ -1259,6 +1363,10 @@ cmd_status() {
       headroom: ($s.headroom // "auto"),
       preamp: ($s.preamp // 0),
       autoPreamp: $ap,
+      # The most gain manual headroom may hold for these bands. Same number as
+      # autoPreamp by construction (preamp_ceiling_db is auto_preamp_db), named
+      # separately because the panel uses it as the upper bound of the slider.
+      preampCeiling: $ap,
       limiter: ($s.limiter // "on"),
       boost: ($s.boost // "off"),
       outputStage: $oa,

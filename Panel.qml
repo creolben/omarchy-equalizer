@@ -22,7 +22,15 @@ Panel {
   property Item anchorItem: null
   property QtObject hostWidget: null
 
-  readonly property string helper: "omarchy-equalizer"
+  // The backend that ships with this plugin, addressed where the plugin system
+  // installs it: ~/.config/omarchy/plugins/<id>/bin/omarchy-equalizer. Resolving
+  // it here (rather than taking whatever `omarchy-equalizer` PATH finds) is what
+  // makes `omarchy plugin add <url>` a complete install -- no symlink step, and
+  // the panel always drives the backend that belongs to the QML it is drawn by.
+  // install.sh still links the same file into ~/.local/bin for terminal use, but
+  // the panel does not depend on it.
+  readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/" + moduleName
+  readonly property string helper: pluginDir + "/bin/omarchy-equalizer"
 
   property var status: null
   property bool busy: false
@@ -42,9 +50,17 @@ Panel {
   readonly property var bands: status ? (status.bands || []) : []
   readonly property var presets: status ? (status.presets || []) : []
   readonly property int paramCount: status ? Number(status.parametricCount || 0) : 0
+  readonly property int graphicCount: status ? Number(status.graphicCount || 0) : 0
   readonly property bool sinkPresent: status ? status.sinkPresent === true : false
   readonly property string targetSink: status ? String(status.targetSink || "") : ""
   readonly property real preamp: status ? Number(status.preamp || 0) : 0
+  // The most gain a hand-set preamp may hold for this curve: the backend computes
+  // it (same function as its automatic headroom) and clamps every manual write to
+  // it. The local copy tracks a band drag instantly, the backend's field is the
+  // authority both sides have to agree on, so the smaller wins and neither can
+  // offer gain the backend would refuse.
+  readonly property real backendPreampCeiling: (status && status.preampCeiling !== undefined) ? Number(status.preampCeiling) : 0
+  readonly property real preampMax: Math.max(-23.5, Math.min(autoPreamp, backendPreampCeiling))
   // Gain staging and the output stage, all owned by the backend. Missing
   // fields read as the backend defaults (auto headroom, limiter on, boost off).
   readonly property string headroom: status ? String(status.headroom || "auto") : "auto"
@@ -56,20 +72,61 @@ Panel {
   readonly property int sampleRate: status ? Number(status.sampleRate || 48000) : 48000
 
   // The peak of the *shape* -- the line the handles sit on, measured with the
-  // preamp at zero -- with the preamp named next to it, because those two are
-  // what decide whether a boost can clip. A post-preamp peak would read "no
-  // boost" on a curve that visibly boosts.
+  // preamp at zero -- with the preamp named next to it, and then where the two
+  // together land the signal at the limiter's input. That last number is the one
+  // that matters: while the limiter is on it is the worst-case gain reduction, and
+  // it is what the limiter would otherwise hide. A chain holding +15 dB over the
+  // ceiling sounds loud, flat and grainy and never reports a clip, because the
+  // limiter is doing exactly its job.
+  readonly property real postPreampPeak: status
+    ? Model.peakDb(bands, 0, sampleRate).db + preamp
+    : 0
+  // -1 dBFS is the limiter's ceiling (see limiter_values in the backend); anything
+  // above it is removed on every sample. Automatic headroom leaves at most 1 dB by
+  // construction (it targets 0 dBFS), so only more than that is worth a warning --
+  // which is what a preamp stacked above the curve's own headroom looks like.
+  readonly property real limiterWarnDb: 2
+  readonly property real limiterDucking: Math.max(0, postPreampPeak + 1)
   readonly property string peakSummary: {
     if (!status) return ""
     if (!enabled) return "BYPASSED"
     var peak = Model.peakDb(bands, 0, sampleRate)
+    var text
     if (peak.db <= 0.05)
-      return Math.abs(preamp) >= 0.25
-        ? "PEAK \u2264 0 dB · PREAMP " + preamp.toFixed(1)
+      text = Math.abs(preamp) >= 0.25
+        ? "PEAK \u2264 0 dB \u00b7 PREAMP " + preamp.toFixed(1)
         : "NO BOOST"
-    var text = "+" + peak.db.toFixed(1) + " dB PEAK AT " + Model.formatFreq(peak.freq) + " HZ"
-    if (Math.abs(preamp) >= 0.25) text += " · PREAMP " + (preamp > 0 ? "+" : "") + preamp.toFixed(1)
+    else {
+      text = "+" + peak.db.toFixed(1) + " dB PEAK AT " + Model.formatFreq(peak.freq) + " HZ"
+      if (Math.abs(preamp) >= 0.25) text += " \u00b7 PREAMP " + (preamp > 0 ? "+" : "") + preamp.toFixed(1)
+    }
+    if (limiter === "on" && limiterDucking >= limiterWarnDb)
+      text += " \u00b7 LIMITER \u2212" + limiterDucking.toFixed(1) + " dB"
     return text
+  }
+
+  // Scale marks under the preamp slider. The ceiling is the slider's top, so the
+  // marks follow the range: a +12 mark on a slider that stops at -6.5 dB would be
+  // a lie, and the mark at the ceiling is the one worth looking at.
+  readonly property var preampMarks: {
+    var max = preampMax
+    var marks = []
+    var candidates = [-24, -12, 0]
+    for (var i = 0; i < candidates.length; i++)
+      if (candidates[i] <= max) marks.push(candidates[i])
+    if (max < 0) marks.push(max)
+    var out = []
+    for (var j = 0; j < marks.length; j++) {
+      var db = marks[j]
+      var ceiling = (db === max && max < 0)
+      out.push({
+        db: db,
+        f: (db + 24) / (max + 24),
+        ceiling: ceiling,
+        label: ceiling ? db.toFixed(1) : ((db > 0 ? "+" : "") + db)
+      })
+    }
+    return out
   }
 
   // AutoEq import: a query, whatever the profile index matched, and a line of
@@ -106,6 +163,70 @@ Panel {
   // children cannot reach, so it is exposed here for the headless harness (and
   // for anything else that needs to drive the curve without a pointer).
   readonly property var responseCurve: responseCurveItem
+
+  // Fold state of the sections is presentation state, so it lives in a small
+  // JSON file beside the other panels' settings (the weather/notifications
+  // FileView idiom), not in the backend's state.json -- a backend command for
+  // "the preset list is folded" would be clutter. QML Settings is unusable in
+  // quickshell anyway: the process sets no organizationName, so it warns and
+  // never persists.
+  property bool modeCollapsed: false
+  property bool responseCollapsed: false
+  property bool bandsCollapsed: false
+  property bool preampCollapsed: false
+  property bool outputCollapsed: false
+  property bool presetCollapsed: false
+  property bool autoeqCollapsed: false
+  property bool uiStateLoaded: false
+
+  FileView {
+    id: uiStateFile
+    path: Quickshell.env("HOME") + "/.local/state/omarchy/settings/equalizer-panel.json"
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadUiState(text())
+    onLoadFailed: root.loadUiState("")
+  }
+
+  Process {
+    command: ["mkdir", "-p", Quickshell.env("HOME") + "/.local/state/omarchy/settings"]
+    running: true
+  }
+
+  function loadUiState(raw) {
+    // Fires once per shell start; a later toggle rewrites the file ourselves,
+    // so a second load after that must not stomp the user's newer choice.
+    if (uiStateLoaded) return
+    uiStateLoaded = true
+    if (raw === "") return
+    try {
+      var parsed = JSON.parse(raw)
+      var keys = ["modeCollapsed", "responseCollapsed", "bandsCollapsed",
+                  "preampCollapsed", "outputCollapsed", "presetCollapsed", "autoeqCollapsed"]
+      for (var i = 0; i < keys.length; i++)
+        if (parsed && typeof parsed[keys[i]] === "boolean") root[keys[i]] = parsed[keys[i]]
+    } catch (e) { }
+  }
+
+  function setCollapsed(key, value) {
+    root[key] = value
+    if (uiStateLoaded) uiStateSaveTimer.restart()
+  }
+
+  Timer {
+    id: uiStateSaveTimer
+    interval: 200
+    repeat: false
+    onTriggered: uiStateFile.setText(JSON.stringify({
+      modeCollapsed: root.modeCollapsed,
+      responseCollapsed: root.responseCollapsed,
+      bandsCollapsed: root.bandsCollapsed,
+      preampCollapsed: root.preampCollapsed,
+      outputCollapsed: root.outputCollapsed,
+      presetCollapsed: root.presetCollapsed,
+      autoeqCollapsed: root.autoeqCollapsed
+    }, null, 2) + "\n")
+  }
 
   function refresh() {
     // Not while an action is running: the backend's writes are in flight, and a
@@ -174,15 +295,16 @@ Panel {
   }
 
   function commitPreamp(db) {
-    preampPending = Model.clamp(db, -24, 12)
+    preampPending = Model.clamp(db, -24, preampMax)
     preampCommitTimer.restart()
   }
 
   function sendPreampNow(db) {
     // PanelSlider only snaps when `integer` is set, so a drag hands over raw
     // positions like -8.7079. Snap to the slider's 0.5 dB step here, the one
-    // place every preamp write passes through.
-    var value = Math.round(Model.clamp(db, -24, 12) * 2) / 2
+    // place every preamp write passes through -- and hold the curve's ceiling,
+    // so the panel never asks the backend for gain it will refuse.
+    var value = Math.round(Model.clamp(db, -24, preampMax) * 2) / 2
     // A hand-set preamp is the backend's cue to stop tracking the curve.
     withStatus({ preamp: value, headroom: "manual" })
     run(["set-preamp", String(value)])
@@ -348,6 +470,21 @@ Panel {
       })
     }
     return options
+  }
+
+  // What the loaded preset actually does. Every built-in carries the line in its
+  // own file, which is the only place its curve is written down in words; a user
+  // preset has no prose, so the caption falls back to the shape of the chain.
+  // Worth the row: the list is otherwise a loudness comparison, and every
+  // built-in now lands within about 2 dB of Flat, so what changed is the tone.
+  readonly property string presetDescription: {
+    for (var i = 0; i < presets.length; i++) {
+      var p = presets[i]
+      if (p && p.name === preset && p.description) return String(p.description)
+    }
+    var n = mode === "parametric" ? paramCount : graphicCount
+    return n + (n === 1 ? " band \u00b7 " : " bands \u00b7 ")
+      + (mode === "parametric" ? "parametric" : "graphic")
   }
 
   onOpenedChanged: {
@@ -617,9 +754,14 @@ Panel {
           PanelSeparator { foreground: root.barForeground }
 
           // ---------- Mode ----------
-          Column {
+          CollapsibleSection {
             width: parent.width
-            spacing: Style.space(6)
+            title: "MODE"
+            meta: root.mode === "parametric" ? "PARAMETRIC" : "10-BAND"
+            foreground: root.barForeground
+            fontFamily: root.barFontFamily
+            collapsed: root.modeCollapsed
+            onToggleRequested: root.setCollapsed("modeCollapsed", !root.modeCollapsed)
 
             // The mode control owns its own row: side by side with its caption
             // the segmented track squeezed the text into an ellipsis.
@@ -658,35 +800,21 @@ Panel {
           // The curve the whole chain draws, from the same biquad formulas the
           // running filter-chain uses. It is the control as well as the readout:
           // a handle sets a band's gain, and its frequency in parametric mode.
-          Column {
+          CollapsibleSection {
             width: parent.width
-            spacing: Style.space(4)
-
-            Item {
-              width: parent.width
-              implicitHeight: Math.max(responseHeader.implicitHeight, peakLabel.implicitHeight)
-
-              PanelSectionHeader {
-                id: responseHeader
-                text: "RESPONSE"
-                foreground: root.barForeground
-                fontFamily: root.barFontFamily
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-              }
-
-              Text {
-                id: peakLabel
-                textFormat: Text.PlainText
-                text: root.peakSummary
-                color: Qt.darker(root.barForeground, 1.4)
-                font.family: root.barFontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-              }
-            }
+            gap: Style.space(4)
+            title: "RESPONSE"
+            meta: root.peakSummary
+            // Red once the limiter is really working: that is the operating
+            // point the peak meter downstream cannot show, because by then the
+            // peaks are gone.
+            metaColor: (root.enabled && root.limiter === "on" && root.limiterDucking >= root.limiterWarnDb)
+              ? Color.urgent
+              : Qt.darker(root.barForeground, 1.4)
+            foreground: root.barForeground
+            fontFamily: root.barFontFamily
+            collapsed: root.responseCollapsed
+            onToggleRequested: root.setCollapsed("responseCollapsed", !root.responseCollapsed)
 
             ResponseCurve {
               id: responseCurveItem
@@ -722,20 +850,22 @@ Panel {
           }
 
           // ---------- Bands ----------
-          Item {
+          // Graphic: the ten faders are part of the response console above, so
+          // this section exists for parametric mode only -- a row per band,
+          // because a band's type, frequency and Q are as much of the sound as
+          // its gain (the same four Audio Hijack's Parametric EQ block exposes).
+          CollapsibleSection {
             visible: root.mode === "parametric"
             width: parent.width
-            implicitHeight: parametricColumn.implicitHeight
+            title: "BANDS"
+            meta: String(root.paramCount) + " " + (root.paramCount === 1 ? "BAND" : "BANDS")
+            foreground: root.barForeground
+            fontFamily: root.barFontFamily
+            collapsed: root.bandsCollapsed
+            onToggleRequested: root.setCollapsed("bandsCollapsed", !root.bandsCollapsed)
 
-            // Graphic: the ten faders are part of the response console above, so
-            // this section exists for parametric mode only.
-            //
-            // Parametric: a row per band, because a band's type, frequency and Q
-            // are as much of the sound as its gain -- the same four controls
-            // Audio Hijack's Parametric EQ block exposes per band.
             Column {
               id: parametricColumn
-              visible: root.mode === "parametric"
               width: parent.width
               spacing: Style.space(6)
 
@@ -784,52 +914,29 @@ Panel {
           // ---------- Preamp ----------
           // A profile's bands and its preamp only make sense together, so the
           // preamp sits directly under the bands rather than with the presets.
-          Column {
+          CollapsibleSection {
             width: parent.width
-            spacing: Style.space(6)
+            title: "PREAMPLIFIER"
+            meta: (root.preamp > 0 ? "+" : "") + Number(root.preamp).toFixed(1) + " dB"
+            foreground: root.barForeground
+            fontFamily: root.barFontFamily
+            collapsed: root.preampCollapsed
+            onToggleRequested: root.setCollapsed("preampCollapsed", !root.preampCollapsed)
 
-            Item {
-              width: parent.width
-              implicitHeight: Math.max(preampHeader.implicitHeight, preampValue.implicitHeight, autoPreampButton.implicitHeight)
-
-              PanelSectionHeader {
-                id: preampHeader
-                text: "PREAMPLIFIER"
-                foreground: root.barForeground
-                fontFamily: root.barFontFamily
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-              }
-
-              Text {
-                id: preampValue
-                textFormat: Text.PlainText
-                text: (root.preamp > 0 ? "+" : "") + Number(root.preamp).toFixed(1) + " dB"
-                color: Qt.darker(root.barForeground, 1.4)
-                font.family: root.barFontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                anchors.right: autoPreampButton.left
-                anchors.rightMargin: Style.space(10)
-                anchors.verticalCenter: parent.verticalCenter
-              }
-
-              // Sets the preamp to cancel the curve's peak. Dimmed when the
-              // preamp already matches, so it doubles as a 'you are safe' cue.
-              Button {
-                id: autoPreampButton
-                readonly property bool autoOn: root.headroom === "auto"
-                text: autoOn ? "Auto \u00b7 on" : "Auto \u00b7 off"
-                bordered: true
-                foreground: autoOn ? Color.accent : root.barForeground
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                enabled: !root.busy
-                tooltipText: autoOn
-                  ? "Headroom is automatic: the preamp follows the curve's peak. Click to set it by hand."
-                  : "Make headroom automatic (" + root.autoPreamp.toFixed(1) + " dB for this curve)"
-                onClicked: root.setHeadroom(autoOn ? "manual" : "auto")
-              }
+            // Sets the preamp to cancel the curve's peak. On the header line, so
+            // a folded section can still hand control back to auto. Dimmed when
+            // the preamp already matches, so it doubles as a 'you are safe' cue.
+            accessory: Button {
+              id: autoPreampButton
+              readonly property bool autoOn: root.headroom === "auto"
+              text: autoOn ? "Auto \u00b7 on" : "Auto \u00b7 off"
+              bordered: true
+              foreground: autoOn ? Color.accent : root.barForeground
+              enabled: !root.busy
+              tooltipText: autoOn
+                ? "Headroom is automatic: the preamp follows the curve's peak. Click to set it by hand."
+                : "Make headroom automatic (" + root.autoPreamp.toFixed(1) + " dB for this curve)"
+              onClicked: root.setHeadroom(autoOn ? "manual" : "auto")
             }
 
             PanelSlider {
@@ -837,9 +944,14 @@ Panel {
               width: parent.width
               bar: root.bar
               minimum: -24
-              maximum: 12
+              // The curve's own headroom is the top of the range: more gain than
+              // that is gain the limiter would have to remove from every sample.
+              maximum: root.preampMax
               step: 0.5
-              tickCount: 4
+              // No notches of its own: they would be evenly spaced while the only
+              // meaningful marks (0 dB and the ceiling) are not, and the labelled
+              // scale below already sits on this range.
+              tickCount: 0
               value: root.preamp
               opacity: root.enabled ? 1.0 : 0.5
               onMoved: function(v) { root.commitPreamp(v) }
@@ -847,22 +959,23 @@ Panel {
               onRightClicked: root.sendPreampNow(0)
             }
 
-            // Scale under the slider: the range is asymmetric (-24..+12), so
-            // without marks a 0 dB knob two-thirds along reads as a bug.
+            // Scale under the slider, on the slider's own range: with the ceiling
+            // as the top, the marks and their positions follow from it (see
+            // preampMarks). The mark at the ceiling is the one worth reading.
             Item {
               id: preampScale
               width: parent.width
               implicitHeight: Style.font.caption + Style.space(2)
               Repeater {
-                model: [ { db: -24, f: 0 }, { db: -12, f: 1/3 }, { db: 0, f: 2/3 }, { db: 12, f: 1 } ]
+                model: root.preampMarks
                 Text {
                   required property var modelData
                   textFormat: Text.PlainText
-                  text: (modelData.db > 0 ? "+" : "") + modelData.db
-                  color: Qt.darker(root.barForeground, modelData.db === 0 ? 1.2 : 1.7)
+                  text: modelData.label
+                  color: Qt.darker(root.barForeground, modelData.ceiling ? 1.2 : 1.7)
                   font.family: root.barFontFamily
                   font.pixelSize: Style.font.caption
-                  font.bold: modelData.db === 0
+                  font.bold: modelData.ceiling
                   x: Math.max(0, Math.min(preampScale.width - implicitWidth, preampScale.width * modelData.f - implicitWidth / 2))
                 }
               }
@@ -870,7 +983,8 @@ Panel {
 
             Text {
               textFormat: Text.PlainText
-              text: "Cancels boosts so they cannot clip. Auto keeps it matched to the curve's peak; moving the slider switches to manual."
+              text: "Cancels boosts so they cannot clip. Auto keeps it matched to the curve's peak; moving the slider switches to manual, and manual cannot go past that peak: "
+                + (root.preampMax < 0 ? root.preampMax.toFixed(1) + " dB for this curve." : "there is nothing to cancel while the curve has no boost.")
               color: Qt.darker(root.barForeground, 1.6)
               font.family: root.barFontFamily
               font.pixelSize: Style.font.caption
@@ -886,16 +1000,17 @@ Panel {
           // nothing after it can clip, and Magic Boost, a compressor with makeup
           // gain for quiet material. Both always sit in the graph and are switched
           // by their enabled controls, so neither ever restarts the chain.
-          Column {
+          CollapsibleSection {
             width: parent.width
-            spacing: Style.space(8)
+            gap: Style.space(8)
+            bodySpacing: Style.space(8)
             opacity: root.outputStage ? (root.enabled ? 1.0 : 0.5) : 0.4
-
-            PanelSectionHeader {
-              text: "OUTPUT"
-              foreground: root.barForeground
-              fontFamily: root.barFontFamily
-            }
+            title: "OUTPUT"
+            meta: "LIMITER " + (root.limiter === "on" ? "ON" : "OFF") + " \u00b7 BOOST " + String(root.boost).toUpperCase()
+            foreground: root.barForeground
+            fontFamily: root.barFontFamily
+            collapsed: root.outputCollapsed
+            onToggleRequested: root.setCollapsed("outputCollapsed", !root.outputCollapsed)
 
             Item {
               width: parent.width
@@ -970,34 +1085,26 @@ Panel {
           PanelSeparator { foreground: root.barForeground }
 
           // ---------- Presets ----------
-          Column {
+          CollapsibleSection {
             width: parent.width
-            spacing: Style.space(8)
+            gap: Style.space(8)
+            bodySpacing: Style.space(8)
+            title: "PRESET"
+            meta: String(root.preset).toUpperCase()
+            foreground: root.barForeground
+            fontFamily: root.barFontFamily
+            collapsed: root.presetCollapsed
+            onToggleRequested: root.setCollapsed("presetCollapsed", !root.presetCollapsed)
 
-            Item {
-              width: parent.width
-              implicitHeight: Math.max(presetHeader.implicitHeight, resetButton.implicitHeight)
-
-              PanelSectionHeader {
-                id: presetHeader
-                text: "PRESET"
-                foreground: root.barForeground
-                fontFamily: root.barFontFamily
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-              }
-
-              Button {
-                id: resetButton
-                text: "Reset"
-                iconText: "󰑐"
-                bordered: true
-                foreground: root.barForeground
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                tooltipText: "Flatten every band in this mode"
-                onClicked: root.resetBands()
-              }
+            // Reset stays on the header line, reachable while the list is folded.
+            accessory: Button {
+              id: resetButton
+              text: "Reset"
+              iconText: "󰑐"
+              bordered: true
+              foreground: root.barForeground
+              tooltipText: "Flatten every band in this mode"
+              onClicked: root.resetBands()
             }
 
             // Uncaptioned dropdown fills the row; the delete button takes the
@@ -1055,6 +1162,18 @@ Panel {
               }
             }
 
+            // One line on what the loaded preset does, so the list explains
+            // itself instead of being a set of names to audition.
+            Text {
+              textFormat: Text.PlainText
+              text: root.presetDescription
+              color: Qt.darker(root.barForeground, 1.6)
+              font.family: root.barFontFamily
+              font.pixelSize: Style.font.caption
+              width: parent.width
+              elide: Text.ElideRight
+            }
+
             Row {
               width: parent.width
               spacing: Style.space(6)
@@ -1083,105 +1202,107 @@ Panel {
               }
             }
 
+          }
 
-            PanelSeparator { foreground: root.barForeground }
+          PanelSeparator { foreground: root.barForeground }
 
-            // ---------- AutoEq ----------
-            // AutoEq publishes measured headphone corrections; importing one
-            // replaces the parametric bands and the preamp together.
-            Column {
+          // ---------- AutoEq ----------
+          // AutoEq publishes measured headphone corrections; importing one
+          // replaces the parametric bands and the preamp together.
+          CollapsibleSection {
+            width: parent.width
+            title: "AUTOEQ"
+            meta: "HEADPHONE PROFILES"
+            foreground: root.barForeground
+            fontFamily: root.barFontFamily
+            gap: Style.space(8)
+            bodySpacing: Style.space(8)
+            collapsed: root.autoeqCollapsed
+            onToggleRequested: root.setCollapsed("autoeqCollapsed", !root.autoeqCollapsed)
+
+
+            Row {
               width: parent.width
-              spacing: Style.space(8)
+              spacing: Style.space(6)
 
-              PanelSectionHeader {
-                text: "AUTOEQ"
+              TextField {
+                id: autoeqField
+                width: parent.width - autoeqSearchButton.width - Style.space(6)
+                placeholderText: "Headphone model…"
+                text: root.autoeqQuery
                 foreground: root.barForeground
-                fontFamily: root.barFontFamily
+                onTextChanged: root.autoeqQuery = text
+                Keys.onReturnPressed: root.searchAutoEq()
+                Keys.onEnterPressed: root.searchAutoEq()
               }
 
-              Row {
-                width: parent.width
-                spacing: Style.space(6)
-
-                TextField {
-                  id: autoeqField
-                  width: parent.width - autoeqSearchButton.width - Style.space(6)
-                  placeholderText: "Headphone model…"
-                  text: root.autoeqQuery
-                  foreground: root.barForeground
-                  onTextChanged: root.autoeqQuery = text
-                  Keys.onReturnPressed: root.searchAutoEq()
-                  Keys.onEnterPressed: root.searchAutoEq()
-                }
-
-                Button {
-                  id: autoeqSearchButton
-                  text: "Search"
-                  iconText: "󰍉"
-                  bordered: true
-                  foreground: root.barForeground
-                  enabled: !root.autoeqBusy
-                  anchors.verticalCenter: autoeqField.verticalCenter
-                  onClicked: root.searchAutoEq()
-                }
-              }
-
-              Dropdown {
-                id: autoeqDropdown
-                visible: root.autoeqResults.length > 0
-                height: visible ? implicitHeight : 0
-                label: "Profiles"
-                width: parent.width
-                value: ""
-                options: root.autoeqOptions()
+              Button {
+                id: autoeqSearchButton
+                text: "Search"
+                iconText: "󰍉"
+                bordered: true
                 foreground: root.barForeground
-                // The value carries name and path: two sources can measure the
-                // same headphone, and the source is what tells them apart.
-                onChanged: function(v) {
-                  var parts = String(v).split("||")
-                  root.importAutoEq(parts[0], parts[1])
-                }
-              }
-
-              Row {
-                width: parent.width
-                spacing: Style.space(6)
-
-                Button {
-                  id: autoeqImportButton
-                  text: "Import best match"
-                  iconText: "󰇚"
-                  bordered: true
-                  selected: true
-                  foreground: root.barForeground
-                  enabled: !root.busy && String(root.autoeqQuery || "").trim() !== ""
-                  onClicked: root.importAutoEqQuery()
-                }
-
-                Text {
-                  textFormat: Text.PlainText
-                  visible: root.autoeqMessage !== ""
-                  text: root.autoeqMessage
-                  color: Qt.darker(root.barForeground, 1.4)
-                  font.family: root.barFontFamily
-                  font.pixelSize: Style.font.caption
-                  anchors.verticalCenter: autoeqImportButton.verticalCenter
-                  elide: Text.ElideRight
-                  width: Math.max(0, parent.width - autoeqImportButton.width - Style.space(6))
-                }
+                enabled: !root.autoeqBusy
+                anchors.verticalCenter: autoeqField.verticalCenter
+                onClicked: root.searchAutoEq()
               }
             }
 
-            Text {
-              textFormat: Text.PlainText
-              visible: root.error !== ""
-              text: root.error
-              color: Color.urgent
-              font.family: root.barFontFamily
-              font.pixelSize: Style.font.caption
+            Dropdown {
+              id: autoeqDropdown
+              visible: root.autoeqResults.length > 0
+              height: visible ? implicitHeight : 0
+              label: "Profiles"
               width: parent.width
-              wrapMode: Text.WordWrap
+              value: ""
+              options: root.autoeqOptions()
+              foreground: root.barForeground
+              // The value carries name and path: two sources can measure the
+              // same headphone, and the source is what tells them apart.
+              onChanged: function(v) {
+                var parts = String(v).split("||")
+                root.importAutoEq(parts[0], parts[1])
+              }
             }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Button {
+                id: autoeqImportButton
+                text: "Import best match"
+                iconText: "󰇚"
+                bordered: true
+                selected: true
+                foreground: root.barForeground
+                enabled: !root.busy && String(root.autoeqQuery || "").trim() !== ""
+                onClicked: root.importAutoEqQuery()
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                visible: root.autoeqMessage !== ""
+                text: root.autoeqMessage
+                color: Qt.darker(root.barForeground, 1.4)
+                font.family: root.barFontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: autoeqImportButton.verticalCenter
+                elide: Text.ElideRight
+                width: Math.max(0, parent.width - autoeqImportButton.width - Style.space(6))
+              }
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            visible: root.error !== ""
+            text: root.error
+            color: Color.urgent
+            font.family: root.barFontFamily
+            font.pixelSize: Style.font.caption
+            width: parent.width
+            wrapMode: Text.WordWrap
           }
         }
       }

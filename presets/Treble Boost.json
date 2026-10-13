@@ -1,65 +1,69 @@
 {
+  "name": "Treble Boost",
+  "description": "Bright and open: bass trimmed ~5 dB to make room for the top",
+  "order": 21,
   "mode": "graphic",
+  "preamp": 0,
   "graphic": [
     {
       "type": "peaking",
       "freq": 31,
       "q": 1.41,
-      "gain": 0
+      "gain": -5
     },
     {
       "type": "peaking",
       "freq": 62,
       "q": 1.41,
-      "gain": 0
+      "gain": -3
     },
     {
       "type": "peaking",
       "freq": 125,
       "q": 1.41,
-      "gain": 0
+      "gain": -3
     },
     {
       "type": "peaking",
       "freq": 250,
       "q": 1.41,
-      "gain": 0
+      "gain": -3
     },
     {
       "type": "peaking",
       "freq": 500,
       "q": 1.41,
-      "gain": 0
+      "gain": -3
     },
     {
       "type": "peaking",
       "freq": 1000,
       "q": 1.41,
-      "gain": 1
+      "gain": -1.5
     },
     {
       "type": "peaking",
       "freq": 2000,
       "q": 1.41,
-      "gain": 3
+      "gain": -1
     },
     {
       "type": "peaking",
       "freq": 4000,
       "q": 1.41,
-      "gain": 5
+      "gain": 0
     },
     {
       "type": "peaking",
       "freq": 8000,
       "q": 1.41,
-      "gain": 7
+      "gain": 0
     },
     {
       "type": "peaking",
       "freq": 16000,
       "q": 1.41,
-      "gain": 8
+      "gain": 0
     }
   ]
 }

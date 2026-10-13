@@ -1,0 +1,45 @@
+{
+  "name": "Small Speakers",
+  "description": "Laptop speakers: 55 Hz high-pass, boxiness cut, 3 kHz lift",
+  "order": 52,
+  "mode": "parametric",
+  "preamp": -2.0,
+  "parametric": [
+    {
+      "type": "highpass",
+      "freq": 55,
+      "q": 0.71,
+      "gain": 0
+    },
+    {
+      "type": "peaking",
+      "freq": 300,
+      "q": 1.0,
+      "gain": -2.5
+    },
+    {
+      "type": "peaking",
+      "freq": 1000,
+      "q": 1.0,
+      "gain": 0.5
+    },
+    {
+      "type": "peaking",
+      "freq": 3000,
+      "q": 1.2,
+      "gain": 1.5
+    },
+    {
+      "type": "peaking",
+      "freq": 5000,
+      "q": 1.4,
+      "gain": 0.5
+    },
+    {
+      "type": "highshelf",
+      "freq": 9000,
+      "q": 0.71,
+      "gain": -1.5
+    }
+  ]
+}

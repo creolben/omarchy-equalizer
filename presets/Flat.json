@@ -1,5 +1,9 @@
 {
+  "name": "Flat",
+  "description": "All bands at 0 dB: the neutral reference",
+  "order": 10,
   "mode": "graphic",
+  "preamp": 0,
   "graphic": [
     {
       "type": "peaking",

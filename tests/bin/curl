@@ -11,6 +11,6 @@ printf '%s\n' "$url" >> "$CURL_LOG"
 if [[ $url == *INDEX.md ]]; then
   printf '# Index\n- [Test HP](./oratory1990/over-ear/Test%%20HP) by oratory1990\n- [Test HP (velour)](./crinacle/over-ear/Test%%20HP%%20(velour)) by crinacle\n' > "$out"
 else
-  printf 'Preamp: -6.0 dB\nFilter 1: ON LSC Fc 105 Hz Gain 6.4 dB Q 0.70\nFilter 2: ON PK Fc 8800 Hz Gain 5.1 dB Q 1.42\nFilter 3: ON HSC Fc 10000 Hz Gain -2.1 dB Q 0.70\n' > "$out"
+  printf 'Preamp: -6.5 dB\nFilter 1: ON LSC Fc 105 Hz Gain 6.4 dB Q 0.70\nFilter 2: ON PK Fc 8800 Hz Gain 5.1 dB Q 1.42\nFilter 3: ON HSC Fc 10000 Hz Gain -2.1 dB Q 0.70\n' > "$out"
 fi
 exit 0

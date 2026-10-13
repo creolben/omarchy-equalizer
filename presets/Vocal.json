@@ -1,17 +1,21 @@
 {
+  "name": "Vocal",
+  "description": "Bass trimmed, presence lifted for lead vocals",
+  "order": 35,
   "mode": "graphic",
+  "preamp": 0,
   "graphic": [
     {
       "type": "peaking",
       "freq": 31,
       "q": 1.41,
-      "gain": -3
+      "gain": -4
     },
     {
       "type": "peaking",
       "freq": 62,
       "q": 1.41,
-      "gain": -3
+      "gain": -2.5
     },
     {
       "type": "peaking",
@@ -23,43 +27,43 @@
       "type": "peaking",
       "freq": 250,
       "q": 1.41,
-      "gain": 1
+      "gain": -0.5
     },
     {
       "type": "peaking",
       "freq": 500,
       "q": 1.41,
-      "gain": 4
+      "gain": 0
     },
     {
       "type": "peaking",
       "freq": 1000,
       "q": 1.41,
-      "gain": 5
+      "gain": 0
     },
     {
       "type": "peaking",
       "freq": 2000,
       "q": 1.41,
-      "gain": 4
+      "gain": 0
     },
     {
       "type": "peaking",
       "freq": 4000,
       "q": 1.41,
-      "gain": 2
+      "gain": -1
     },
     {
       "type": "peaking",
       "freq": 8000,
       "q": 1.41,
-      "gain": 0
+      "gain": -2.5
     },
     {
       "type": "peaking",
       "freq": 16000,
       "q": 1.41,
-      "gain": -1
+      "gain": -4.5
     }
   ]
 }

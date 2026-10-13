@@ -96,7 +96,9 @@ check "a cut-only curve needs no preamp" "0" "$(run status | jq -r '.preamp')"
 run set-preamp -3 >/dev/null
 check "set-preamp switches headroom to manual" "manual" "$(run status | jq -r '.headroom')"
 run set-gain 5 6 >/dev/null
-check "manual headroom keeps the hand-set preamp" "-3" "$(run status | jq -r '.preamp')"
+check "a boost lowers the ceiling to the value Auto would pick" "true" \
+  "$(jq -cn --argjson a "$(run status | jq -r '.preampCeiling')" --argjson b "$(run status | jq -r '.autoPreamp')" '($a - $b) == 0')"
+check "a hand-set preamp above the ceiling is clamped to it" "-6.0" "$(run status | jq -r '.preamp')"
 run set-headroom auto >/dev/null
 check "set-headroom auto recomputes the preamp" "true" \
   "$(jq -cn --argjson a "$(run status | jq -r '.preamp')" --argjson b "$(run status | jq -r '.autoPreamp')" '($a - $b) == 0')"
@@ -153,10 +155,95 @@ check "removing from an empty set is refused" "1|Band 0 does not exist." "$rc|$o
 run add-band >/dev/null
 check "a band can be added back" "1" "$(run status | jq -r '.bands | length')"
 
+echo "== headroom ceiling =="
+# A hand-set preamp is headroom, not a volume control: it may never hold more gain
+# than the curve's own peak, or the limiter removes the difference from every
+# sample and the panel reports nothing wrong. The ceiling is enforced in the stored
+# state, in the running graph and in the fragment on disk.
+frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
+run set-mode graphic >/dev/null
+run reset >/dev/null
+run set-gain 5 6 >/dev/null
+run set-headroom manual >/dev/null
+: >"$PWCLI_LOG"
+out="$(run set-preamp 10 2>&1)"
+check "set-preamp above the ceiling says so" "1" "$(grep -c 'above the headroom ceiling' <<<"$out")"
+check "the ceiling is stored instead of the value asked for" "-6.0" "$(run status | jq -r '.preamp')"
+check "the ceiling reaches the running graph" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"pre:Mult" 0.501187' && echo yes || echo no)"
+check "the fragment follows the live preamp" "1" "$(grep -c '"Mult" = 0.501187' "$frag")"
+out="$(run set-preamp -8 2>&1)"
+check "a preamp below the ceiling is left alone" "0" "$(grep -c 'above the headroom ceiling' <<<"$out")"
+check "and is what the graph and the state hold" "-8" "$(run status | jq -r '.preamp')"
+check "and is what the fragment holds" "1" "$(grep -c '"Mult" = 0.398107' "$frag")"
+
+echo "== built-in presets carry their own headroom =="
+# A preset's preamp has to be exactly what the backend computes for its own curve.
+# "asks for no clamp" is the weaker half of that: the clamp only stops a preset
+# asking for MORE gain than its curve can take, so a preset declaring less than it
+# needs still plays quieter than Flat for no reason. The numbers in the files are
+# generated from auto_preamp_db, and this is what keeps them from drifting.
+run set-mode graphic >/dev/null
+for f in "$here/../presets"/*.json; do
+  name="$(basename "$f" .json)"
+  mode="$(jq -r '.mode' "$f")"
+  bands="$(jq -c --arg m "$mode" 'if $m == "graphic" then .graphic else .parametric end' "$f")"
+  out="$(run apply-preset "$name" 2>&1)"
+  check "applying '$name' asks for no clamp" "0" "$(grep -c 'above the headroom ceiling' <<<"$out")"
+  check "'$name' declares the preamp its own curve needs" \
+    "$(backend_auto_preamp "$mode" "$bands")" "$(jq -r '.preamp' "$f")"
+done
+# backend_auto_preamp writes its own state to read status back, and the last one
+# leaves a state with an empty band array. Drop it so the next section starts from
+# the defaults rather than from a chain with nothing in it.
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+
+echo "== built-in presets are level-matched =="
+# Clicking through the preset list is a loudness comparison as much as a tone one:
+# a set built from boosts plays 3-7 dB below Flat, so every comparison is really
+# "quieter" versus "quieter still" and the missing loudness cannot be won back at
+# full volume. tests/preset-levels.js measures the applied curve with the plugin's
+# own model and holds every preset inside a couple of dB of Flat.
+node "$here/preset-levels.js" >"$T/preset-levels.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/preset-levels.log"
+check "every built-in preset is level-matched, in range, and describes itself" "0" "$rc"
+
+echo "== preset list =="
+check "every preset file is listed" \
+  "$(ls "$here/../presets"/*.json | wc -l)" "$(run status | jq '[.presets[] | select(.builtin)] | length')"
+check "the list is in the order the files declare" "Flat,Bass Boost,Treble Boost" \
+  "$(run status | jq -r '[.presets[] | select(.builtin) | .name] | .[0:3] | join(",")')"
+check "the list carries a description for the selected preset" "yes" \
+  "$(run status | jq -r '[.presets[] | select(.name == "Rock")][0].description | if . == null then "no" else "yes" end')"
+check "a built-in is marked as one" "true" \
+  "$(run status | jq -r '[.presets[] | select(.name == "Rock")][0].builtin')"
+
+echo "== routing: a DSP output is chained in front of, not resolved past ==
+# WirePlumber resolves a DSP sink's stream down to the hardware it feeds. Chaining
+# the equalizer in front of the DSP sink keeps the speaker tuning in the path; a
+# target of the hardware underneath would silently drop it for as long as the EQ
+# was on, which on an Asahi laptop is the biggest single part of how the speakers
+# sound."
+run disable >/dev/null
+export PACTL_DEFAULT_SINK=audio_effect.stub-dsp
+export PACTL_DEVICE_SINK=audio_effect.stub-dsp
+run enable >/dev/null
+check "the chain plays into the DSP sink" "1" \
+  "$(grep -c 'target.object = "audio_effect.stub-dsp"' "$frag")"
+check "the hardware under it is not the target" "0" "$(grep -c 'alsa_output.stub' "$frag")"
+check "the DSP sink is remembered as the previous default" "audio_effect.stub-dsp" \
+  "$(jq -r '.previousDefaultSink' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+run disable >/dev/null
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
+run enable >/dev/null
+run disable >/dev/null
+
 echo "== preset delete =="
 run save-preset ScratchPreset >/dev/null
 run apply-preset ScratchPreset >/dev/null
 check "applying a user preset sets the label" "ScratchPreset" "$(run status | jq -r '.preset')"
+check "a user preset sorts after the built-ins" "ScratchPreset" "$(run status | jq -r '.presets[-1].name')"
+check "a user preset carries no description of its own" "null" "$(run status | jq -r '.presets[-1].description')"
 run delete-preset ScratchPreset >/dev/null; rc=$?
 check "deleting a user preset succeeds" "0" "$rc"
 check "the deleted preset is gone from the list" "0" "$(run presets | grep -c '^ScratchPreset$')"
@@ -169,7 +256,7 @@ check "deleting a built-in is refused" "1|'Flat' is a built-in preset and cannot
 echo "== autoeq =="
 out="$(run import-autoeq 'Test HP' 'oratory1990/over-ear/Test%20HP')"
 check "an explicit index path imports that profile" "Test HP" "$(jq -r '.preset' <<<"$out")"
-check "the imported profile keeps its preamp" "-6" "$(jq -r '.preamp' <<<"$out")"
+check "the imported profile keeps its preamp" "-6.5" "$(jq -r '.preamp' <<<"$out")"
 check "the import becomes a preset" "yes" "$(run presets | grep -q '^Test HP$' && echo yes || echo no)"
 check "no profile index was fetched" "0" "$(grep -c 'INDEX.md' "$CURL_LOG")"
 check "the profile path asked for is the one downloaded" "1" "$(grep -c 'Test%20HP/Test%20HP%20ParametricEQ.txt' "$CURL_LOG")"
@@ -192,7 +279,7 @@ check "a shape-compatible preset does not restart the unit" "0" "$(grep -c resta
 check "a shape-compatible preset writes the graph more than once" "yes" \
   "$( (( $(wc -l <"$PWCLI_LOG") > 1)) && echo yes || echo no )"
 check "the last ramp step carries the preset's final gains" "yes" \
-  "$(tail -n1 "$PWCLI_LOG" | grep -q '"g0:Gain" 8' && echo yes || echo no)"
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"g9:Gain" -5.5' && echo yes || echo no)"
 : >"$SYSTEMCTL_LOG"
 run apply-preset "Speech Clarity" >/dev/null
 check "a parametric preset rebuilds the graph" "yes" \
@@ -214,11 +301,16 @@ frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
 check "the fragment hosts the multiband compressor" "1" "$(grep -c 'lv2/mb_compressor_mono' "$frag")"
 check "the fragment no longer hosts the single-band compressor" "0" "$(grep -c 'lv2/compressor_mono' "$frag")"
 check "the fragment hosts the limiter" "1" "$(grep -c 'limiter_mono' "$frag")"
-check "the compressor splits the bass at 200 Hz" "1" "$(grep -c '"fre_0" = 200' "$frag")"
-check "the compressor splits the mids at 4 kHz" "1" "$(grep -c '"fre_1" = 4000' "$frag")"
-check "the compressor's treble band ends at 20 kHz" "1" "$(grep -c '"fre_2" = 20000' "$frag")"
+check "the compressor splits the bass from the mid at 200 Hz" "1" "$(grep -c '"sf_1" = 200' "$frag")"
+check "the compressor splits the mid from the treble at 4 kHz" "1" "$(grep -c '"sf_2" = 4000' "$frag")"
+check "no control is written that the plugin reports as an output" "0" \
+  "$(grep -c '"fre_[0-9]" =' "$frag")"
 check "the compressor's bass band is enabled" "1" "$(grep -c '"ce_0" = 1' "$frag")"
 check "the compressor's fourth band is disabled" "1" "$(grep -c '"ce_3" = 0' "$frag")"
+check "the mid band's split is switched on (defaults would leave it off)" "1" \
+  "$(grep -c '"cbe_1" = 1' "$frag")"
+check "the treble band's split is switched on" "1" "$(grep -c '"cbe_2" = 1' "$frag")"
+check "the fourth band's split stays off" "1" "$(grep -c '"cbe_3" = 0' "$frag")"
 check "the limiter oversamples to catch true peaks" "1" \
   "$(grep 'name = limit' "$frag" | grep -c '"ovs" = 12')"
 check "the last band feeds the compressor" "1" \
@@ -243,12 +335,18 @@ check "set-limiter off writes the limiter enabled control" "yes" \
 run set-limiter on >/dev/null
 check "set-limiter on writes enabled 1" "yes" \
   "$(tail -n1 "$PWCLI_LOG" | grep -q '"limit:enabled" 1' && echo yes || echo no)"
+check "set-limiter keeps the fragment in step" "1" \
+  "$(grep 'name = limit' "$frag" | grep -c '"enabled" = 1')"
 : >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
 run set-boost high >/dev/null
 check "set-boost does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
 check "set-boost writes all its controls in one call" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
 check "set-boost high enables the multiband compressor" "yes" \
   "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:enabled" 1' && echo yes || echo no)"
+check "set-boost high switches the mid band's split on" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:cbe_1" 1' && echo yes || echo no)"
+check "set-boost high keeps the fourth band's split off" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:cbe_3" 0' && echo yes || echo no)"
 check "set-boost high writes +10 dB makeup to all three bands" "yes" \
   "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:mk_0" 3.162278.*"boost:mk_1" 3.162278.*"boost:mk_2" 3.162278' && echo yes || echo no)"
 check "set-boost high keeps the treble band's ratio at 4" "yes" \
@@ -260,6 +358,8 @@ check "set-boost off leaves medium's makeup in place" "yes" \
   "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:mk_0" 2.238721.*"boost:mk_1" 2.238721.*"boost:mk_2" 2.238721' && echo yes || echo no)"
 check "set-boost off leaves medium's bass threshold in place" "yes" \
   "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:al_0" 0.063096' && echo yes || echo no)"
+check "set-boost keeps the fragment in step" "1" \
+  "$(grep 'name = boost' "$frag" | grep -c '"mk_0" = 2.238721')"
 
 echo "== output stage validation =="
 out="$(run set-limiter maybe)"; rc=$?

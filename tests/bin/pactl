@@ -1,6 +1,18 @@
 #!/bin/bash
+# Stub pactl for the backend tests.
+#
+# The equalizer sink always exists, so sink_present is true and the fragment/live
+# paths are exercised at all. A second, device-like sink and the default sink can be
+# set per test: PACTL_DEVICE_SINK adds a line to `list sinks short`, PACTL_DEFAULT_SINK
+# changes what `get-default-sink` prints. The routing tests use them to put a DSP sink
+# in the seat the equalizer has to chain in front of.
+sinks="1	omarchy_equalizer	PipeWire	s16le 2ch 48000Hz	SUSPENDED"
+if [[ -n ${PACTL_DEVICE_SINK:-} ]]; then
+  sinks="$sinks
+2	$PACTL_DEVICE_SINK	PipeWire	s16le 2ch 48000Hz	SUSPENDED"
+fi
 case "$1" in
-  list) printf '1\tomarchy_equalizer\tPipeWire\ts16le 2ch 48000Hz\tSUSPENDED\n' ;;
-  get-default-sink) printf 'omarchy_equalizer\n' ;;
+  list) printf '%s\n' "$sinks" ;;
+  get-default-sink) printf '%s\n' "${PACTL_DEFAULT_SINK:-omarchy_equalizer}" ;;
 esac
 exit 0
