@@ -4,6 +4,7 @@
   "name": "Equalizer",
   "version": "1.0.0",
   "author": "creolben",
+  "license": "MIT",
   "description": "System-wide 10-band graphic equalizer plus parametric bands, with presets",
   "kinds": [
     "bar-widget"

@@ -1,9 +1,10 @@
 #!/bin/bash
 
-# Puts the equalizer backend on PATH so the panel and the bar widget can reach it
-# by name. The plugin itself is a plain checkout, so this is the one step that
-# has to happen after dropping it in -- run it once, and again if the plugin
-# moves.
+# Puts the equalizer backend on PATH for use from a terminal.
+#
+# The panel does not need this: it addresses bin/omarchy-equalizer inside the
+# plugin directory, so `omarchy plugin add` is a complete install on its own.
+# Run this if you want the `omarchy-equalizer` command in a shell too.
 #
 # A symlink (rather than a copy) is what keeps the installed command in step with
 # the checkout: editing bin/omarchy-equalizer takes effect immediately.
