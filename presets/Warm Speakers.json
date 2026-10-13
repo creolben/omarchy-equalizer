@@ -1,0 +1,29 @@
+{
+  "mode": "parametric",
+  "parametric": [
+    {
+      "type": "lowshelf",
+      "freq": 120,
+      "q": 0.71,
+      "gain": 4
+    },
+    {
+      "type": "peaking",
+      "freq": 350,
+      "q": 1.0,
+      "gain": -2
+    },
+    {
+      "type": "peaking",
+      "freq": 1500,
+      "q": 1.0,
+      "gain": -1
+    },
+    {
+      "type": "highshelf",
+      "freq": 6000,
+      "q": 0.71,
+      "gain": -3
+    }
+  ]
+}

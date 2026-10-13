@@ -1,0 +1,10 @@
+# Editor and OS scratch
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Local captures and temp files (the audio tests write raw captures)
+*.tmp
+*.raw
+*.wav

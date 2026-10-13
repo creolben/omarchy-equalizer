@@ -1,0 +1,41 @@
+{
+  "mode": "parametric",
+  "parametric": [
+    {
+      "type": "highpass",
+      "freq": 80,
+      "q": 0.71,
+      "gain": 0
+    },
+    {
+      "type": "peaking",
+      "freq": 250,
+      "q": 1.2,
+      "gain": -3
+    },
+    {
+      "type": "peaking",
+      "freq": 1200,
+      "q": 1.0,
+      "gain": 2
+    },
+    {
+      "type": "peaking",
+      "freq": 3000,
+      "q": 1.4,
+      "gain": 4
+    },
+    {
+      "type": "peaking",
+      "freq": 6500,
+      "q": 1.4,
+      "gain": 2
+    },
+    {
+      "type": "highshelf",
+      "freq": 9000,
+      "q": 0.71,
+      "gain": -1
+    }
+  ]
+}

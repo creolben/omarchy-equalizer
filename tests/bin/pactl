@@ -1,0 +1,6 @@
+#!/bin/bash
+case "$1" in
+  list) printf '1\tomarchy_equalizer\tPipeWire\ts16le 2ch 48000Hz\tSUSPENDED\n' ;;
+  get-default-sink) printf 'omarchy_equalizer\n' ;;
+esac
+exit 0

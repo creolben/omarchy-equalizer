@@ -1,0 +1,3 @@
+#!/bin/bash
+printf "%s\n" "$*" >> "$SYSTEMCTL_LOG"
+exit 0

@@ -1,0 +1,1349 @@
+#!/bin/bash
+
+# omarchy:summary=System-wide equalizer (10-band graphic + parametric) with presets
+# omarchy:group=audio
+#
+# Backend for the creolben.equalizer shell plugin. It hosts a PipeWire
+# filter-chain equalizer as its own PipeWire client, so it can be switched on and
+# off (and reconfigured) without restarting pipewire.service -- a daemon restart
+# drops every PulseAudio client connection and apps that do not reconnect have
+# to be restarted by hand.
+#
+# Why a private config name: PipeWire's stock filter-chain.conf merges every
+# fragment in filter-chain.conf.d/, so hosting the EQ there would also load any
+# unrelated user filter kept in that directory.
+#
+# Band layout
+#   graphic      fixed 10 ISO bands (31 Hz .. 16 kHz), biquads, one per channel
+#   parametric   user-defined bands; each carries type, frequency, Q and gain
+#
+# Parameter names inside a filter-chain node are "<node>:<Control>", so
+# "g3:Gain" is band 3's gain. That is what makes live updates possible: gains and
+# frequencies are written into the running graph with pw-cli, and only a change
+# to the *shape* of the graph (band count, or a band's filter type) needs a
+# restart.
+#
+# Routing: the EQ is a virtual sink that plays into the physical output. Turning
+# it on makes it the default sink and moves existing streams onto it; turning it
+# off restores the previous default and moves the streams back, the same dance
+# omarchy-audio-tuning does for the speaker tuning.
+
+set -uo pipefail
+
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+state_root="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-equalizer"
+plugin_dir="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+
+host_config="$config_home/pipewire/omarchy-equalizer.conf"
+fragment_dir="$config_home/pipewire/omarchy-equalizer.conf.d"
+fragment="$fragment_dir/90-eq.conf"
+unit_name=omarchy-equalizer.service
+unit="$config_home/systemd/user/$unit_name"
+# Watches for output-device changes while the EQ is on; see cmd_follow.
+follow_unit_name=omarchy-equalizer-follow.service
+follow_unit="$config_home/systemd/user/$follow_unit_name"
+script_path="$(readlink -f "$0")"
+
+sink_name=omarchy_equalizer
+state_file="$state_root/state.json"
+user_presets="$state_root/presets.json"
+builtin_presets="$plugin_dir/presets"
+
+# The output stage is LSP's mono multiband compressor and limiter, appended after
+# the bands. The plugin directory is overridable so a test (or an LSP installed
+# somewhere else) can point at a different root; lsp_available only trusts the
+# two TTLs, which is what the filter-chain needs to load the nodes at all.
+lsp_dir="${OMARCHY_EQ_LV2_DIR:-/usr/lib/lv2}/lsp-plugins.lv2"
+lsp_mb_compressor_uri="http://lsp-plug.in/plugins/lv2/mb_compressor_mono"
+lsp_limiter_uri="http://lsp-plug.in/plugins/lv2/limiter_mono"
+
+# Graphic equalizer centre frequencies: the ISO octave series, one decimal
+# place so the graph file stays readable.
+graphic_freqs=(31 62 125 250 500 1000 2000 4000 8000 16000)
+graphic_labels=(31 62 125 250 500 1k 2k 4k 8k 16k)
+
+Q_GRAPHIC=1.41        # ~1 octave bandwidth: the standard graphic-EQ spacing
+Q_SHELF=0.71          # shelf slope; Q means something else on a shelf
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# dB -> linear multiplier, for the preamp node's Mult control. LC_ALL=C keeps the
+# decimal point a point whatever the user's locale says.
+db_to_mult() { LC_ALL=C awk -v db="${1:-0}" 'BEGIN { printf "%.6f", 10 ^ (db / 20) }'; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
+# Values reach jq through --argjson, so a typo used to surface as a jq parse
+# error. Reject it here, where the message can say what was wrong.
+is_number() { [[ ${1:-} =~ ^-?[0-9]+([.][0-9]+)?$ ]]; }
+need_number() { is_number "${1:-}" || die "'${1:-}' is not a number."; }
+
+need jq
+
+# ---------------------------------------------------------------- state
+
+state_dir_ensure() { mkdir -p "$state_root"; }
+
+# Default bands mirror Audio Hijack's two equalizers: a flat 10-band graphic set,
+# and a parametric set that opens with shelf endpoints and peaking mid-bands --
+# the same shape its Parametric EQ block starts from.
+default_state() {
+  jq -n --argjson freqs "$(printf '%s\n' "${graphic_freqs[@]}" | jq -sc '.')" '
+    {
+      enabled: false,
+      mode: "graphic",
+      preset: "Flat",
+      # A whole-chain gain, before the bands. AutoEq profiles need it: their
+      # boosts would clip without the matching cut. With headroom auto the value
+      # is recomputed from the bands on every change; manual freezes it.
+      preamp: 0,
+      headroom: "auto",
+      # The Audio Hijack-style output stage: a Magic Boost compressor into a
+      # brickwall limiter. Both nodes stay in the graph when LSP is installed;
+      # these only choose their enabled controls, so switching is a live write.
+      limiter: "on",
+      boost: "off",
+      previousDefaultSink: "",
+      targetSink: "",
+      graphic: [ $freqs[] | { type: "peaking", freq: ., q: 1.41, gain: 0 } ],
+      parametric: [
+        { type: "lowshelf",  freq: 80,   q: 0.71, gain: 0 },
+        { type: "peaking",   freq: 120,  q: 1.0,  gain: 0 },
+        { type: "peaking",   freq: 250,  q: 1.0,  gain: 0 },
+        { type: "peaking",   freq: 500,  q: 1.0,  gain: 0 },
+        { type: "peaking",   freq: 1000, q: 1.0,  gain: 0 },
+        { type: "peaking",   freq: 2000, q: 1.0,  gain: 0 },
+        { type: "peaking",   freq: 4000, q: 1.0,  gain: 0 },
+        { type: "highshelf", freq: 8000, q: 0.71, gain: 0 }
+      ]
+    }'
+}
+
+state_read() {
+  if [[ -s $state_file ]]; then
+    jq -e . "$state_file" >/dev/null 2>&1 && { cat "$state_file"; return; }
+  fi
+  default_state
+}
+
+state_write() { state_dir_ensure; jq . >"$state_file.tmp" <<<"$1" && mv "$state_file.tmp" "$state_file"; }
+
+# The bands the equalizer is currently processing.
+active_bands() {
+  jq --arg mode "$(jq -r '.mode' <<<"$1")" -r '
+    if $mode == "parametric" then .parametric else .graphic end' <<<"$1"
+}
+
+# ---------------------------------------------------------------- headroom
+
+# The peak of the active band chain with the preamp at zero, on the same 400-step
+# log sweep Model.js draws its response on. This is a port of that file's
+# biquadCoefficients/magnitudeDb/peakDb, so the gain the backend actually applies
+# and the curve the panel draws cannot disagree; tests/headroom-check.js holds the
+# two side by side. The result is rounded away from zero to the preamp's 0.5 dB
+# step -- rounding toward zero would leave a sliver of boost, the clip this exists
+# to prevent -- and clamped to the slider's -24 dB floor. A cut-only curve needs
+# no preamp.
+auto_preamp_db() {
+  local bands="$1" rate
+  rate="$(graph_rate)"
+  jq -r '.[] | [ (.type // "peaking"), (.freq // 1000), (.gain // 0), (.q // 1.0) ] | @tsv' <<<"$bands" |
+    LC_ALL=C awk -v fs="$rate" '
+      # |H(e^jw)| in dB for one biquad, from coefficients already divided by a0.
+      function magnitude_db(type, fc, q, gain, f,
+                            A, w0, alpha, k, k2, b0, b1, b2, a0, a1, a2,
+                            w, c1, s1, c2, s2, nr, ni, dr, di, num, den, ratio) {
+        if (fc == 0) fc = 1000
+        if (fc < 1) fc = 1
+        if (fc > fs / 2 - 1) fc = fs / 2 - 1
+        if (q == 0) q = 1
+        if (q < 0.05) q = 0.05
+        A = 10 ^ (gain / 40)
+        w0 = 2 * PI * fc / fs
+        alpha = sin(w0) / (2 * q)
+        k = cos(w0)
+        k2 = 2 * sqrt(A) * alpha
+
+        if (type == "lowshelf") {
+          b0 = A * ((A + 1) - (A - 1) * k + k2)
+          b1 = 2 * A * ((A - 1) - (A + 1) * k)
+          b2 = A * ((A + 1) - (A - 1) * k - k2)
+          a0 = (A + 1) + (A - 1) * k + k2
+          a1 = -2 * ((A - 1) + (A + 1) * k)
+          a2 = (A + 1) + (A - 1) * k - k2
+        } else if (type == "highshelf") {
+          b0 = A * ((A + 1) + (A - 1) * k + k2)
+          b1 = -2 * A * ((A - 1) + (A + 1) * k)
+          b2 = A * ((A + 1) + (A - 1) * k - k2)
+          a0 = (A + 1) - (A - 1) * k + k2
+          a1 = 2 * ((A - 1) - (A + 1) * k)
+          a2 = (A + 1) - (A - 1) * k - k2
+        } else if (type == "lowpass") {
+          b0 = (1 - k) / 2; b1 = 1 - k; b2 = (1 - k) / 2
+          a0 = 1 + alpha; a1 = -2 * k; a2 = 1 - alpha
+        } else if (type == "highpass") {
+          b0 = (1 + k) / 2; b1 = -(1 + k); b2 = (1 + k) / 2
+          a0 = 1 + alpha; a1 = -2 * k; a2 = 1 - alpha
+        } else if (type == "bandpass") {
+          b0 = alpha; b1 = 0; b2 = -alpha
+          a0 = 1 + alpha; a1 = -2 * k; a2 = 1 - alpha
+        } else if (type == "notch") {
+          b0 = 1; b1 = -2 * k; b2 = 1
+          a0 = 1 + alpha; a1 = -2 * k; a2 = 1 - alpha
+        } else if (type == "allpass") {
+          b0 = 1 - alpha; b1 = -2 * k; b2 = 1 + alpha
+          a0 = 1 + alpha; a1 = -2 * k; a2 = 1 - alpha
+        } else {
+          b0 = 1 + alpha * A; b1 = -2 * k; b2 = 1 - alpha * A
+          a0 = 1 + alpha / A; a1 = -2 * k; a2 = 1 - alpha / A
+        }
+        b0 /= a0; b1 /= a0; b2 /= a0; a1 /= a0; a2 /= a0
+
+        w = 2 * PI * f / fs
+        c1 = cos(w); s1 = sin(w)
+        c2 = cos(2 * w); s2 = sin(2 * w)
+        nr = b0 + b1 * c1 + b2 * c2
+        ni = -(b1 * s1 + b2 * s2)
+        dr = 1 + a1 * c1 + a2 * c2
+        di = -(a1 * s1 + a2 * s2)
+        num = sqrt(nr * nr + ni * ni)
+        den = sqrt(dr * dr + di * di)
+        if (den < 1e-12) return 0
+        ratio = num / den
+        if (ratio < 1e-9) ratio = 1e-9
+        return 20 * log(ratio) / log(10)
+      }
+
+      # n starts at 0 explicitly: an uninitialized awk scalar has the string value
+      # "", so types[n] would file the first band under an index the END loop can
+      # never reach.
+      BEGIN { n = 0 }
+      { types[n] = $1; freqs[n] = $2; gains[n] = $3; qs[n] = $4; n++ }
+      END {
+        PI = atan2(0, -1)
+        lo = 20; hi = 20000; steps = 400; max = -1e300
+        for (i = 0; i <= steps; i++) {
+          f = lo * (hi / lo) ^ (i / steps)
+          total = 0
+          for (b = 0; b < n; b++) total += magnitude_db(types[b], freqs[b], qs[b], gains[b], f)
+          if (total > max) max = total
+        }
+        if (max <= 0.05) {
+          result = 0
+        } else {
+          c = int(max * 2)
+          if (c < max * 2) c++
+          result = -c / 2
+          if (result < -24) result = -24
+          if (result > 0) result = 0
+        }
+        # Unity is the common case, so print it plainly rather than as "0.0".
+        if (result == 0) printf "0\n"; else printf "%.1f\n", result
+      }
+    '
+}
+
+# With headroom auto the preamp is not the user's to set: it is recomputed from
+# the bands on every change, so the chain's peak never exceeds 0 dB. Manual keeps
+# the stored value, which is what a hand-tuned profile expects. A state written
+# before the field existed reads as auto, the safe default.
+apply_headroom() {
+  local state="$1" headroom
+  headroom="$(jq -r '.headroom // "auto"' <<<"$state")"
+  if [[ $headroom == auto ]]; then
+    state="$(jq -c --argjson p "$(auto_preamp_db "$(active_bands "$state")")" '.preamp = $p' <<<"$state")"
+  fi
+  printf '%s\n' "$state"
+}
+
+# ---------------------------------------------------------------- presets
+
+presets_ensure() { state_dir_ensure; [[ -s $user_presets ]] || printf '{}\n' >"$user_presets"; }
+
+preset_is_builtin() { [[ -f $builtin_presets/$1.json ]]; }
+
+preset_read() {
+  local name="$1"
+  if preset_is_builtin "$name"; then cat "$builtin_presets/$name.json"; return 0; fi
+  presets_ensure
+  jq -e --arg n "$name" 'has($n)' "$user_presets" >/dev/null 2>&1 || return 1
+  jq --arg n "$name" '.[$n]' "$user_presets"
+}
+
+preset_list_json() {
+  local builtin_json='[]' name
+  if [[ -d $builtin_presets ]]; then
+    for f in "$builtin_presets"/*.json; do
+      [[ -e $f ]] || continue
+      name="$(basename "$f" .json)"
+      builtin_json="$(jq -c --arg n "$name" '. + [{ name: $n, builtin: true }]' <<<"$builtin_json")"
+    done
+  fi
+  presets_ensure
+  # A user preset with the same name as a built-in never reaches here:
+  # save-preset refuses the collision, so the two lists cannot disagree.
+  jq -c -n --argjson b "$builtin_json" --argjson u "$(cat "$user_presets")" '
+    (($b | map(.name)) + ($u | keys)) as $names
+    | ($names | unique | sort) as $sorted
+    | [ $sorted[] as $n | { name: $n, builtin: ($b | map(.name) | index($n) != null) } ]
+  '
+}
+
+# ---------------------------------------------------------------- graph
+
+filter_label() {
+  case "$1" in
+    lowshelf) printf 'bq_lowshelf' ;;
+    highshelf) printf 'bq_highshelf' ;;
+    lowpass) printf 'bq_lowpass' ;;
+    highpass) printf 'bq_highpass' ;;
+    bandpass) printf 'bq_bandpass' ;;
+    notch) printf 'bq_notch' ;;
+    allpass) printf 'bq_allpass' ;;
+    *) printf 'bq_peaking' ;;
+  esac
+}
+
+# ---------------------------------------------------------------- output stage
+
+# The stage exists only when both mono plugins are installed. When they are not,
+# write_fragment emits no stage nodes or links, so an LSP-less machine gets
+# exactly the graph it had before this feature.
+lsp_available() { [[ -f $lsp_dir/limiter_mono.ttl && -f $lsp_dir/mb_compressor_mono.ttl ]]; }
+
+# Magic Boost is a three-band compressor into a brickwall limiter, the one-knob
+# loudness stage Audio Hijack puts at the end of its chain. A single-band
+# compressor at +10 dB makeup ducks the whole spectrum every time bass hits;
+# separate bass/mid/treble detection stops the mids and treble from pumping.
+# These "symbol value" lines are the single source for the control block in the
+# loaded fragment and the params written live, so the two can never disagree.
+# al/kn/mk are the compressor's dB controls and go through db_to_mult like every
+# other dB value; off keeps medium's settings so switching it back on is instant
+# and level.
+#
+# The graph always carries all eight bands. Bands 3..7 stay disabled but mirror
+# the treble band's controls, so enabling one later cannot read a stale value.
+# ofe/ife turn off the FFT analysis displays, which the graph would otherwise pay
+# to compute on every quantum.
+boost_values() {
+  local level="${1:-off}" enabled cr at rt mk
+  local -a al
+  # The split is bass 0..200 Hz, mid 200..4000 Hz, treble 4000..20000 Hz; the
+  # disabled bands sit at the top so their range is empty.
+  local -a fre=(200 4000 20000 20000 20000 20000 20000 20000)
+  local i bi ce
+  case "$level" in
+    off)    enabled=0; al=(-24 -22 -22); cr=3; at=8;  rt=120; mk=7  ;;
+    low)    enabled=1; al=(-20 -18 -18); cr=2; at=10; rt=150; mk=4  ;;
+    high)   enabled=1; al=(-28 -26 -26); cr=4; at=5;  rt=100; mk=10 ;;
+    medium | *) enabled=1; al=(-24 -22 -22); cr=3; at=8; rt=120; mk=7 ;;
+  esac
+  printf 'enabled %s\nmode 1\nofe 0\nife 0\ng_in 1\ng_out 1\ndrywet 100\n' "$enabled"
+  for ((i = 0; i < 8; i++)); do
+    if ((i < 3)); then bi=$i; ce=1; else bi=2; ce=0; fi
+    printf 'ce_%d %s\nkn_%d %s\nal_%d %s\ncr_%d %s\nat_%d %s\nrt_%d %s\nmk_%d %s\nfre_%d %d\n' \
+      "$i" "$ce" "$i" "$(db_to_mult -6)" "$i" "$(db_to_mult "${al[$bi]}")" \
+      "$i" "$cr" "$i" "$at" "$i" "$rt" "$i" "$(db_to_mult "$mk")" "$i" "${fre[$i]}"
+  done
+}
+
+# The limiter is the last node, so its -1 dBFS ceiling is what leaves the graph.
+# ovs 12 is "Full x2/24 bit" oversampling: it makes the limiter catch
+# inter-sample peaks, not just sample peaks, at a CPU cost the ARM laptop can
+# afford. mode, boost and alr stay off.
+limiter_values() {
+  local on="${1:-on}" enabled
+  case "$on" in off) enabled=0 ;; *) enabled=1 ;; esac
+  printf 'enabled %s\nth %s\nlk 5\nat 5\nrt 20\nmode 0\nboost 0\nalr 0\novs 12\n' \
+    "$enabled" "$(db_to_mult -1.0)"
+}
+
+# Render "symbol value" lines as a filter-chain control = { ... } block.
+stage_controls() {
+  LC_ALL=C awk '{ printf "%s\"%s\" = %s", (NR > 1 ? " " : ""), $1, $2 }'
+}
+
+# Render them as one pw-cli param list for node $1: "name:symbol value" pairs.
+stage_params() {
+  local name="$1"
+  LC_ALL=C awk -v n="$name" '{ printf "%s\"%s:%s\" %s", (NR > 1 ? " " : ""), n, $1, $2 }'
+}
+
+# The live forms, named after the node they drive.
+boost_params() { boost_values "${1:-off}" | stage_params boost; }
+limiter_params() { limiter_values "${1:-on}" | stage_params limit; }
+
+# A shelf's "Q" control is the slope, not a bandwidth, so a shelf band keeps its
+# own value but never inherits the graphic Q.
+write_fragment() {
+  local state="$1" mode bands count i ctl boost_level limiter_state
+  mode="$(jq -r '.mode' <<<"$state")"
+  bands="$(active_bands "$state")"
+  count="$(jq 'length' <<<"$bands")"
+
+  state_dir_ensure
+  mkdir -p "$fragment_dir"
+
+  {
+    printf '# Generated by omarchy-equalizer -- do not edit by hand.\n'
+    printf '# Mode: %s, %s band(s).\n\n' "$mode" "$count"
+    printf 'context.modules = [\n  { name = libpipewire-module-filter-chain\n    args = {\n'
+    printf '      node.description = "Equalizer"\n'
+    printf '      media.name       = "Equalizer"\n\n'
+    printf '      filter.graph = {\n        nodes = [\n'
+
+    # The preamp is a plain linear gain node, first in the chain, so a profile's
+    # negative preamp can be applied -- and moved live -- independently of the
+    # bands.
+    printf '          { type = builtin name = pre label = linear control = { "Mult" = %s "Add" = 0 } }\n' \
+      "$(db_to_mult "$(jq -r '.preamp // 0' <<<"$state")")"
+
+    for ((i = 0; i < count; i++)); do
+      local type label freq q gain
+      type="$(jq -r ".[$i].type // \"peaking\"" <<<"$bands")"
+      freq="$(jq -r ".[$i].freq // 1000" <<<"$bands")"
+      gain="$(jq -r ".[$i].gain // 0" <<<"$bands")"
+      q="$(jq -r ".[$i].q // 1.0" <<<"$bands")"
+      label="$(filter_label "$type")"
+      # A shelving or pass filter ignores Gain/Freq mismatches gracefully, but
+      # emitting an unused control would show up as a settable parameter that
+      # does nothing -- so each label only carries the controls it honours.
+      case "$type" in
+        lowpass | highpass | bandpass | notch | allpass) ctl="\"Freq\" = $freq \"Q\" = $q" ;;
+        lowshelf | highshelf) ctl="\"Freq\" = $freq \"Q\" = $q \"Gain\" = $gain" ;;
+        *) ctl="\"Freq\" = $freq \"Q\" = $q \"Gain\" = $gain" ;;
+      esac
+      printf '          { type = builtin name = g%d label = %s control = { %s } }\n' "$i" "$label" "$ctl"
+    done
+
+    # Both LSP plugins are the mono builds, so audio.channels = 2 below
+    # duplicates the whole graph per channel exactly as it does for the
+    # biquads, and the controls stay addressable by the node name.
+    if lsp_available; then
+      boost_level="$(jq -r '.boost // "off"' <<<"$state")"
+      limiter_state="$(jq -r '.limiter // "on"' <<<"$state")"
+      printf '          { type = lv2 name = boost plugin = "%s" control = { %s } }\n' \
+        "$lsp_mb_compressor_uri" "$(boost_values "$boost_level" | stage_controls)"
+      printf '          { type = lv2 name = limit plugin = "%s" control = { %s } }\n' \
+        "$lsp_limiter_uri" "$(limiter_values "$limiter_state" | stage_controls)"
+    fi
+
+    printf '        ]\n'
+    printf '        links = [\n'
+    # No bands means the preamp is the whole chain: a link to a g0 that was
+    # never emitted makes the filter-chain fail to load.
+    if ((count > 0)); then
+      printf '          { output = "pre:Out" input = "g0:In" }\n'
+    fi
+    for ((i = 0; i < count - 1; i++)); do
+      printf '          { output = "g%d:Out" input = "g%d:In" }\n' "$i" "$((i + 1))"
+    done
+    if lsp_available; then
+      # The stage is the tail of the chain. limit's output becomes the graph
+      # output automatically because nothing links out of it; with no bands the
+      # preamp feeds boost directly.
+      if ((count > 0)); then
+        printf '          { output = "g%d:Out" input = "boost:in" }\n' "$((count - 1))"
+      else
+        printf '          { output = "pre:Out" input = "boost:in" }\n'
+      fi
+      printf '          { output = "boost:out" input = "limit:in" }\n'
+    fi
+    printf '        ]\n'
+
+    printf '      }\n\n'
+    printf '      audio.channels = 2\n'
+    printf '      audio.position = [ FL FR ]\n'
+    printf '      capture.props  = { node.name = "%s" node.description = "Equalizer" media.class = Audio/Sink }\n' "$sink_name"
+    printf '      playback.props = { node.name = "%s.output" node.passive = true target.object = "%s" }\n' "$sink_name" "${2:-}"
+    printf '    }\n  }\n]\n'
+  } >"$fragment.tmp"
+
+  mv "$fragment.tmp" "$fragment"
+}
+
+# The rate the graph instantiates the builtin biquads with. The response curve
+# needs it: 16 kHz sits much closer to Nyquist at 44.1 kHz than at 48 kHz, and
+# the curve is drawn from the same formulas the filters run.
+graph_rate() {
+  local rate
+  rate="$(pw-metadata -n settings 0 clock.rate 2>/dev/null | awk -F"'" '/value:/ {print $4; exit}')"
+  is_number "$rate" || rate=48000
+  printf '%.0f\n' "$rate"
+}
+
+# Live updates: write the running graph's band controls in one pw-cli call. Only
+# gain, frequency and Q can move this way -- they are controls on nodes that
+# already exist -- which is why a type or count change restarts instead.
+find_node_id() {
+  pw-dump 2>/dev/null | jq -r --arg n "$sink_name" '
+    .[] | select(.type == "PipeWire:Interface:Node")
+        | select(.info.props["node.name"]? == $n) | .id' | head -n1
+}
+
+# Build the spa-pod parameter list for a band set. Split from the send so the
+# cross-fade below can reuse it for every interpolated step without duplicating
+# the control layout (and the pass-filter rule that withholds Gain).
+build_band_params() {
+  local bands="$1" preamp="${2:-0}" params i count
+  count="$(jq 'length' <<<"$bands")"
+  params="\"pre:Mult\" $(db_to_mult "$preamp")"
+  for ((i = 0; i < count; i++)); do
+    local freq q gain type
+    type="$(jq -r ".[$i].type // \"peaking\"" <<<"$bands")"
+    freq="$(jq -r ".[$i].freq // 1000" <<<"$bands")"
+    gain="$(jq -r ".[$i].gain // 0" <<<"$bands")"
+    q="$(jq -r ".[$i].q // 1.0" <<<"$bands")"
+    params+=" \"g$i:Freq\" $freq \"g$i:Q\" $q"
+    case "$type" in
+      lowpass | highpass | bandpass | notch | allpass) ;;
+      *) params+=" \"g$i:Gain\" $gain" ;;
+    esac
+  done
+  printf '%s\n' "$params"
+}
+
+# Send one parameter list to the running graph. Passing the node id saves a
+# pw-dump per step when a caller writes the same node repeatedly.
+live_send_params() {
+  local params="$1" id="${2:-}"
+  [[ -n $id ]] || id="$(find_node_id)"
+  [[ -n $id ]] || return 1
+  # pw-cli needs the params as a spa pod struct; one call keeps every band
+  # consistent with the same audio quantum.
+  pw-cli set-param "$id" Props "{ params = [ $params ] }" >/dev/null 2>&1
+}
+
+live_apply_bands() {
+  local bands="$1" state="$2"
+  live_send_params "$(build_band_params "$bands" "$(jq -r '.preamp // 0' <<<"$state")")"
+}
+
+# The preamp is a single live control, so the automatic and manual paths share
+# this: a headroom switch reaches the running graph exactly the way a hand-set
+# preamp does.
+live_apply_preamp() {
+  local db="$1" id
+  id="$(find_node_id)"
+  [[ -n $id ]] || return 1
+  pw-cli set-param "$id" Props "{ params = [ \"pre:Mult\" $(db_to_mult "$db") ] }" >/dev/null 2>&1
+}
+
+# One interpolation step between two shape-compatible band sets. Frequency moves
+# geometrically -- linearly in log-frequency -- so a sweep sounds even; the rest
+# is plain linear. Callers only use this when both sets have the same length and
+# filter types, so the indices line up.
+interpolate_bands() {
+  local from="$1" to="$2" t="$3"
+  jq -c -n --argjson f "$from" --argjson g "$to" --argjson k "$t" '
+    [ range(0; ($f | length)) as $i
+      | { type: ($f[$i].type // "peaking"),
+          freq: (($f[$i].freq // 1000) * pow((($g[$i].freq // 1000) / ($f[$i].freq // 1000)); $k)),
+          q: (($f[$i].q // 1.0) + (($g[$i].q // 1.0) - ($f[$i].q // 1.0)) * $k),
+          gain: (($f[$i].gain // 0) + (($g[$i].gain // 0) - ($f[$i].gain // 0)) * $k) } ]'
+}
+
+# Cross-fade a shape-compatible change over eight short steps. Each step sends
+# the whole control set in one pw-cli call, so the graph is never half-updated;
+# the last step writes the exact targets so rounding can never leave a band a
+# hair off its preset value. OMARCHY_EQ_NO_RAMP=1 collapses this to the single
+# target write (the tests use it to avoid the sleeps where they do not assert on
+# the fade itself).
+live_ramp_bands() {
+  local from_bands="$1" to_bands="$2" from_preamp="$3" to_preamp="$4" id k t step_bands step_preamp
+  id="$(find_node_id)"
+  [[ -n $id ]] || return 1
+  if [[ ${OMARCHY_EQ_NO_RAMP:-} == 1 ]]; then
+    live_send_params "$(build_band_params "$to_bands" "$to_preamp")" "$id"
+    return
+  fi
+  for ((k = 1; k <= 8; k++)); do
+    if ((k == 8)); then
+      step_bands="$to_bands"
+      step_preamp="$to_preamp"
+    else
+      t="$(LC_ALL=C awk -v k="$k" 'BEGIN { printf "%.6f", k / 8 }')"
+      step_bands="$(interpolate_bands "$from_bands" "$to_bands" "$t")"
+      step_preamp="$(LC_ALL=C awk -v a="$from_preamp" -v b="$to_preamp" -v t="$t" \
+        'BEGIN { printf "%.6f", a + (b - a) * t }')"
+    fi
+    live_send_params "$(build_band_params "$step_bands" "$step_preamp")" "$id"
+    if ((k < 8)); then sleep 0.02; fi
+  done
+}
+
+sink_present() {
+  pactl list sinks short 2>/dev/null | awk '{print $2}' | grep -Fx "$sink_name" >/dev/null
+}
+
+# The physical output the equalizer should play into.
+current_default_sink() { pactl get-default-sink 2>/dev/null; }
+
+# Resolve through any DSP sink already in place (the Asahi speaker tuning, or an
+# earlier copy of this equalizer) down to the hardware output.
+physical_output() {
+  local sink
+  sink="$(current_default_sink)"
+  # While the equalizer is on, the default sink IS the equalizer; what it plays
+  # into is the remembered target, not itself.
+  if [[ $sink == "$sink_name" ]]; then
+    sink="$(state_read | jq -r '.targetSink // empty')"
+  elif [[ -n $sink ]]; then
+    local resolved
+    resolved="$(omarchy-audio-output-sink 2>/dev/null)"
+    [[ -n $resolved ]] && sink="$resolved"
+  fi
+  [[ -z $sink ]] && sink="$(pactl list sinks short 2>/dev/null | awk '$2 !~ /^omarchy_equalizer/ {print $2; exit}')"
+  printf '%s\n' "$sink"
+}
+
+# Application streams only: a filter-chain's own output is a sink input too, and
+# moving it would rewire the EQ into itself.
+app_streams() {
+  pactl list sink-inputs 2>/dev/null | awk '
+    /^Sink Input #/ {id = substr($3, 2)}
+    /application\.name = / {
+      if (id != "") print id
+      id = ""
+    }'
+}
+
+move_apps_to() {
+  local target="$1" id
+  [[ -z $target ]] && return 0
+  for id in $(app_streams); do
+    pactl move-sink-input "$id" "$target" 2>/dev/null || true
+  done
+}
+
+# Sink-input id of the EQ's own output stream (what plays into the device).
+eq_output_input_id() {
+  pactl list sink-inputs 2>/dev/null | awk -v n="node.name = \"$sink_name.output\"" '
+    /^Sink Input #/ {id = substr($3, 2)}
+    index($0, n) {print id; exit}'
+}
+
+write_unit() {
+  mkdir -p "$config_home/systemd/user"
+  cat >"$unit" <<EOF
+[Unit]
+Description=Omarchy equalizer filter-chain
+Documentation=https://github.com/basecamp/omarchy
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+Wants=wireplumber.service
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pipewire -c omarchy-equalizer.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+  cat >"$follow_unit" <<EOF
+[Unit]
+Description=Omarchy equalizer output follower
+After=$unit_name
+BindsTo=$unit_name
+PartOf=$unit_name
+
+[Service]
+Type=simple
+ExecStart=$script_path follow
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=$unit_name
+EOF
+}
+
+service_start() {
+  # The service name comes from the config's own filename, which is what lets a
+  # private config name keep the EQ out of the shared filter-chain namespace.
+  cp "$plugin_dir/host/omarchy-equalizer.conf" "$host_config"
+  write_unit
+  systemctl --user daemon-reload >/dev/null 2>&1
+  systemctl --user enable --now "$unit_name" "$follow_unit_name" >/dev/null 2>&1
+  local _
+  for _ in {1..40}; do
+    sink_present && return 0
+    systemctl --user is-active --quiet "$unit_name" || return 1
+    sleep 0.25
+  done
+  sink_present
+}
+
+service_stop() {
+  systemctl --user disable --now "$follow_unit_name" "$unit_name" >/dev/null 2>&1
+  systemctl --user daemon-reload >/dev/null 2>&1
+  local _
+  for _ in {1..20}; do sink_present || return 0; sleep 0.25; done
+  return 0
+}
+
+service_restart() {
+  systemctl --user restart "$unit_name" >/dev/null 2>&1
+  local _
+  for _ in {1..40}; do sink_present && return 0; sleep 0.25; done
+  return 1
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_enable() {
+  local state default target
+  state="$(state_read)"
+  if [[ $(jq -r '.enabled' <<<"$state") == true ]] && sink_present; then
+    return 0
+  fi
+
+  default="$(current_default_sink)"
+  target="$(physical_output)"
+  [[ -n $target ]] || die "No output sink to equalize."
+
+  write_fragment "$state" "$target"
+  service_start || die "The equalizer filter-chain failed to start."
+
+  # The previous default is remembered so turning the EQ off can restore exactly
+  # the output the user had selected.
+  state="$(jq -c --arg prev "$default" --arg tgt "$target" '
+    .enabled = true | .previousDefaultSink = $prev | .targetSink = $tgt' <<<"$state")"
+  state_write "$state"
+
+  pactl set-default-sink "$sink_name" >/dev/null 2>&1
+  move_apps_to "$sink_name"
+}
+
+cmd_disable() {
+  local state restore
+  state="$(state_read)"
+  restore="$(jq -r '.previousDefaultSink // ""' <<<"$state")"
+
+  # Recompute the hardware sink rather than trusting the remembered one: the
+  # remembered value may itself be a tuning that has since been removed.
+  local fallback
+  fallback="$(physical_output)"
+
+  service_stop
+
+  if [[ -n $restore ]] && pactl list sinks short 2>/dev/null | awk '{print $2}' | grep -Fx "$restore" >/dev/null; then
+    pactl set-default-sink "$restore" >/dev/null 2>&1
+    move_apps_to "$restore"
+  elif [[ -n $fallback ]]; then
+    pactl set-default-sink "$fallback" >/dev/null 2>&1
+    move_apps_to "$fallback"
+  fi
+
+  state="$(jq -c '.enabled = false' <<<"$state")"
+  state_write "$state"
+}
+
+# Follow an output change made while the EQ is on. Connecting headphones makes
+# WirePlumber set them as the default sink; apps follow and bypass the EQ, which
+# keeps playing into the old device, so every dial moves a chain nobody hears.
+# Re-aim the EQ at the new device (live stream move, no restart) and take the
+# default back.
+cmd_retarget() {
+  local state default target id
+  state="$(state_read)"
+  [[ $(jq -r '.enabled' <<<"$state") == true ]] || return 0
+  sink_present || return 0
+  default="$(current_default_sink)"
+  [[ -n $default && $default != "$sink_name" ]] || return 0
+  target="$(physical_output)"
+  [[ -n $target && $target != "$sink_name" ]] || return 0
+  state="$(jq -c --arg prev "$default" --arg tgt "$target" '.previousDefaultSink = $prev | .targetSink = $tgt' <<<"$state")"
+  state_write "$state"
+  write_fragment "$state" "$target"
+  id="$(eq_output_input_id)"
+  [[ -n $id ]] && pactl move-sink-input "$id" "$target" >/dev/null 2>&1
+  pactl set-default-sink "$sink_name" >/dev/null 2>&1
+  move_apps_to "$sink_name"
+}
+
+# Long-running watcher (omarchy-equalizer-follow.service): retarget when the
+# default sink changes or a sink appears/disappears. Bursts are drained first.
+cmd_follow() {
+  need pactl
+  cmd_retarget
+  pactl subscribe 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      *" on server"* | *"'new' on sink #"* | *"'remove' on sink #"*)
+        while IFS= read -r -t 0.4 _; do :; done
+        cmd_retarget
+        ;;
+    esac
+  done
+}
+
+cmd_set_gain() {
+  local index="$1" gain="$2" state mode bands count
+  state="$(state_read)"
+  mode="$(jq -r '.mode' <<<"$state")"
+  bands="$(active_bands "$state")"
+  count="$(jq 'length' <<<"$bands")"
+  [[ $index =~ ^[0-9]+$ ]] || die "Band index must be a number."
+  ((index < count)) || die "Band $index does not exist."
+  need_number "$gain"
+
+  state="$(jq -c --arg mode "$mode" --argjson i "$index" --argjson g "$gain" '
+    .[$mode][$i].gain = $g' <<<"$state")"
+  state="$(apply_headroom "$state")"
+  state_write "$state"
+
+  if sink_present; then
+    bands="$(active_bands "$state")"
+    live_apply_bands "$bands" "$state" || {
+      write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+      service_restart >/dev/null 2>&1
+    }
+  fi
+}
+
+cmd_set_band() {
+  local index="$1" key="$2" value="$3" state mode bands
+  state="$(state_read)"
+  mode="$(jq -r '.mode' <<<"$state")"
+  bands="$(active_bands "$state")"
+  [[ $index =~ ^[0-9]+$ ]] || die "Band index must be a number."
+  ((index < $(jq 'length' <<<"$bands"))) || die "Band $index does not exist."
+
+  case "$key" in
+    gain) need_number "$value"; state="$(jq -c --arg m "$mode" --argjson i "$index" --argjson v "$value" '.[$m][$i].gain = $v' <<<"$state")" ;;
+    freq) need_number "$value"; state="$(jq -c --arg m "$mode" --argjson i "$index" --argjson v "$value" '.[$m][$i].freq = $v' <<<"$state")" ;;
+    q)    need_number "$value"; state="$(jq -c --arg m "$mode" --argjson i "$index" --argjson v "$value" '.[$m][$i].q = $v' <<<"$state")" ;;
+    type) state="$(jq -c --arg m "$mode" --argjson i "$index" --arg v "$value" '.[$m][$i].type = $v' <<<"$state")" ;;
+    label | name) ;;
+    *) die "Unknown band property '$key'." ;;
+  esac
+  state="$(apply_headroom "$state")"
+  state_write "$state"
+
+  # Gain, frequency and Q are all just values on a biquad that already exists in
+  # the running graph, so they are written live. Only a type change swaps the
+  # filter itself and has to rebuild -- which is what made every frequency edit
+  # cost an audible dropout before.
+  if sink_present; then
+    if [[ $key == type ]]; then
+      write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+      service_restart >/dev/null 2>&1
+    else
+      live_apply_bands "$(active_bands "$state")" "$state" || {
+        write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+        service_restart >/dev/null 2>&1
+      }
+    fi
+  fi
+}
+
+cmd_add_band() {
+  local state
+  state="$(state_read)"
+  state="$(jq -c '.mode = "parametric" | .parametric += [{ type: "peaking", freq: 1000, q: 1.0, gain: 0 }]' <<<"$state")"
+  state="$(apply_headroom "$state")"
+  state_write "$state"
+  if sink_present; then
+    write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+    service_restart >/dev/null 2>&1
+  fi
+}
+
+cmd_remove_band() {
+  local index="$1" state count
+  state="$(state_read)"
+  count="$(jq '.parametric | length' <<<"$state")"
+  [[ $index =~ ^[0-9]+$ ]] || die "Band index must be a number."
+  ((index < count)) || die "Band $index does not exist."
+  state="$(jq -c --argjson i "$index" 'del(.parametric[$i])' <<<"$state")"
+  state="$(apply_headroom "$state")"
+  state_write "$state"
+  if sink_present; then
+    write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+    service_restart >/dev/null 2>&1
+  fi
+}
+
+cmd_set_mode() {
+  local mode="$1" state
+  case "$mode" in graphic | parametric) ;; *) die "Mode must be graphic or parametric." ;; esac
+  state="$(state_read)"
+  state="$(jq -c --arg m "$mode" '.mode = $m' <<<"$state")"
+  state="$(apply_headroom "$state")"
+  state_write "$state"
+  if sink_present; then
+    write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+    service_restart >/dev/null 2>&1
+  fi
+}
+
+cmd_apply_preset() {
+  local name="$1" preset state mode from_bands to_bands from_preamp to_preamp
+  preset="$(preset_read "$name")" || die "No preset named '$name'."
+
+  # A preset may carry its own mode; a graphic preset applied while in
+  # parametric mode switches modes rather than stuffing 10 bands into 8.
+  mode="$(jq -r '.mode // "graphic"' <<<"$preset")"
+  state="$(state_read)"
+  # What is running right now: the ramp needs both ends, and the shape check
+  # decides whether a ramp is usable at all.
+  from_bands="$(active_bands "$state")"
+  from_preamp="$(jq -r '.preamp // 0' <<<"$state")"
+
+  state="$(jq -c --arg n "$name" --arg m "$mode" --argjson p "$preset" '
+    .preset = $n | .mode = $m | .preamp = ($p.preamp // 0)
+    | if ($p.graphic // null) != null and ($p.graphic | length) > 0 then .graphic = $p.graphic else . end
+    | if ($p.parametric // null) != null and ($p.parametric | length) > 0 then .parametric = $p.parametric else . end
+  ' <<<"$state")"
+  state="$(apply_headroom "$state")"
+  to_bands="$(active_bands "$state")"
+  to_preamp="$(jq -r '.preamp // 0' <<<"$state")"
+  state_write "$state"
+
+  if sink_present; then
+    # A preset whose shape matches the running chain (same band count, same
+    # sequence of filter types) can be crossfaded in place instead of dropping
+    # audio through a restart. Anything else -- a mode switch, a new band count,
+    # a filter-type swap -- needs the graph rebuilt: those nodes do not exist
+    # yet, or are wired in a different order. The fragment is written either
+    # way, so a later restart comes up with the new preset.
+    if [[ $(jq 'length' <<<"$from_bands") -eq $(jq 'length' <<<"$to_bands") ]] &&
+       [[ "$(jq -r '[.[].type] | join(",")' <<<"$from_bands")" == "$(jq -r '[.[].type] | join(",")' <<<"$to_bands")" ]]; then
+      write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+      live_ramp_bands "$from_bands" "$to_bands" "$from_preamp" "$to_preamp" || {
+        write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+        service_restart >/dev/null 2>&1
+      }
+    else
+      write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+      service_restart >/dev/null 2>&1
+    fi
+  fi
+}
+
+cmd_save_preset() {
+  local name="$1" state entry
+  [[ -n $name ]] || die "A preset needs a name."
+  preset_is_builtin "$name" && die "'$name' is a built-in preset. Choose another name."
+  state="$(state_read)"
+  entry="$(jq -c '{ mode: .mode, graphic: .graphic, parametric: .parametric, preamp: (.preamp // 0) }' <<<"$state")"
+  presets_ensure
+  jq -c --arg n "$name" --argjson e "$entry" '.[$n] = $e' "$user_presets" >"$user_presets.tmp" &&
+    mv "$user_presets.tmp" "$user_presets"
+  state="$(jq -c --arg n "$name" '.preset = $n' <<<"$state")"
+  state_write "$state"
+}
+
+cmd_delete_preset() {
+  local name="$1"
+  preset_is_builtin "$name" && die "'$name' is a built-in preset and cannot be deleted."
+  [[ -n $name ]] || die "Name the preset to delete."
+  presets_ensure
+  jq -e --arg n "$name" 'has($n)' "$user_presets" >/dev/null 2>&1 || die "No user preset named '$name'."
+  jq -c --arg n "$name" 'del(.[$n])' "$user_presets" >"$user_presets.tmp" &&
+    mv "$user_presets.tmp" "$user_presets"
+  # The bands stay as they are; only the label stops naming a preset that no
+  # longer exists, otherwise the dropdown shows a ghost entry.
+  local state
+  state="$(state_read)"
+  if [[ $(jq -r '.preset // ""' <<<"$state") == "$name" ]]; then
+    state_write "$(jq -c '.preset = "Custom"' <<<"$state")"
+  fi
+}
+
+cmd_reset() {
+  local state mode from_bands to_bands from_preamp to_preamp
+  state="$(state_read)"
+  mode="$(jq -r '.mode' <<<"$state")"
+  from_bands="$(active_bands "$state")"
+  from_preamp="$(jq -r '.preamp // 0' <<<"$state")"
+  # Reset means flat, so the preamp goes back to unity with the bands -- an
+  # imported profile's cut left behind would quietly halve the output.
+  state="$(jq -c --arg m "$mode" '
+    .preset = "Flat" | .preamp = 0
+    | if $m == "parametric" then
+        .parametric = [ .parametric[] | .gain = 0 ]
+      else
+        .graphic = [ .graphic[] | .gain = 0 ]
+      end' <<<"$state")"
+  state="$(apply_headroom "$state")"
+  to_bands="$(active_bands "$state")"
+  to_preamp="$(jq -r '.preamp // 0' <<<"$state")"
+  state_write "$state"
+  if sink_present; then
+    # Reset only flattens gains, so the running chain already has the right
+    # shape: ramp to it rather than dropping audio through a restart.
+    live_ramp_bands "$from_bands" "$to_bands" "$from_preamp" "$to_preamp" || true
+  fi
+}
+
+# ---------------------------------------------------------------- preamp
+
+# The preamp is one live control, so unlike a band's type it never needs a
+# restart -- only the multiplier changes. Setting it by hand is also how the user
+# takes over from automatic headroom.
+cmd_set_preamp() {
+  local db="${1:-0}" state
+  need_number "$db"
+  state="$(state_read)"
+  state="$(jq -c --argjson v "$db" '.preamp = $v | .headroom = "manual"' <<<"$state")"
+  state_write "$state"
+  if sink_present; then live_apply_preamp "$db" || true; fi
+}
+
+# Switching back to auto recomputes the preamp from the bands and pushes the new
+# multiplier live; manual only stores the label, because the preamp does not move.
+cmd_set_headroom() {
+  local value="${1:-}" state
+  case "$value" in
+    auto | manual) ;;
+    *) die "Headroom must be auto or manual." ;;
+  esac
+  state="$(state_read)"
+  state="$(jq -c --arg v "$value" '.headroom = $v' <<<"$state")"
+  if [[ $value == auto ]]; then
+    state="$(apply_headroom "$state")"
+  fi
+  state_write "$state"
+  if [[ $value == auto ]] && sink_present; then
+    live_apply_preamp "$(jq -r '.preamp // 0' <<<"$state")" || true
+  fi
+}
+
+# ---------------------------------------------------------------- output stage commands
+
+# The stage is toggled only through the plugins' enabled controls, so neither
+# command touches the graph's shape and neither ever restarts the unit. When LSP
+# is missing the choice is still stored (so installing it later brings the stage
+# up enabled as the user left it) but there is nothing live to write; the warning
+# is the only sign the stage is inactive.
+lsp_inactive_warn() {
+  printf 'LSP plugins are not installed; the output stage is inactive.\n' >&2
+}
+
+cmd_set_limiter() {
+  local value="${1:-}" state
+  case "$value" in
+    on | off) ;;
+    *) die "Limiter must be on or off." ;;
+  esac
+  state="$(state_read)"
+  state="$(jq -c --arg v "$value" '.limiter = $v' <<<"$state")"
+  state_write "$state"
+  if ! lsp_available; then
+    lsp_inactive_warn
+  elif sink_present; then
+    live_send_params "$(limiter_params "$value")" || true
+  fi
+}
+
+cmd_set_boost() {
+  local value="${1:-}" state
+  case "$value" in
+    off | low | medium | high) ;;
+    *) die "Boost must be off, low, medium or high." ;;
+  esac
+  state="$(state_read)"
+  state="$(jq -c --arg v "$value" '.boost = $v' <<<"$state")"
+  state_write "$state"
+  if ! lsp_available; then
+    lsp_inactive_warn
+  elif sink_present; then
+    live_send_params "$(boost_params "$value")" || true
+  fi
+}
+
+# ---------------------------------------------------------------- AutoEq
+
+# AutoEq publishes one ParametricEQ.txt per headphone measurement, plus a single
+# INDEX.md listing all of them. Looking a headphone up by name therefore means
+# fetching that one file; it changes slowly, so it is cached for a week.
+autoeq_index="$state_root/autoeq-index.md"
+autoeq_index_max_age=604800
+autoeq_raw_base="https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results"
+
+fetch_autoeq_index() {
+  local age
+  if [[ -s $autoeq_index ]]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$autoeq_index") ))
+    (( age < autoeq_index_max_age )) && return 0
+  fi
+  state_dir_ensure
+  need curl
+  curl -fsSL --max-time 25 -o "$autoeq_index.tmp" \
+    "$autoeq_raw_base/INDEX.md" >/dev/null 2>&1 || return 1
+  mv "$autoeq_index.tmp" "$autoeq_index"
+}
+
+# Index lines look like: - [Sennheiser HD 650](./oratory1990/over-ear/Sennheiser%20HD%20650) by oratory1990
+autoeq_search() {
+  local query="$1" line name path
+  fetch_autoeq_index || die "Could not fetch the AutoEq profile index (no network?)."
+  [[ -n $query ]] || die "Give a headphone name to search for."
+
+  : >"$state_root/autoeq-search.tmp"
+  while IFS= read -r line; do
+    # Parsed with shell expansions rather than a pattern, because headphone names
+    # and profile paths both contain parentheses: a regex stopping at the first
+    # ")" truncates "HIFIMAN Sundara (Dekoni sheepskin Earpads)" to a path that
+    # does not exist. The line is "- [Name](./path) by source".
+    [[ $line == "- ["* ]] || continue
+    name="${line#*- [}"
+    name="${name%%](*}"
+    path_all="${line#*](./}"
+    [[ $path_all != "$line" ]] || continue
+    path="${path_all%% by *}"
+    path="${path%)}"
+    [[ -n $path ]] || continue
+    jq -cn --arg n "$name" --arg p "$path" \
+      --arg s "$(autoeq_name_from_path "${path%%/*}")" '{ name: $n, path: $p, source: $s }' \
+      >>"$state_root/autoeq-search.tmp"
+  done < <(grep -iF -- "$query" "$autoeq_index")
+
+  jq -sc 'sort_by(.name, .source)' "$state_root/autoeq-search.tmp"
+}
+
+# A profile path's last segment is the profile directory, and its URL-decoded
+# form is the headphone's name.
+autoeq_name_from_path() {
+  printf '%s' "$1" | awk -F/ '{print $NF}' | sed 's/%20/ /g; s/%2C/,/g; s/%28/(/g; s/%29/)/g; s/%26/\&/g; s/%27/'"'"'/g; s/%2B/+/g'
+}
+
+cmd_autoeq_search() {
+  # --json is the panel's path: it needs the sources as data, not as a column.
+  if [[ ${1:-} == "--json" ]]; then
+    autoeq_search "${2:-}"
+    return
+  fi
+  autoeq_search "$1" |
+    jq -r '.[] | "\(.name)\t\(.source)"' |
+    awk -F'\t' '{printf "%-46s %s\n", $1, $2}'
+}
+
+# AutoEq's type letters. Everything it emits is a peaking filter or one of the
+# two shelves; the pass filters show up in hand-written EqualizerAPO configs.
+autoeq_type() {
+  case "$1" in
+    PK) printf 'peaking' ;;
+    LSC | LS) printf 'lowshelf' ;;
+    HSC | HS) printf 'highshelf' ;;
+    LP | LPQ) printf 'lowpass' ;;
+    HP | HPQ) printf 'highpass' ;;
+    BP) printf 'bandpass' ;;
+    NO) printf 'notch' ;;
+    AP) printf 'allpass' ;;
+    *) printf 'peaking' ;;
+  esac
+}
+
+# Parse one profile file into { preamp, bands }. The format is EqualizerAPO's:
+#
+#   Preamp: -6.1 dB
+#   Filter 1: ON LSC Fc 105 Hz Gain 6.4 dB Q 0.70
+#
+# so this reads Peace and EqualizerAPO configs too. Off filters are skipped
+# rather than imported as flat bands, which would silently widen the profile.
+autoeq_profile_json() {
+  local file="$1" type freq gain q bands='[]' preamp=0
+  while read -r type freq gain q; do
+    [[ -z $type ]] && continue
+    if [[ $type == PREAMP ]]; then preamp="$freq"; continue; fi
+    bands="$(jq -c --arg t "$(autoeq_type "$type")" --argjson f "$freq" --argjson g "$gain" --argjson q "$q" \
+      '. + [{ type: $t, freq: $f, gain: $g, q: $q }]' <<<"$bands")"
+  done < <(LC_ALL=C awk '
+    /^Preamp:/ { if (match($0, /-?[0-9]+(\.[0-9]+)?/)) preamp = substr($0, RSTART, RLENGTH) }
+    /^Filter/ {
+      if ($3 != "ON") next
+      t = $4; fc = ""; g = "0"; q = "0.7"
+      for (i = 1; i <= NF; i++) {
+        if ($i == "Fc") fc = $(i + 1)
+        else if ($i == "Gain") g = $(i + 1)
+        else if ($i == "Q") q = $(i + 1)
+      }
+      if (fc == "") next
+      printf "%s %s %s %s\n", t, fc, g, q
+    }
+    END { printf "PREAMP %s\n", preamp + 0 }
+  ' "$file")
+
+  jq -c -n --argjson b "$bands" --argjson p "$preamp" '{ preamp: $p, bands: $b }'
+}
+
+# Import by headphone name (downloaded), by an explicit index path, or from a
+# local ParametricEQ.txt file.
+cmd_import_autoeq() {
+  local target="${1:-}" selected="${2:-}" name="" file parsed bands preamp state path url matches
+
+  [[ -n $target ]] || die "Name a headphone, or give a path to a ParametricEQ.txt file."
+  file="$(mktemp)"
+
+  if [[ -f $target ]]; then
+    cp "$target" "$file"
+    name="$(basename "$target" .txt)"
+    name="${name% ParametricEQ}"
+  elif [[ -n $selected ]]; then
+    # The panel offers the measurements it found and sends back the one that was
+    # picked. Searching again here would re-rank by source and could download a
+    # different measurement of the same headphone than the one chosen.
+    need curl
+    path="$selected"
+    name="$(autoeq_name_from_path "$path")"
+    url="$autoeq_raw_base/$path/$(basename "$path")%20ParametricEQ.txt"
+    curl -fsSL --max-time 25 -o "$file" "$url" >/dev/null 2>&1 || {
+      rm -f "$file"
+      die "Could not download the profile for '$name'."
+    }
+  else
+    need curl
+    matches="$(autoeq_search "$target")"
+    (( $(jq 'length' <<<"$matches") > 0 )) || {
+      rm -f "$file"
+      die "No AutoEq profile matched '$target'. Try: omarchy-equalizer autoeq-search <name>"
+    }
+    # Pick between sources deterministically: an exact name match first (so
+    # searching "HIFIMAN Sundara" does not land on the Dekoni-earpad variant),
+    # then oratory1990 -- the source the project's own guides point at -- and
+    # finally the shortest name, which is the least qualified variant.
+    path="$(jq -r --arg q "$target" '
+      (map(select((.name | ascii_downcase) == ($q | ascii_downcase)))) as $exact
+      | (if ($exact | length) > 0 then $exact else . end)
+      | sort_by((if .source == "oratory1990" then 0 else 1 end), (.name | length))
+      | .[0].path' <<<"$matches")"
+    name="$(autoeq_name_from_path "$path")"
+    url="$autoeq_raw_base/$path/$(basename "$path")%20ParametricEQ.txt"
+    curl -fsSL --max-time 25 -o "$file" "$url" >/dev/null 2>&1 || {
+      rm -f "$file"
+      die "Could not download the profile for '$name'."
+    }
+  fi
+
+  parsed="$(autoeq_profile_json "$file")"
+  rm -f "$file"
+  bands="$(jq -c '.bands' <<<"$parsed")"
+  preamp="$(jq -r '.preamp' <<<"$parsed")"
+  (( $(jq 'length' <<<"$bands") > 0 )) || die "The profile has no usable filters."
+
+  state="$(state_read)"
+  state="$(jq -c --argjson b "$bands" --argjson p "$preamp" \
+    '.mode = "parametric" | .parametric = $b | .preamp = $p' <<<"$state")"
+  state="$(apply_headroom "$state")"
+  state_write "$state"
+
+  # An imported profile is kept as a preset: it has to survive the next import.
+  cmd_save_preset "$name" >/dev/null 2>&1 || true
+
+  if sink_present; then
+    write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+    service_restart >/dev/null 2>&1
+  fi
+
+  jq -c -n --arg n "$name" --argjson p "$preamp" --argjson c "$(jq 'length' <<<"$bands")" \
+    '{ preset: $n, preamp: $p, bands: $c }'
+}
+
+# One JSON document for the panel: what is on, what the bands are, what presets
+# exist. The panel never reads the state file itself.
+cmd_status() {
+  local state bands
+  state="$(state_read)"
+  bands="$(active_bands "$state")"
+  jq -c -n --argjson s "$state" --argjson b "$bands" --argjson p "$(preset_list_json)" \
+     --argjson r "$(graph_rate)" --argjson ap "$(auto_preamp_db "$bands")" \
+     --argjson oa "$(lsp_available && echo true || echo false)" '
+    {
+      sampleRate: $r,
+      enabled: ($s.enabled // false),
+      mode: ($s.mode // "graphic"),
+      preset: ($s.preset // "Flat"),
+      headroom: ($s.headroom // "auto"),
+      preamp: ($s.preamp // 0),
+      autoPreamp: $ap,
+      limiter: ($s.limiter // "on"),
+      boost: ($s.boost // "off"),
+      outputStage: $oa,
+      sinkPresent: false,
+      targetSink: ($s.targetSink // ""),
+      bands: $b,
+      graphicCount: ($s.graphic | length),
+      parametricCount: ($s.parametric | length),
+      presets: $p
+    }'
+}
+
+cmd_status_full() {
+  local out
+  out="$(cmd_status)"
+  jq -c --argjson present "$(sink_present && echo true || echo false)" \
+     --arg default "$(current_default_sink)" \
+     --arg physical "$(physical_output)" \
+    '.sinkPresent = $present | .defaultSink = $default | .physicalSink = $physical' <<<"$out"
+}
+
+cmd_toggle() {
+  local state
+  state="$(state_read)"
+  if [[ $(jq -r '.enabled' <<<"$state") == true ]] && sink_present; then
+    cmd_disable
+  else
+    cmd_enable
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-equalizer <command> [args]
+
+  status                          JSON state for the shell plugin
+  enable | disable | toggle       Switch the equalizer on or off
+  retarget                        Re-aim the EQ at the current output device
+  follow                          Watch for output changes (run by systemd)
+  set-mode <graphic|parametric>   Choose which band set is processed
+  set-gain <index> <dB>           Set one band's gain (live, no restart)
+  set-band <index> <gain|freq|q|type> <value>
+  add-band                        Append a parametric band
+  remove-band <index>             Drop a parametric band
+  apply-preset <name>             Load a preset
+  save-preset <name>              Save the current bands as a preset
+  delete-preset <name>            Delete a user preset
+  reset                           Flatten the current mode's gains
+  presets                         List preset names
+  set-preamp <dB>                 Whole-chain preamp (live, no restart)
+  set-headroom <auto|manual>      Auto-track the preamp to the band peaks
+  set-limiter <on|off>            Brickwall output limiter (live, no restart)
+  set-boost <off|low|medium|high> Magic Boost compressor (live, no restart)
+  autoeq-search [--json] <name>   Search AutoEq headphone profiles
+  import-autoeq <name|file> [index-path]
+                                  Import an AutoEq profile, saved as a preset
+EOF
+}
+
+command="${1:-status}"
+shift 2>/dev/null || true
+
+case "$command" in
+  status) cmd_status_full ;;
+  enable) cmd_enable ;;
+  disable) cmd_disable ;;
+  toggle) cmd_toggle ;;
+  retarget) cmd_retarget ;;
+  follow) cmd_follow ;;
+  set-mode) cmd_set_mode "${1:-}" ;;
+  set-gain) cmd_set_gain "${1:-0}" "${2:-0}" ;;
+  set-band) cmd_set_band "${1:-0}" "${2:-}" "${3:-0}" ;;
+  add-band) cmd_add_band ;;
+  remove-band) cmd_remove_band "${1:-0}" ;;
+  apply-preset) cmd_apply_preset "${1:-}" ;;
+  save-preset) cmd_save_preset "${1:-}" ;;
+  delete-preset) cmd_delete_preset "${1:-}" ;;
+  reset) cmd_reset ;;
+  set-preamp) cmd_set_preamp "${1:-0}" ;;
+  set-headroom) cmd_set_headroom "${1:-}" ;;
+  set-limiter) cmd_set_limiter "${1:-}" ;;
+  set-boost) cmd_set_boost "${1:-}" ;;
+  autoeq-search) cmd_autoeq_search "${1:-}" "${2:-}" ;;
+  import-autoeq) cmd_import_autoeq "${1:-}" "${2:-}" ;;
+  presets) preset_list_json | jq -r '.[].name' ;;
+  help | --help | -h) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

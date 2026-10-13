@@ -1,0 +1,2 @@
+#!/bin/bash
+printf "alsa_output.stub\n"

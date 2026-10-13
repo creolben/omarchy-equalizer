@@ -1,0 +1,3 @@
+#!/bin/bash
+# Stub: the backend reads the graph rate from this to draw the response curve.
+printf "update: id:0 key:'clock.rate' value:'44100' type:''\n"

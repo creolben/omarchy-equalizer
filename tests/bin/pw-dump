@@ -1,0 +1,2 @@
+#!/bin/bash
+printf '[{"id":42,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"omarchy_equalizer"}}}]\n'

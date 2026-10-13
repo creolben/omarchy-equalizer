@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stub for the running PipeWire graph: log the call so the ramp tests can assert
+# how many live writes happened and what the last one carried.
+printf "%s\n" "$*" >> "$PWCLI_LOG"
+exit 0
