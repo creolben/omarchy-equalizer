@@ -3,7 +3,7 @@
 # omarchy:summary=System-wide equalizer (10-band graphic + parametric) with presets
 # omarchy:group=audio
 #
-# Backend for the creolben.equalizer shell plugin. It hosts a PipeWire
+# Backend for the io.github.creolben.equalizer shell plugin. It hosts a PipeWire
 # filter-chain equalizer as its own PipeWire client, so it can be switched on and
 # off (and reconfigured) without restarting pipewire.service -- a daemon restart
 # drops every PulseAudio client connection and apps that do not reconnect have

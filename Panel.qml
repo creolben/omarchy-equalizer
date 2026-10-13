@@ -15,8 +15,8 @@ import "Model.js" as Model
 // from one session, or a band nudged from a terminal, shows up here unchanged.
 Panel {
   id: root
-  moduleName: "creolben.equalizer"
-  ipcTarget: "creolben.equalizer"
+  moduleName: "io.github.creolben.equalizer"
+  ipcTarget: "io.github.creolben.equalizer"
 
   // Injected by BarWidget.qml.
   property Item anchorItem: null

@@ -19,14 +19,14 @@ omarchy plugin add https://github.com/creolben/omarchy-equalizer.git --enable
 That is the whole install. The plugin carries its own backend
 (`bin/omarchy-equalizer`) and the panel addresses it inside the plugin directory,
 so nothing has to be put on `PATH`. It appears in the bar as an equalizer icon;
-click it, or run `omarchy-shell shell summon creolben.equalizer`.
+click it, or run `omarchy-shell shell summon io.github.creolben.equalizer`.
 
 To work on the plugin instead, clone it in place:
 
 ```sh
 git clone https://github.com/creolben/omarchy-equalizer.git \
-  ~/.config/omarchy/plugins/creolben.equalizer
-omarchy plugin enable creolben.equalizer
+  ~/.config/omarchy/plugins/io.github.creolben.equalizer
+omarchy plugin enable io.github.creolben.equalizer
 ./install.sh    # optional: puts the `omarchy-equalizer` CLI on your PATH
 ```
 
@@ -49,9 +49,9 @@ device you had selected and stops both units, so removing the plugin afterwards
 cannot leave your machine pointing at a sink that no longer exists:
 
 ```sh
-~/.config/omarchy/plugins/creolben.equalizer/bin/omarchy-equalizer disable
-omarchy plugin disable creolben.equalizer
-omarchy plugin remove creolben.equalizer --yes
+~/.config/omarchy/plugins/io.github.creolben.equalizer/bin/omarchy-equalizer disable
+omarchy plugin disable io.github.creolben.equalizer
+omarchy plugin remove io.github.creolben.equalizer --yes
 ```
 
 Then delete what the plugin wrote outside its own directory:

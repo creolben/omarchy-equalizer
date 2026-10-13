@@ -8,9 +8,9 @@ import qs.Ui
 // shell, exactly like the first-party panels under plugins/panels/.
 BarWidget {
   id: root
-  moduleName: "creolben.equalizer"
+  moduleName: "io.github.creolben.equalizer"
 
-  // Summoned by omarchy-shell shell summon creolben.equalizer, and by the
+  // Summoned by omarchy-shell shell summon io.github.creolben.equalizer, and by the
   // plugin's own click. Bar.findPanelWidget requires open/close/opened on the
   // bar-widget root, so all three are mirrored off the panel.
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
