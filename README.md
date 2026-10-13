@@ -42,6 +42,33 @@ Enabling makes the equalizer the default sink and moves application streams onto
 it; disabling restores the output you had selected. While it is on, the volume
 keys control its level, which is applied before the bands.
 
+### Uninstall
+
+Take the equalizer out of the audio path **first** — that restores the output
+device you had selected and stops both units, so removing the plugin afterwards
+cannot leave your machine pointing at a sink that no longer exists:
+
+```sh
+~/.config/omarchy/plugins/creolben.equalizer/bin/omarchy-equalizer disable
+omarchy plugin disable creolben.equalizer
+omarchy plugin remove creolben.equalizer --yes
+```
+
+Then delete what the plugin wrote outside its own directory:
+
+```sh
+rm -f  ~/.local/bin/omarchy-equalizer                       # only if you ran install.sh
+rm -f  ~/.config/pipewire/omarchy-equalizer.conf
+rm -rf ~/.config/pipewire/omarchy-equalizer.conf.d          # the generated graph
+rm -f  ~/.config/systemd/user/omarchy-equalizer.service \
+       ~/.config/systemd/user/omarchy-equalizer-follow.service
+rm -rf ~/.local/state/omarchy-equalizer                     # state, user presets, AutoEq cache
+systemctl --user daemon-reload
+```
+
+The state directory holds your bands, your saved presets and your settings; keep
+it if you plan to install the plugin again.
+
 ## How it fits together
 
 - `bin/omarchy-equalizer` — a bash script that owns the state, generates the
