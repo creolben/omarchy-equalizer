@@ -265,6 +265,51 @@ out="$(run import-autoeq 'Test HP (velour)')"
 check "a name import still searches the index" "1" "$(grep -c 'INDEX.md' "$CURL_LOG")"
 check "a name import resolves the variant asked for" "Test HP (velour)" "$(jq -r '.preset' <<<"$out")"
 
+# A profile is untrusted input and its fields land unquoted in the fragment. A
+# JSON string carrying an escaped brace and newline -- awk splits on whitespace,
+# so the token has no literal space -- used to survive --argjson and be decoded
+# by jq -r, closing the control braces and appending configuration (context.exec
+# among it) to the graph. The import must refuse it before anything is written.
+run set-mode graphic >/dev/null
+state_before="$(cat "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+frag_before="$(cat "$frag")"
+printf '%s\n' 'Filter 1: ON PK Fc "\u007d\u000a" Hz Gain 6.0 dB Q 0.7' >"$T/Evil ParametricEQ.txt"
+out="$(run import-autoeq "$T/Evil ParametricEQ.txt")"; rc=$?
+check "a crafted Fc is refused" "1" "$rc"
+check "the refusal names the field" "1" "$(grep -c 'Profile Fc' <<<"$out")"
+check "the crafted import saves no preset" "0" "$(run presets | grep -c '^Evil$')"
+check "the crafted import leaves the state alone" "$state_before" \
+  "$(cat "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+check "the crafted import does not rewrite the fragment" "$frag_before" "$(cat "$frag")"
+
+# The same injection already in a band -- from a hand edit or a saved preset -- must
+# be refused by the fragment writer too, and the marker must not reach the file. The
+# value keeps a numeric prefix so auto_preamp_db's awk reads it as a number and
+# survives to the guard; a leading brace makes that awk divide by zero first.
+mkdir -p "$XDG_STATE_HOME/omarchy-equalizer"
+jq -c -n '{ enabled: false, mode: "graphic", preset: "Test", preamp: 0, headroom: "auto",
+  parametric: [],
+  graphic: [ { type: "peaking", freq: 1000, q: "0.7}\nINJECTED_MARKER", gain: 0 } ] }' \
+  >"$XDG_STATE_HOME/omarchy-equalizer/state.json"
+out="$(run set-mode graphic)"; rc=$?
+check "the fragment writer refuses a string band value" "1" "$rc"
+check "the fragment refusal names the band" "1" "$(grep -c 'Band 0 Q must be a number' <<<"$out")"
+check "nothing is injected into the fragment" "0" "$(grep -c 'INJECTED_MARKER' "$frag")"
+
+# And the live path -- bands straight to pw-cli, no fragment in between -- must
+# refuse it before a single parameter reaches the graph.
+jq -c -n '{ enabled: false, mode: "graphic", preset: "Test", preamp: 0, headroom: "auto",
+  parametric: [],
+  graphic: [ { type: "peaking", freq: 1000, q: "0.7}\nINJECTED_MARKER", gain: 0 } ] }' \
+  >"$XDG_STATE_HOME/omarchy-equalizer/state.json"
+: >"$PWCLI_LOG"
+out="$(run set-gain 0 1)"; rc=$?
+check "the live path refuses a string band value" "1" "$rc"
+check "the live refusal names the band" "1" "$(grep -c 'Band 0 Q must be a number' <<<"$out")"
+check "the live path sends nothing to the graph" "0" "$(grep -c 'INJECTED_MARKER' "$PWCLI_LOG")"
+# Drop the crafted state so the sections after this start from the defaults.
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+
 echo "== preset ramp =="
 # Get into graphic mode with a flat graphic set, then clear the logs so only the
 # preset application is measured. The ramp is enabled here; every other test

@@ -132,6 +132,25 @@ active_bands() {
     if $mode == "parametric" then .parametric else .graphic end' <<<"$1"
 }
 
+# Frequency, gain and Q are interpolated unquoted into the fragment on disk and
+# into the live pw-cli parameter list, so a non-number in a band is not a value
+# but extra configuration: jq -r decodes its escapes, and a JSON string that
+# closes the control braces can append nodes -- a context.exec among them -- to
+# the graph. Bands reach here from a crafted profile as much as from a hand edit,
+# so walk the set and refuse the first field that is not a plain number.
+need_numeric_bands() {
+  local bands="$1" i count freq gain q
+  count="$(jq 'length' <<<"$bands")"
+  for ((i = 0; i < count; i++)); do
+    freq="$(jq -r ".[$i].freq // 1000" <<<"$bands")"
+    gain="$(jq -r ".[$i].gain // 0" <<<"$bands")"
+    q="$(jq -r ".[$i].q // 1.0" <<<"$bands")"
+    is_number "$freq" || die "Band $i freq must be a number, not '$freq'."
+    is_number "$gain" || die "Band $i gain must be a number, not '$gain'."
+    is_number "$q" || die "Band $i Q must be a number, not '$q'."
+  done
+}
+
 # ---------------------------------------------------------------- headroom
 
 # The peak of the active band chain with the preamp at zero, on the same 400-step
@@ -427,6 +446,7 @@ write_fragment() {
   local state="$1" mode bands count i ctl boost_level limiter_state
   mode="$(jq -r '.mode' <<<"$state")"
   bands="$(active_bands "$state")"
+  need_numeric_bands "$bands"
   count="$(jq 'length' <<<"$bands")"
 
   state_dir_ensure
@@ -548,6 +568,7 @@ find_node_id() {
 # the control layout (and the pass-filter rule that withholds Gain).
 build_band_params() {
   local bands="$1" preamp="${2:-0}" params i count
+  need_numeric_bands "$bands"
   count="$(jq 'length' <<<"$bands")"
   params="\"pre:Mult\" $(db_to_mult "$preamp")"
   for ((i = 0; i < count; i++)); do
@@ -577,8 +598,12 @@ live_send_params() {
 }
 
 live_apply_bands() {
-  local bands="$1" state="$2"
-  live_send_params "$(build_band_params "$bands" "$(jq -r '.preamp // 0' <<<"$state")")"
+  local bands="$1" state="$2" params
+  # build_band_params refuses a non-numeric band from inside a command
+  # substitution, so its die only ends that subshell: carry the failure out here
+  # rather than send an empty parameter list.
+  params="$(build_band_params "$bands" "$(jq -r '.preamp // 0' <<<"$state")")" || exit 1
+  live_send_params "$params"
 }
 
 # The preamp is a single live control, so the automatic and manual paths share
@@ -612,11 +637,12 @@ interpolate_bands() {
 # target write (the tests use it to avoid the sleeps where they do not assert on
 # the fade itself).
 live_ramp_bands() {
-  local from_bands="$1" to_bands="$2" from_preamp="$3" to_preamp="$4" id k t step_bands step_preamp
+  local from_bands="$1" to_bands="$2" from_preamp="$3" to_preamp="$4" id k t step_bands step_preamp params
   id="$(find_node_id)"
   [[ -n $id ]] || return 1
   if [[ ${OMARCHY_EQ_NO_RAMP:-} == 1 ]]; then
-    live_send_params "$(build_band_params "$to_bands" "$to_preamp")" "$id"
+    params="$(build_band_params "$to_bands" "$to_preamp")" || exit 1
+    live_send_params "$params" "$id"
     return
   fi
   for ((k = 1; k <= 8; k++)); do
@@ -629,7 +655,8 @@ live_ramp_bands() {
       step_preamp="$(LC_ALL=C awk -v a="$from_preamp" -v b="$to_preamp" -v t="$t" \
         'BEGIN { printf "%.6f", a + (b - a) * t }')"
     fi
-    live_send_params "$(build_band_params "$step_bands" "$step_preamp")" "$id"
+    params="$(build_band_params "$step_bands" "$step_preamp")" || exit 1
+    live_send_params "$params" "$id"
     if ((k < 8)); then sleep 0.02; fi
   done
 }
@@ -1248,11 +1275,24 @@ autoeq_type() {
 #
 # so this reads Peace and EqualizerAPO configs too. Off filters are skipped
 # rather than imported as flat bands, which would silently widen the profile.
+#
+# A profile is untrusted input -- downloaded, or handed over as a local file --
+# and every value in it is interpolated unquoted into the PipeWire fragment, so
+# the numeric fields are checked here, before the profile is saved or applied:
+# a JSON string survives --argjson and jq -r decodes its escapes, which would
+# otherwise let a crafted profile close the control braces and write extra
+# configuration into the graph (context.exec among it).
 autoeq_profile_json() {
   local file="$1" type freq gain q bands='[]' preamp=0
   while read -r type freq gain q; do
     [[ -z $type ]] && continue
-    if [[ $type == PREAMP ]]; then preamp="$freq"; continue; fi
+    if [[ $type == PREAMP ]]; then
+      is_number "$freq" || die "Profile preamp '$freq' is not a number."
+      preamp="$freq"; continue
+    fi
+    is_number "$freq" || die "Profile Fc '$freq' is not a number."
+    is_number "$gain" || die "Profile Gain '$gain' is not a number."
+    is_number "$q" || die "Profile Q '$q' is not a number."
     bands="$(jq -c --arg t "$(autoeq_type "$type")" --argjson f "$freq" --argjson g "$gain" --argjson q "$q" \
       '. + [{ type: $t, freq: $f, gain: $g, q: $q }]' <<<"$bands")"
   done < <(LC_ALL=C awk '
@@ -1322,7 +1362,9 @@ cmd_import_autoeq() {
     }
   fi
 
-  parsed="$(autoeq_profile_json "$file")"
+  # The parser runs in a command substitution, so its die (exit) only leaves the
+  # subshell: propagate the failure rather than importing half a profile.
+  parsed="$(autoeq_profile_json "$file")" || exit 1
   rm -f "$file"
   bands="$(jq -c '.bands' <<<"$parsed")"
   preamp="$(jq -r '.preamp' <<<"$parsed")"
