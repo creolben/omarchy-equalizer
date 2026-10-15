@@ -75,6 +75,22 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installe
 # error. Reject it here, where the message can say what was wrong.
 is_number() { [[ ${1:-} =~ ^-?[0-9]+([.][0-9]+)?$ ]]; }
 need_number() { is_number "${1:-}" || die "'${1:-}' is not a number."; }
+# A mode names one of the two band sets, so it must be exactly one of them. The
+# fragment writes it into the header comment, and a newline in it would end the
+# comment and leave the rest of the value to be read as configuration; the state
+# and the preset are both places it can come from, so it is checked at each.
+need_mode() { case "${1:-}" in graphic | parametric) ;; *) die "Mode must be graphic or parametric, not '${1:-}'." ;; esac; }
+# A sink name is written between double quotes in playback.props, and it comes
+# from pactl, where any client can register a node -- a Bluetooth or USB device
+# names itself. A quote closes the string early; a backslash or a control
+# character (newline, carriage return, tab) smuggles raw configuration past it.
+# Every real node name uses letters, digits, dots, dashes, underscores, spaces or
+# non-ASCII, so only those three are refused.
+need_sink_name() {
+  local name="${1:-}"
+  [[ ! $name =~ [\"\\] && ! $name =~ [[:cntrl:]] ]] ||
+    die "Sink name '$name' contains a quote, backslash or control character."
+}
 
 need jq
 
@@ -443,8 +459,12 @@ limiter_params() { limiter_values "${1:-on}" | stage_params limit; }
 # A shelf's "Q" control is the slope, not a bandwidth, so a shelf band keeps its
 # own value but never inherits the graphic Q.
 write_fragment() {
-  local state="$1" mode bands count i ctl boost_level limiter_state
-  mode="$(jq -r '.mode' <<<"$state")"
+  local state="$1" target="${2:-}" mode bands count i ctl boost_level limiter_state
+  # The backstop for a hand-edited state: both values land in the loaded config,
+  # so refuse them here as the last line of defence before anything is written.
+  mode="$(jq -r '.mode // "graphic"' <<<"$state")"
+  need_mode "$mode"
+  need_sink_name "$target"
   bands="$(active_bands "$state")"
   need_numeric_bands "$bands"
   count="$(jq 'length' <<<"$bands")"
@@ -523,7 +543,7 @@ write_fragment() {
     printf '      audio.channels = 2\n'
     printf '      audio.position = [ FL FR ]\n'
     printf '      capture.props  = { node.name = "%s" node.description = "Equalizer" media.class = Audio/Sink }\n' "$sink_name"
-    printf '      playback.props = { node.name = "%s.output" node.passive = true target.object = "%s" }\n' "$sink_name" "${2:-}"
+    printf '      playback.props = { node.name = "%s.output" node.passive = true target.object = "%s" }\n' "$sink_name" "$target"
     printf '    }\n  }\n]\n'
   } >"$fragment.tmp"
 
@@ -817,6 +837,9 @@ cmd_enable() {
   default="$(current_default_sink)"
   target="$(chain_target)"
   [[ -n $target ]] || die "No output sink to equalize."
+  # Refuse a name that would break out of the quoted target at its source, so it
+  # is never remembered in the state rather than caught later by the writer.
+  need_sink_name "$target"
 
   write_fragment "$state" "$target"
   service_start || die "The equalizer filter-chain failed to start."
@@ -869,6 +892,7 @@ cmd_retarget() {
   [[ -n $default && $default != "$sink_name" ]] || return 0
   target="$(chain_target)"
   [[ -n $target && $target != "$sink_name" ]] || return 0
+  need_sink_name "$target"
   state="$(jq -c --arg prev "$default" --arg tgt "$target" '.previousDefaultSink = $prev | .targetSink = $tgt' <<<"$state")"
   state_write "$state"
   write_fragment "$state" "$target"
@@ -982,7 +1006,7 @@ cmd_remove_band() {
 
 cmd_set_mode() {
   local mode="$1" state
-  case "$mode" in graphic | parametric) ;; *) die "Mode must be graphic or parametric." ;; esac
+  need_mode "$mode"
   state="$(state_read)"
   state="$(jq -c --arg m "$mode" '.mode = $m' <<<"$state")"
   state="$(apply_headroom "$state")"
@@ -998,8 +1022,11 @@ cmd_apply_preset() {
   preset="$(preset_read "$name")" || die "No preset named '$name'."
 
   # A preset may carry its own mode; a graphic preset applied while in
-  # parametric mode switches modes rather than stuffing 10 bands into 8.
+  # parametric mode switches modes rather than stuffing 10 bands into 8. A user
+  # preset's mode is otherwise copied straight into the state, so validate it
+  # before that write -- a bogus one must never be stored or reported.
   mode="$(jq -r '.mode // "graphic"' <<<"$preset")"
+  need_mode "$mode"
   state="$(state_read)"
   # What is running right now: the ramp needs both ends, and the shape check
   # decides whether a ramp is usable at all.

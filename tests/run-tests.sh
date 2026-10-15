@@ -310,6 +310,76 @@ check "the live path sends nothing to the graph" "0" "$(grep -c 'INJECTED_MARKER
 # Drop the crafted state so the sections after this start from the defaults.
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 
+echo "== crafted mode and targetSink =="
+# A preset's mode is copied into the state unchecked, and write_fragment prints it
+# into the header comment. A newline in it ends the comment, so the line after is
+# read as configuration -- context.exec among it -- which is what a crafted preset
+# mode used to write into the loaded config. It must be refused before the state
+# is touched.
+run set-mode graphic >/dev/null
+frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
+jq -c -n '{ EvilMode: {
+  mode: "graphic\ncontext.exec = [ { command = \"touch /tmp/eq-mode-pwned\" } ] #",
+  graphic: [ { type: "peaking", freq: 1000, q: 1.0, gain: 0 } ],
+  parametric: [], preamp: 0 } }' >"$XDG_STATE_HOME/omarchy-equalizer/presets.json"
+state_before="$(cat "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+frag_before="$(cat "$frag")"
+out="$(run apply-preset EvilMode)"; rc=$?
+check "a crafted preset mode is refused" "1" "$rc"
+check "the mode refusal names the valid modes" "1" "$(grep -c 'graphic or parametric' <<<"$out")"
+check "the crafted mode reaches no fragment" "0" "$(grep -c 'eq-mode-pwned' "$frag")"
+check "the crafted mode leaves the state alone" "$state_before" \
+  "$(cat "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+check "the crafted mode does not rewrite the fragment" "$frag_before" "$(cat "$frag")"
+
+# The guard's positive half: a normal preset still applies and switches the mode.
+out="$(run apply-preset Flat)"; rc=$?
+check "a normal preset still applies" "0" "$rc"
+check "and it still switches the mode" "graphic" "$(run status | jq -r '.mode')"
+
+# The state's targetSink lands between double quotes in playback.props, and it
+# comes from pactl, where any client can register a node. A quote closes the
+# string and the rest is read as configuration; the fragment writer must refuse it
+# rather than write it.
+jq -c -n '{ enabled: false, mode: "graphic", preset: "Test", preamp: 0, headroom: "auto",
+  targetSink: "evil\" }\ncontext.exec = [ { command = \"touch /tmp/eq-sink-pwned\" } ] #",
+  parametric: [],
+  graphic: [ { type: "peaking", freq: 1000, q: 1.0, gain: 0 } ] }' \
+  >"$XDG_STATE_HOME/omarchy-equalizer/state.json"
+frag_before="$(cat "$frag")"
+out="$(run set-mode graphic)"; rc=$?
+check "a crafted targetSink is refused" "1" "$rc"
+check "the sink refusal names the offending character" "1" \
+  "$(grep -c 'contains a quote, backslash or control character' <<<"$out")"
+check "the crafted sink reaches no fragment" "0" "$(grep -c 'eq-sink-pwned' "$frag")"
+check "the crafted sink does not rewrite the fragment" "$frag_before" "$(cat "$frag")"
+
+# An ordinary node name -- dashes and dots, no quotes -- is what the guard is
+# meant to let through.
+jq -c -n '{ enabled: false, mode: "graphic", preset: "Test", preamp: 0, headroom: "auto",
+  targetSink: "alsa_output.pci-0000_00_1f.3.analog-stereo", parametric: [],
+  graphic: [ { type: "peaking", freq: 1000, q: 1.0, gain: 0 } ] }' \
+  >"$XDG_STATE_HOME/omarchy-equalizer/state.json"
+out="$(run set-mode graphic)"; rc=$?
+check "an ordinary sink name is not refused" "0" "$rc"
+check "and it reaches the fragment" "1" \
+  "$(grep -c 'target.object = "alsa_output.pci-0000_00_1f.3.analog-stereo"' "$frag")"
+
+# The source guard: a pathological default sink is refused before it is
+# remembered, rather than being stored and caught only by the writer.
+run disable >/dev/null
+export PACTL_DEFAULT_SINK='evil" } #'
+out="$(run enable)"; rc=$?
+check "a pathological pactl sink is refused at enable" "1" "$rc"
+check "the enable refusal names the offending character" "1" \
+  "$(grep -c 'contains a quote, backslash or control character' <<<"$out")"
+check "the pathological sink is not remembered" "0" \
+  "$(grep -c 'evil' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+unset PACTL_DEFAULT_SINK
+# Clean the crafted state and preset so the sections after start from defaults.
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
+
 echo "== preset ramp =="
 # Get into graphic mode with a flat graphic set, then clear the logs so only the
 # preset application is measured. The ramp is enabled here; every other test
