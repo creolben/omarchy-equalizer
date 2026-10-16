@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.creolben.equalizer",
   "name": "Equalizer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "creolben",
   "license": "MIT",
   "description": "System-wide 10-band graphic equalizer plus parametric bands, with presets",
