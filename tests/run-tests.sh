@@ -621,6 +621,38 @@ check "without LSP add-band restarts" "1" "$(grep -c restart "$SYSTEMCTL_LOG")"
 export OMARCHY_EQ_LV2_DIR="$T/lv2"
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 
+echo "== panel fields never use a native Qt text input =="
+# Every editable Qt text input reads another application's clipboard offer on
+# each clipboard change, unbounded, inside the shell process the panel runs in
+# (marketplace review, issue 11753). The fields are drawn from key events
+# instead, and this scan keeps it that way -- the comments may name the types
+# the code avoids, so they are stripped before scanning.
+strip_qml_comments() { perl -0777 -pe 's{/\*.*?\*/}{}gs; s{//.*$}{}gm' "$1"; }
+native=0
+clipboard=0
+for qml in "$here"/../*.qml; do
+  native=$((native + $(strip_qml_comments "$qml" | grep -cE '\b(TextInput|TextField|TextEdit|TextArea|SpinBox|NumberField)\b')))
+  clipboard=$((clipboard + $(strip_qml_comments "$qml" | grep -ci 'clipboard')))
+done
+check "no native text-input type in shipped QML" "0" "$native"
+check "no clipboard reference in shipped QML" "0" "$clipboard"
+check "the preset name and AutoEq query are KeyFields" "2" "$(grep -c 'KeyField {' "$here/../Panel.qml")"
+check "the frequency and Q fields are KeyFields" "2" "$(grep -c 'KeyField {' "$here/../ParametricBandRow.qml")"
+check "the band row needs no Qt Quick Controls" "0" "$(grep -c '^import QtQuick.Controls' "$here/../ParametricBandRow.qml")"
+
+echo "== offscreen QML field tests =="
+qmltestrunner=""
+[[ -x /usr/lib/qt6/bin/qmltestrunner ]] && qmltestrunner=/usr/lib/qt6/bin/qmltestrunner
+if [[ -n $qmltestrunner ]]; then
+  qml_out="$(QT_QPA_PLATFORM=offscreen HOME="$T" timeout 90 "$qmltestrunner" \
+    -import "$here/qml/imports" -input "$here/qml" 2>&1 || true)"
+  printf '%s\n' "$qml_out" | grep -E 'Totals:' | sed 's/^/      /'
+  check "the key-field tests pass offscreen" "yes" \
+    "$(printf '%s' "$qml_out" | grep -qE 'Totals: [0-9]+ passed, 0 failed' && echo yes || echo no)"
+else
+  printf 'SKIP  offscreen QML field tests (qmltestrunner is not installed)\n'
+fi
+
 rm -rf "$T"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

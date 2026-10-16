@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
@@ -68,14 +67,8 @@ Item {
     root.qCommitted(value)
   }
 
-  onBandFreqChanged: if (!freqField.activeFocus) freqField.text = String(Math.round(bandFreq))
-  onBandQChanged: if (!qField.activeFocus) qField.text = String(bandQ)
   onBandGainChanged: liveGain = bandGain
-  Component.onCompleted: {
-    liveGain = bandGain
-    freqField.text = String(Math.round(bandFreq))
-    qField.text = String(bandQ)
-  }
+  Component.onCompleted: liveGain = bandGain
 
   // The card the row sits on: one surface per band, lit while the pointer is
   // anywhere over it, so the row reads as a unit rather than five loose fields.
@@ -192,37 +185,39 @@ Item {
   }
 
   // ---- frequency ----
-  TextField {
+  KeyField {
     id: freqField
     width: Style.space(66)
     height: root.fieldHeight
     foreground: root.foreground
-    horizontalAlignment: TextInput.AlignRight
+    horizontalAlignment: Text.AlignRight
     placeholderText: "Hz"
+    allowedCharacters: /[0-9.]/
+    maximumLength: 7
+    value: String(Math.round(root.bandFreq))
     anchors.right: qField.left
     anchors.rightMargin: Style.space(8)
     anchors.verticalCenter: parent.verticalCenter
-    validator: DoubleValidator { bottom: 20; top: 20000; decimals: 0; notation: DoubleValidator.StandardNotation }
+    onAccepted: root.commitFreq()
     onEditingFinished: root.commitFreq()
-    Keys.onReturnPressed: root.commitFreq()
-    Keys.onEnterPressed: root.commitFreq()
   }
 
   // ---- Q ----
-  TextField {
+  KeyField {
     id: qField
     width: Style.space(56)
     height: root.fieldHeight
     foreground: root.foreground
-    horizontalAlignment: TextInput.AlignRight
+    horizontalAlignment: Text.AlignRight
     placeholderText: "Q"
+    allowedCharacters: /[0-9.]/
+    maximumLength: 5
+    value: String(root.bandQ)
     anchors.right: removeButton.left
     anchors.rightMargin: Style.space(8)
     anchors.verticalCenter: parent.verticalCenter
-    validator: DoubleValidator { bottom: 0.1; top: 30; decimals: 2; notation: DoubleValidator.StandardNotation }
+    onAccepted: root.commitQ()
     onEditingFinished: root.commitQ()
-    Keys.onReturnPressed: root.commitQ()
-    Keys.onEnterPressed: root.commitQ()
   }
 
   Button {

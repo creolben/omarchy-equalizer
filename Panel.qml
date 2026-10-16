@@ -437,6 +437,9 @@ Panel {
       return
     }
     saveName = ""
+    // The field follows saveName only while unfocused, and the button click
+    // leaves it focused, so clear the draft here as well.
+    presetNameField.text = ""
     run(["save-preset", name])
   }
 
@@ -1178,15 +1181,14 @@ Panel {
               width: parent.width
               spacing: Style.space(6)
 
-              TextField {
+              KeyField {
                 id: presetNameField
                 width: parent.width - savePresetButton.width - Style.space(6)
                 placeholderText: "Save current bands as…"
-                text: root.saveName
+                value: root.saveName
                 foreground: root.barForeground
-                onTextChanged: root.saveName = text
-                Keys.onReturnPressed: root.savePreset()
-                Keys.onEnterPressed: root.savePreset()
+                onTextEdited: root.saveName = text
+                onAccepted: root.savePreset()
               }
 
               Button {
@@ -1225,15 +1227,14 @@ Panel {
               width: parent.width
               spacing: Style.space(6)
 
-              TextField {
+              KeyField {
                 id: autoeqField
                 width: parent.width - autoeqSearchButton.width - Style.space(6)
                 placeholderText: "Headphone model…"
-                text: root.autoeqQuery
+                value: root.autoeqQuery
                 foreground: root.barForeground
-                onTextChanged: root.autoeqQuery = text
-                Keys.onReturnPressed: root.searchAutoEq()
-                Keys.onEnterPressed: root.searchAutoEq()
+                onTextEdited: root.autoeqQuery = text
+                onAccepted: root.searchAutoEq()
               }
 
               Button {

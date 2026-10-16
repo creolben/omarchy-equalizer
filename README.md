@@ -102,10 +102,15 @@ it if you plan to install the plugin again.
   device changes — plugging in headphones otherwise leaves the equalizer playing
   into the old device while apps bypass it.
 - The panel is QML (`Panel.qml`, `ResponseCurve.qml`, the slider and switch
-  widgets). `Model.js` holds the biquad response maths; the response curve the
-  panel draws and the automatic headroom the backend computes are the same
-  formulas, in JS and `awk` respectively, and `tests/headroom-check.js` keeps
-  them honest against each other.
+  widgets). Its text and number fields (`presetNameField`, the AutoEq query,
+  the band frequency and Q) are drawn from key events (`KeyField.qml`): an
+  editable native Qt text input reads another application's clipboard offer on
+  each clipboard change, unbounded, inside the shell process the panel runs in,
+  so the fields never instantiate one. Paste is unavailable by design; Return
+  or leaving a field commits, and Ctrl+U clears it. `Model.js` holds the biquad
+  response maths; the response curve the panel draws and the automatic headroom
+  the backend computes are the same formulas, in JS and `awk` respectively, and
+  `tests/headroom-check.js` keeps them honest against each other.
 
 ## Command line
 
@@ -180,7 +185,7 @@ keys control its level, which is applied before the bands.
 ## Tests
 
 ```sh
-bash tests/run-tests.sh     # 145 assertions, no real sink touched
+bash tests/run-tests.sh     # 224 assertions, no real sink touched
 node tests/curve-check.js   # Model.js response maths vs PipeWire's own biquads
 ```
 
@@ -194,6 +199,12 @@ edit does not restart the unit" is an assertion rather than an observation.
 built-in preset's applied curve with the plugin's own model (at each graph rate
 the chain can run at) and enforces the level-matching rules described under
 [Presets](#presets), plus that each file names and describes itself.
+
+The suite also scans every shipped `.qml` (comments stripped) for Qt's native
+text-input types and for the clipboard — the panel must never give the shell a
+reason to read a foreign clipboard — and, when `qmltestrunner` is installed,
+runs `tests/qml/tst_keyfield.qml` offscreen against stand-ins for the shell kit
+(`tests/qml/imports`). Without the runner that part is skipped, not failed.
 
 ## Presets
 
