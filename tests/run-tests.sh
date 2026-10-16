@@ -458,6 +458,8 @@ check "set-boost does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_L
 check "set-boost writes all its controls in one call" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
 check "set-boost high enables the multiband compressor" "yes" \
   "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:enabled" 1' && echo yes || echo no)"
+check "set-boost writes the envelope boost off" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:envb" 0' && echo yes || echo no)"
 check "set-boost high switches the mid band's split on" "yes" \
   "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:cbe_1" 1' && echo yes || echo no)"
 check "set-boost high keeps the fourth band's split off" "yes" \
@@ -475,6 +477,8 @@ check "set-boost off leaves medium's bass threshold in place" "yes" \
   "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:al_0" 0.063096' && echo yes || echo no)"
 check "set-boost keeps the fragment in step" "1" \
   "$(grep 'name = boost' "$frag" | grep -c '"mk_0" = 2.238721')"
+check "the boost node carries the envelope boost off" "1" \
+  "$(grep 'name = boost' "$frag" | grep -c '"envb" = 0')"
 
 echo "== output stage validation =="
 out="$(run set-limiter maybe)"; rc=$?

@@ -405,7 +405,11 @@ boost_values() {
     high)   enabled=1; al=(-28 -26 -26); cr=4; at=5;  rt=100; mk=10 ;;
     medium | *) enabled=1; al=(-24 -22 -22); cr=3; at=8; rt=120; mk=7 ;;
   esac
-  printf 'enabled %s\nmode 1\nofe 0\nife 0\ng_in 1\ng_out 1\ndrywet 100\n' "$enabled"
+  # LSP defaults envb ("Envelope boost") to 1 (Pink BT), a pink-noise weighting
+  # of the level detector that makes the compressor engage ~17 dB below the
+  # configured thresholds. Writing 0 (None) makes al_N mean the documented dB
+  # threshold, so the transfer curve matches the table above.
+  printf 'enabled %s\nmode 1\nofe 0\nife 0\ng_in 1\ng_out 1\ndrywet 100\nenvb 0\n' "$enabled"
   # cbe_N ("Compression band enable N+1") is the toggle that actually splits the
   # extra bands; the plugin's defaults alternate 0/1 across cbe_1..cbe_7, so
   # without writing them the mid band folds into the bass band and the stage
