@@ -130,17 +130,26 @@ done
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 
 echo "== live vs rebuild =="
+# In parametric mode with LSP the 16-slot pool is resident, so a type change is a
+# values write: no restart, and the whole slot set goes out in one pw-cli call.
 run set-mode parametric >/dev/null
-: >"$SYSTEMCTL_LOG"
+frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
 run set-band 3 type lowshelf >/dev/null
-check "a type change restarts the unit" "yes" "$(grep -c restart "$SYSTEMCTL_LOG" | sed 's/^0$/no/;s/^[1-9].*/yes/')"
-: >"$SYSTEMCTL_LOG"
+check "a parametric type change does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "a parametric type change is one pw-cli call" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+check "the type change writes the pool slot" "yes" "$(grep -q '"para:ft_3" 5' "$PWCLI_LOG" && echo yes || echo no)"
+check "the type change keeps the fragment's pool slot in step" "yes" \
+  "$(grep -q '"ft_3" = 5' "$frag" && echo yes || echo no)"
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
 run set-band 3 freq 300 >/dev/null
 check "a frequency change does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "and reaches the pool live" "yes" "$(grep -q '"para:f_3" 300' "$PWCLI_LOG" && echo yes || echo no)"
 run set-band 3 q 2.5 >/dev/null
 check "a Q change does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
 run set-gain 3 -4.5 >/dev/null
 check "a gain change does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "a gain change reaches the pool live" "yes" "$(grep -q '"para:g_3" 0.595662' "$PWCLI_LOG" && echo yes || echo no)"
 check "the frequency edit was persisted" "300" "$(run status | jq -r '.bands[3].freq')"
 check "the type edit was persisted" "lowshelf" "$(run status | jq -r '.bands[3].type')"
 
@@ -399,10 +408,10 @@ check "the last ramp step carries the preset's final gains" "yes" \
 run apply-preset "Speech Clarity" >/dev/null
 check "a parametric preset rebuilds the graph" "yes" \
   "$(grep -c restart "$SYSTEMCTL_LOG" | sed 's/^0$/no/;s/^[1-9].*/yes/')"
-: >"$SYSTEMCTL_LOG"
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
 run add-band >/dev/null
-check "a band-count change restarts the unit" "yes" \
-  "$(grep -c restart "$SYSTEMCTL_LOG" | sed 's/^0$/no/;s/^[1-9].*/yes/')"
+check "adding a band to a running pool does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "adding a band to the pool is one live write" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
 
 echo "== output stage defaults =="
 check "the limiter defaults on" "on" "$(run status | jq -r '.limiter')"
@@ -433,11 +442,14 @@ check "the last band feeds the compressor" "1" \
 check "the compressor feeds the limiter" "1" \
   "$(grep -c 'boost:out" input = "limit:in"' "$frag")"
 check "the limiter is the graph output" "0" "$(grep -c 'limit:out' "$frag")"
-# With no bands the preamp is the whole head of the chain and feeds the stage.
+# With no bands the preamp is the whole head of the chain and feeds the pool,
+# which then feeds the stage.
 run set-mode parametric >/dev/null
 while [[ $(run status | jq -r '.bands | length') -gt 0 ]]; do run remove-band 0 >/dev/null; done
-check "with no bands the preamp feeds the compressor" "1" \
-  "$(grep -c 'pre:Out" input = "boost:in"' "$frag")"
+check "with no bands the preamp feeds the pool" "1" \
+  "$(grep -c 'pre:Out" input = "para:in"' "$frag")"
+check "with no bands the pool feeds the compressor" "1" \
+  "$(grep -c 'para:out" input = "boost:in"' "$frag")"
 check "with no bands there is still no g0 link" "0" "$(grep -c 'g0:In' "$frag")"
 
 echo "== output stage live control =="
@@ -506,14 +518,108 @@ check "set-boost warns that the stage is inactive" \
 check "set-boost stores the value without LSP" "medium" "$(run status | jq -r '.boost')"
 export OMARCHY_EQ_LV2_DIR="$T/lv2"
 
-echo "== output stage survives a rebuild =="
+echo "== output stage survives a pool edit =="
 run set-mode parametric >/dev/null
 : >"$SYSTEMCTL_LOG"
 run add-band >/dev/null
-check "a band-count change still restarts with the stage" "yes" \
-  "$(grep -c restart "$SYSTEMCTL_LOG" | sed 's/^0$/no/;s/^[1-9].*/yes/')"
-check "the regenerated fragment keeps the compressor" "1" "$(grep -c 'lv2/mb_compressor_mono' "$frag")"
-check "the regenerated fragment keeps the limiter" "1" "$(grep -c 'limiter_mono' "$frag")"
+check "a live pool edit does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "the synced fragment keeps the compressor" "1" "$(grep -c 'lv2/mb_compressor_mono' "$frag")"
+check "the synced fragment keeps the limiter" "1" "$(grep -c 'limiter_mono' "$frag")"
+
+echo "== parametric pool fragment =="
+# The type map, APO (DR) mode and Off unused slots are the contract the panel's
+# curve and the backend's headroom rest on, so they are asserted, not assumed.
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-mode parametric >/dev/null
+frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
+check "the fragment hosts the 16-slot pool" "1" "$(grep -c 'lv2/para_equalizer_x16_mono' "$frag")"
+check "the pool runs APO (DR)" "1" "$(grep -c '"fm_0" = 6' "$frag")"
+check "the pool runs slope x1" "1" "$(grep -c '"s_0" = 0' "$frag")"
+check "a low shelf maps to Lo-shelf (ft 5)" "1" "$(grep -c '"ft_0" = 5' "$frag")"
+check "a high shelf maps to Hi-shelf (ft 3)" "1" "$(grep -c '"ft_7" = 3' "$frag")"
+check "a peaking band maps to Bell (ft 1)" "1" "$(grep -c '"ft_1" = 1' "$frag")"
+check "the unused slots are Off (ft 0)" "8" \
+  "$(grep -oE '"ft_(8|9|1[0-5])" = 0' "$frag" | wc -l | tr -d ' ')"
+check "the pool keeps linear gain" "1" "$(grep -c '"g_0" = 1.000000' "$frag")"
+check "the pool pins g_in/g_out" "yes" \
+  "$(grep -q '"g_in" = 1.*"g_out" = 1' "$frag" && echo yes || echo no)"
+check "the pool turns the FFT displays off" "yes" \
+  "$(grep -q '"ife" = 0.*"ofe" = 0' "$frag" && echo yes || echo no)"
+check "the preamp feeds the pool" "1" "$(grep -c 'pre:Out" input = "para:in"' "$frag")"
+check "the pool feeds the compressor" "1" "$(grep -c 'para:out" input = "boost:in"' "$frag")"
+check "the compressor still feeds the limiter" "1" "$(grep -c 'boost:out" input = "limit:in"' "$frag")"
+check "no biquad band nodes remain in parametric mode" "0" \
+  "$(grep -c 'type = builtin name = g' "$frag")"
+
+echo "== parametric pool live edits =="
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run set-band 1 type highpass >/dev/null
+check "a pool type change does not restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "a pool type change is one pw-cli call" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+check "the type change writes Hi-pass (ft 2) live" "yes" \
+  "$(grep -q '"para:ft_1" 2' "$PWCLI_LOG" && echo yes || echo no)"
+check "the fragment follows the type change" "yes" \
+  "$(grep -q '"ft_1" = 2' "$frag" && echo yes || echo no)"
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run add-band >/dev/null
+check "a pool add does not restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "a pool add is one pw-cli call" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+check "the add enables the first free slot" "yes" \
+  "$(grep -q '"para:ft_8" 1' "$PWCLI_LOG" && echo yes || echo no)"
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run remove-band 0 >/dev/null
+check "a pool remove does not restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "a pool remove is one pw-cli call" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+check "the freed slot is written Off" "yes" \
+  "$(grep -q '"para:ft_8" 0' "$PWCLI_LOG" && echo yes || echo no)"
+
+echo "== parametric band cap =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-mode parametric >/dev/null
+while [[ $(run status | jq -r '.bands | length') -lt 16 ]]; do run add-band >/dev/null; done
+check "the pool can hold 16 bands" "16" "$(run status | jq -r '.parametricCount')"
+out="$(run add-band)"; rc=$?
+check "add-band past 16 is refused" "1|Parametric mode holds at most 16 bands." "$rc|$out"
+check "the refused add leaves the count at 16" "16" "$(run status | jq -r '.parametricCount')"
+
+echo "== a hand-edited over-cap state =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+mkdir -p "$XDG_STATE_HOME/omarchy-equalizer"
+jq -c -n '{ enabled: false, mode: "parametric", preset: "Test", preamp: 0, headroom: "auto",
+  graphic: [], parametric: [ range(0; 18) | { type: "peaking", freq: 1000, q: 1.0, gain: 0 } ] }' \
+  >"$XDG_STATE_HOME/omarchy-equalizer/state.json"
+out="$("$E" status 2>"$T/trunc.err")"
+check "an over-cap state loads truncated to 16" "16" "$(jq -r '.parametricCount' <<<"$out")"
+check "the truncation says so on stderr" "1" "$(grep -c 'keeping the first 16' "$T/trunc.err")"
+check "the truncation is persisted" "16" \
+  "$(jq '.parametric | length' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+
+echo "== graphic type changes still restart =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-mode graphic >/dev/null
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run set-band 0 type lowshelf >/dev/null
+check "a graphic type change restarts" "1" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "a graphic type change writes no live param" "0" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+
+echo "== no-LSP parametric stays the biquad path =="
+export OMARCHY_EQ_LV2_DIR="$T/lv2-missing"
+mkdir -p "$OMARCHY_EQ_LV2_DIR"
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-mode parametric >/dev/null
+frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
+check "without LSP the fragment stays biquads" "0" "$(grep -c 'type = lv2 name = para' "$frag")"
+check "without LSP the fragment has biquad bands" "yes" \
+  "$(grep -q 'type = builtin name = g0' "$frag" && echo yes || echo no)"
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run set-band 3 type lowshelf >/dev/null
+check "without LSP a parametric type change restarts" "1" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "without LSP a parametric type change writes no live param" "0" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+: >"$SYSTEMCTL_LOG"
+run add-band >/dev/null
+check "without LSP add-band restarts" "1" "$(grep -c restart "$SYSTEMCTL_LOG")"
+export OMARCHY_EQ_LV2_DIR="$T/lv2"
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 
 rm -rf "$T"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

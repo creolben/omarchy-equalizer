@@ -116,6 +116,13 @@ function strongestBand(bands) {
 // backend's own: Q is the bandwidth of a peaking filter and the slope of a
 // shelf. tests/curve-check.js holds these to the C source and to a time-domain
 // simulation of the difference equation.
+//
+// In parametric mode with LSP the bands run through a para_equalizer_x16_mono in
+// APO (DR) mode at slope x1 instead of the builtin biquads. That mode was chosen
+// precisely because its bell and shelf shapes and its Q meaning match this RBJ
+// math, so the same coefficients remain the model for the drawn curve and for
+// auto_preamp_db; tests/run-tests.sh pins the pool's fm/s mapping that keeps it
+// so. Nothing here changes for the plugin.
 
 function biquadCoefficients(type, freq, q, gain, rate) {
   var fs = (Number(rate) > 0) ? Number(rate) : 48000

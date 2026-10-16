@@ -6,9 +6,18 @@
 //
 // Usage: node tests/headroom-check.js <rate> <sets.json>
 //   sets.json is an array of band arrays.
+//
+// It runs as a helper inside tests/run-tests.sh, which compares its output with
+// the backend's awk port. Invoked bare it prints this usage rather than failing
+// on a missing path.
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+
+if (process.argv.length < 4) {
+  process.stderr.write('usage: node tests/headroom-check.js <rate> <sets.json>\n');
+  process.exit(0);
+}
 
 const model = {};
 vm.createContext(model);

@@ -1,7 +1,7 @@
 # Equalizer
 
 An Omarchy shell plugin that puts a system-wide equalizer in front of any PipeWire
-output: a 10-band graphic EQ, unlimited parametric bands, level-matched presets,
+output: a 10-band graphic EQ, up to 16 parametric bands, level-matched presets,
 AutoEq headphone import, automatic headroom, and an output stage (brickwall
 limiter plus a multiband "Magic Boost" compressor).
 
@@ -37,6 +37,10 @@ omarchy plugin enable io.github.creolben.equalizer
 - `curl` for AutoEq import; `node` to run the test suite
 - Optional: `lsp-plugins-lv2` for the output stage. Without it the equalizer runs
   as a pure EQ and the limiter/boost controls report the stage as inactive.
+- Optional but recommended: with `lsp-plugins-lv2`, parametric mode also runs on
+  a resident 16-slot LSP equalizer, so changing a band's type or adding/removing
+  bands is a live `pw-cli` write rather than a filter-chain restart. Without it,
+  a shape change still restarts the chain (players may pause for it).
 
 Enabling makes the equalizer the default sink and moves application streams onto
 it; disabling restores the output you had selected. While it is on, the volume
@@ -81,10 +85,15 @@ it if you plan to install the plugin again.
   rather than `pipewire.conf.d`, which would need a `pipewire.service` restart —
   that drops every PulseAudio client connection.
 - The graph itself is regenerated at
-  `~/.config/pipewire/omarchy-equalizer.conf.d/90-eq.conf` whenever the *shape*
-  changes (band count, or a band's filter type). Gain, frequency and Q are values
-  on filters that already exist, so those are written into the running graph with
-  `pw-cli set-param` and never restart anything.
+  `~/.config/pipewire/omarchy-equalizer.conf.d/90-eq.conf` when the mode changes
+  and on enable/retarget, and is kept in step (values only) after a live edit. In
+  graphic mode the ten builtin biquads are fixed, so gain, frequency and Q are
+  written into the running graph with `pw-cli set-param` and never restart
+  anything. In parametric mode with `lsp-plugins-lv2` the whole band set runs on
+  one resident 16-slot `para_equalizer_x16_mono` node, so a band's type and the
+  band count are values too: type/add-band/remove-band are live writes as well.
+  Without LSP, parametric mode keeps the per-band biquad chain and a shape change
+  (type or count) rebuilds and restarts the unit as before.
 - State lives outside the plugin, in
   `${XDG_STATE_HOME:-~/.local/state}/omarchy-equalizer/`: `state.json`,
   `presets.json` for user presets, and a cached AutoEq index.
@@ -108,7 +117,8 @@ follow                          Watch for output changes (run by systemd)
 set-mode <graphic|parametric>   Choose which band set is processed
 set-gain <index> <dB>           Set one band's gain (live, no restart)
 set-band <index> <gain|freq|q|type> <value>
-add-band                        Append a parametric band
+                                Set one parametric/graphic band property
+add-band                        Append a parametric band (16 max)
 remove-band <index>             Drop a parametric band
 apply-preset <name>             Load a preset
 save-preset <name>              Save the current bands as a preset
@@ -154,8 +164,18 @@ keys control its level, which is applied before the bands.
 - **Magic Boost** — `mb_compressor_mono` split into bass / mid / treble at 200 Hz
   and 4 kHz, Off / Low / Medium / High. Compresses and adds makeup gain. A
   single-band compressor would duck the whole spectrum on every bass hit.
-- Both output nodes stay in the graph permanently; only their `enabled` control
-  moves, because a graph-shape change is a unit restart and an audible dropout.
+- **Parametric bands are resident with LSP.** In parametric mode with
+  `lsp-plugins-lv2` the bands run through one `para_equalizer_x16_mono` node whose
+  16 slots are always in the graph; unused slots are `Off`. Every parametric edit
+  — gain, frequency, Q, type, add and remove — is therefore a control write, sent
+  as one `pw-cli set-param` call and never a restart, and the band count is capped
+  at 16. The node runs the plugin's `APO (DR)` mode at slope x1, whose bell, shelf
+  and pass shapes and `Q` meaning match the RBJ biquads `Model.js` draws and the
+  backend's automatic headroom assumes.
+- Both output nodes — and the parametric pool when LSP is installed — stay in the
+  graph permanently; only their controls move, because a graph-shape change is a
+  unit restart and an audible dropout. Mode switch (graphic ↔ parametric) is the
+  one deliberate exception, and it keeps its single restart.
 
 ## Tests
 

@@ -15,13 +15,16 @@
 #
 # Band layout
 #   graphic      fixed 10 ISO bands (31 Hz .. 16 kHz), biquads, one per channel
-#   parametric   user-defined bands; each carries type, frequency, Q and gain
+#   parametric   user-defined bands; each carries type, frequency, Q and gain.
+#                With lsp-plugins-lv2 installed the whole set runs on one
+#                resident 16-slot LSP node, so type and band count are live values
+#                too; without it, it is a per-band biquad chain as before.
 #
-# Parameter names inside a filter-chain node are "<node>:<Control>", so
-# "g3:Gain" is band 3's gain. That is what makes live updates possible: gains and
-# frequencies are written into the running graph with pw-cli, and only a change
-# to the *shape* of the graph (band count, or a band's filter type) needs a
-# restart.
+# Parameter names inside a filter-chain node are "<node>:<Control>", so "g3:Gain"
+# is band 3's gain and "para:ft_3" is the pool's slot 3 filter type. That is what
+# makes live updates possible: values are written into the running graph with
+# pw-cli, and only a change to the *shape* of the graph (a mode switch, or a band
+# count change on the no-LSP biquad path) needs a restart.
 #
 # Routing: the EQ is a virtual sink that plays into the physical output. Turning
 # it on makes it the default sink and moves existing streams onto it; turning it
@@ -56,6 +59,10 @@ builtin_presets="$plugin_dir/presets"
 lsp_dir="${OMARCHY_EQ_LV2_DIR:-/usr/lib/lv2}/lsp-plugins.lv2"
 lsp_mb_compressor_uri="http://lsp-plug.in/plugins/lv2/mb_compressor_mono"
 lsp_limiter_uri="http://lsp-plug.in/plugins/lv2/limiter_mono"
+# Parametric mode with LSP runs one 16-slot para equalizer instead of a per-band
+# biquad chain: every slot is in the graph from the start, which is what makes a
+# type or band-count change a live values write rather than a rebuild.
+lsp_para_uri="http://lsp-plug.in/plugins/lv2/para_equalizer_x16_mono"
 
 # Graphic equalizer centre frequencies: the ISO octave series, one decimal
 # place so the graph file stays readable.
@@ -133,9 +140,32 @@ default_state() {
     }'
 }
 
+# The parametric pool holds 16 slots, so a longer parametric set -- a hand-edited
+# state, an old user preset, a crafted profile -- is cut to the first 16 with a
+# line on stderr, never silently: the fragment cannot carry the rest, and a later
+# edit would otherwise act on bands the graph does not have.
+cap_parametric_state() {
+  local state="$1" count
+  count="$(jq '.parametric | length' <<<"$state" 2>/dev/null || printf 0)"
+  if [[ $count =~ ^[0-9]+$ ]] && ((count > 16)); then
+    printf 'The parametric set has %s bands; keeping the first 16.\n' "$count" >&2
+    jq -c '.parametric = .parametric[0:16]' <<<"$state"
+  else
+    printf '%s\n' "$state"
+  fi
+}
+
 state_read() {
+  local state capped
   if [[ -s $state_file ]]; then
-    jq -e . "$state_file" >/dev/null 2>&1 && { cat "$state_file"; return; }
+    if jq -e . "$state_file" >/dev/null 2>&1; then
+      state="$(cat "$state_file")"
+      # Persisted, so the note appears once rather than on every command.
+      capped="$(cap_parametric_state "$state")"
+      [[ $capped == "$state" ]] || state_write "$capped"
+      printf '%s\n' "$capped"
+      return
+    fi
   fi
   default_state
 }
@@ -460,6 +490,77 @@ stage_params() {
 boost_params() { boost_values "${1:-off}" | stage_params boost; }
 limiter_params() { limiter_values "${1:-on}" | stage_params limit; }
 
+# ---------------------------------------------------------------- parametric pool
+
+# The graph carries the 16-slot LSP pool instead of a per-band biquad chain only
+# in parametric mode with the plugins installed. write_fragment and every live
+# writer branch on this one predicate, so the graph on disk and the one running
+# can never disagree about whether "g0" or "para:ft_0" names a band.
+using_para_pool() {
+  [[ $(jq -r '.mode // "graphic"' <<<"$1") == parametric ]] && lsp_available
+}
+
+# The panel's type names -> the plugin's Filter type enumeration. The values are
+# the TTL's own: Off 0, Bell 1, Hi-pass 2, Hi-shelf 3, Lo-pass 4, Lo-shelf 5,
+# Notch 6, Allpass 8, Bandpass 9. A type the backend does not know is a Bell,
+# matching filter_label's default.
+para_type_code() {
+  case "$1" in
+    peaking) printf 1 ;;
+    highpass) printf 2 ;;
+    highshelf) printf 3 ;;
+    lowpass) printf 4 ;;
+    lowshelf) printf 5 ;;
+    notch) printf 6 ;;
+    allpass) printf 8 ;;
+    bandpass) printf 9 ;;
+    *) printf 1 ;;
+  esac
+}
+
+# "symbol value" lines for the pool's globals and all 16 slots. fm 6 is APO (DR)
+# at slope x1: that mode's bell and shelf coefficients, and its RBJ meaning of Q,
+# are what Model.js draws and auto_preamp_db assumes. The plugin default fm 0
+# (RLC (BT)) is edge-referenced and its w is not Q, so it would make the curve and
+# the automatic headroom lie. q is always written (its default is 0); the globals
+# are pinned because the plugin's defaults are not neutral -- the FFT displays
+# would be computed on every quantum, and g_in/g_out and the display state left
+# wherever the plugin chose. Unused slots are ft 0 (Off) with defined values in
+# the fields a band enabled later would read.
+para_values() {
+  local bands="${1:-[]}" count i type freq q gain
+  count="$(jq 'length' <<<"$bands")"
+  printf 'enabled 1\nmode 0\nreact 0.2\nshift 1\nfsel 0\nquant 0\nife 0\nofe 0\ng_in 1\ng_out 1\n'
+  for ((i = 0; i < 16; i++)); do
+    if ((i < count)); then
+      type="$(jq -r ".[$i].type // \"peaking\"" <<<"$bands")"
+      freq="$(jq -r ".[$i].freq // 1000" <<<"$bands")"
+      q="$(jq -r ".[$i].q // 1.0" <<<"$bands")"
+      gain="$(jq -r ".[$i].gain // 0" <<<"$bands")"
+      printf 'ft_%d %s\nfm_%d 6\ns_%d 0\nf_%d %s\nq_%d %s\ng_%d %s\n' \
+        "$i" "$(para_type_code "$type")" "$i" "$i" "$i" "$freq" "$i" "$q" "$i" "$(db_to_mult "$gain")"
+    else
+      printf 'ft_%d 0\nfm_%d 6\ns_%d 0\nf_%d 1000\nq_%d 1.0\ng_%d 1\n' \
+        "$i" "$i" "$i" "$i" "$i" "$i"
+    fi
+  done
+}
+
+# The live param list for the pool: the preamp first (a gain or type edit changes
+# the automatic headroom), then every slot. One string, so one pw-cli call.
+# need_numeric_bands runs here for the same reason as build_band_params: the die
+# only ends this command substitution, so the caller must carry the failure out.
+build_para_params() {
+  local bands="$1" preamp="${2:-0}"
+  need_numeric_bands "$bands"
+  # The preamp and the slot set share one line: a newline between them would
+  # split the parameter list into two arguments, so one pw-cli call would look
+  # like two to anything counting invocations.
+  printf '"pre:Mult" %s ' "$(db_to_mult "$preamp")"
+  para_values "$bands" | stage_params para
+  printf '\n'
+}
+
 # A shelf's "Q" control is the slope, not a bandwidth, so a shelf band keeps its
 # own value but never inherits the graphic Q.
 write_fragment() {
@@ -490,23 +591,36 @@ write_fragment() {
     printf '          { type = builtin name = pre label = linear control = { "Mult" = %s "Add" = 0 } }\n' \
       "$(db_to_mult "$(jq -r '.preamp // 0' <<<"$state")")"
 
-    for ((i = 0; i < count; i++)); do
-      local type label freq q gain
-      type="$(jq -r ".[$i].type // \"peaking\"" <<<"$bands")"
-      freq="$(jq -r ".[$i].freq // 1000" <<<"$bands")"
-      gain="$(jq -r ".[$i].gain // 0" <<<"$bands")"
-      q="$(jq -r ".[$i].q // 1.0" <<<"$bands")"
-      label="$(filter_label "$type")"
-      # A shelving or pass filter ignores Gain/Freq mismatches gracefully, but
-      # emitting an unused control would show up as a settable parameter that
-      # does nothing -- so each label only carries the controls it honours.
-      case "$type" in
-        lowpass | highpass | bandpass | notch | allpass) ctl="\"Freq\" = $freq \"Q\" = $q" ;;
-        lowshelf | highshelf) ctl="\"Freq\" = $freq \"Q\" = $q \"Gain\" = $gain" ;;
-        *) ctl="\"Freq\" = $freq \"Q\" = $q \"Gain\" = $gain" ;;
-      esac
-      printf '          { type = builtin name = g%d label = %s control = { %s } }\n' "$i" "$label" "$ctl"
-    done
+    # Parametric mode with LSP runs the whole band set through one 16-slot LSP
+    # node instead of a per-band biquad: every slot is in the graph from the
+    # start, so a type or band-count change is a live values change and never a
+    # rebuild. Without LSP (or in graphic mode) the biquads are emitted exactly as
+    # before, and a shape change still pays a restart.
+    if using_para_pool "$state"; then
+      # One LV2 node, mono like the output stage, duplicated per channel by
+      # audio.channels below. The controls cover all 16 slots whether or not each
+      # one carries a band.
+      printf '          { type = lv2 name = para plugin = "%s" control = { %s } }\n' \
+        "$lsp_para_uri" "$(para_values "$bands" | stage_controls)"
+    else
+      for ((i = 0; i < count; i++)); do
+        local type label freq q gain
+        type="$(jq -r ".[$i].type // \"peaking\"" <<<"$bands")"
+        freq="$(jq -r ".[$i].freq // 1000" <<<"$bands")"
+        gain="$(jq -r ".[$i].gain // 0" <<<"$bands")"
+        q="$(jq -r ".[$i].q // 1.0" <<<"$bands")"
+        label="$(filter_label "$type")"
+        # A shelving or pass filter ignores Gain/Freq mismatches gracefully, but
+        # emitting an unused control would show up as a settable parameter that
+        # does nothing -- so each label only carries the controls it honours.
+        case "$type" in
+          lowpass | highpass | bandpass | notch | allpass) ctl="\"Freq\" = $freq \"Q\" = $q" ;;
+          lowshelf | highshelf) ctl="\"Freq\" = $freq \"Q\" = $q \"Gain\" = $gain" ;;
+          *) ctl="\"Freq\" = $freq \"Q\" = $q \"Gain\" = $gain" ;;
+        esac
+        printf '          { type = builtin name = g%d label = %s control = { %s } }\n' "$i" "$label" "$ctl"
+      done
+    fi
 
     # Both LSP plugins are the mono builds, so audio.channels = 2 below
     # duplicates the whole graph per channel exactly as it does for the
@@ -522,24 +636,33 @@ write_fragment() {
 
     printf '        ]\n'
     printf '        links = [\n'
-    # No bands means the preamp is the whole chain: a link to a g0 that was
-    # never emitted makes the filter-chain fail to load.
-    if ((count > 0)); then
-      printf '          { output = "pre:Out" input = "g0:In" }\n'
-    fi
-    for ((i = 0; i < count - 1; i++)); do
-      printf '          { output = "g%d:Out" input = "g%d:In" }\n' "$i" "$((i + 1))"
-    done
-    if lsp_available; then
-      # The stage is the tail of the chain. limit's output becomes the graph
-      # output automatically because nothing links out of it; with no bands the
-      # preamp feeds boost directly.
-      if ((count > 0)); then
-        printf '          { output = "g%d:Out" input = "boost:in" }\n' "$((count - 1))"
-      else
-        printf '          { output = "pre:Out" input = "boost:in" }\n'
-      fi
+    if using_para_pool "$state"; then
+      # The pool is always in the graph, so the preamp feeds it directly even
+      # with no bands. limit's output is the graph output because nothing links
+      # out of it, exactly as for the biquad tail.
+      printf '          { output = "pre:Out" input = "para:in" }\n'
+      printf '          { output = "para:out" input = "boost:in" }\n'
       printf '          { output = "boost:out" input = "limit:in" }\n'
+    else
+      # No bands means the preamp is the whole chain: a link to a g0 that was
+      # never emitted makes the filter-chain fail to load.
+      if ((count > 0)); then
+        printf '          { output = "pre:Out" input = "g0:In" }\n'
+      fi
+      for ((i = 0; i < count - 1; i++)); do
+        printf '          { output = "g%d:Out" input = "g%d:In" }\n' "$i" "$((i + 1))"
+      done
+      if lsp_available; then
+        # The stage is the tail of the chain. limit's output becomes the graph
+        # output automatically because nothing links out of it; with no bands the
+        # preamp feeds boost directly.
+        if ((count > 0)); then
+          printf '          { output = "g%d:Out" input = "boost:in" }\n' "$((count - 1))"
+        else
+          printf '          { output = "pre:Out" input = "boost:in" }\n'
+        fi
+        printf '          { output = "boost:out" input = "limit:in" }\n'
+      fi
     fi
     printf '        ]\n'
 
@@ -628,6 +751,37 @@ live_apply_bands() {
   # rather than send an empty parameter list.
   params="$(build_band_params "$bands" "$(jq -r '.preamp // 0' <<<"$state")")" || exit 1
   live_send_params "$params"
+}
+
+# The pool's live writer: the same one-call rule as live_apply_bands, with the
+# whole 16-slot set and the preamp in a single pw-cli call.
+live_apply_para() {
+  local bands="$1" preamp="${2:-0}" params
+  params="$(build_para_params "$bands" "$preamp")" || exit 1
+  live_send_params "$params"
+}
+
+# Write the active band set to whatever the running graph holds. The pool path
+# also keeps the fragment in step, because the fragment carries the slot values;
+# the biquad path leaves it for the next rebuild, as it always has. A live write
+# that cannot find the node falls back to a rebuild, so a sink torn down under us
+# still comes back correct.
+live_apply_active() {
+  local bands="$1" state="$2" target
+  if using_para_pool "$state"; then
+    sync_fragment "$state"
+    live_apply_para "$bands" "$(jq -r '.preamp // 0' <<<"$state")" || {
+      target="$(jq -r '.targetSink // ""' <<<"$state")"
+      write_fragment "$state" "$target"
+      service_restart >/dev/null 2>&1
+    }
+  else
+    live_apply_bands "$bands" "$state" || {
+      target="$(jq -r '.targetSink // ""' <<<"$state")"
+      write_fragment "$state" "$target"
+      service_restart >/dev/null 2>&1
+    }
+  fi
 }
 
 # The preamp is a single live control, so the automatic and manual paths share
@@ -938,10 +1092,7 @@ cmd_set_gain() {
 
   if sink_present; then
     bands="$(active_bands "$state")"
-    live_apply_bands "$bands" "$state" || {
-      write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
-      service_restart >/dev/null 2>&1
-    }
+    live_apply_active "$bands" "$state"
   fi
 }
 
@@ -964,38 +1115,52 @@ cmd_set_band() {
   state="$(apply_headroom "$state")"
   state_write "$state"
 
-  # Gain, frequency and Q are all just values on a biquad that already exists in
-  # the running graph, so they are written live. Only a type change swaps the
-  # filter itself and has to rebuild -- which is what made every frequency edit
-  # cost an audible dropout before.
+  # Gain, frequency and Q are values on a filter that already exists in the
+  # running graph, so they are written live. In parametric mode with LSP the
+  # filter is a slot in the pool and a type change is a value too, so it lands
+  # live as well; only a biquad chain has to rebuild for a type swap.
   if sink_present; then
-    if [[ $key == type ]]; then
+    if using_para_pool "$state" || [[ $key != type ]]; then
+      live_apply_active "$(active_bands "$state")" "$state"
+    else
       write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
       service_restart >/dev/null 2>&1
-    else
-      live_apply_bands "$(active_bands "$state")" "$state" || {
-        write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
-        service_restart >/dev/null 2>&1
-      }
     fi
   fi
 }
 
 cmd_add_band() {
-  local state
+  local state from_para
   state="$(state_read)"
+  # Whether the graph running right now is the pool: decided on the current mode,
+  # before this command switches it to parametric. Adding from graphic mode is a
+  # graph-shape change and still restarts.
+  from_para=false
+  using_para_pool "$state" && from_para=true
+
+  (( $(jq '.parametric | length' <<<"$state") < 16 )) ||
+    die "Parametric mode holds at most 16 bands."
   state="$(jq -c '.mode = "parametric" | .parametric += [{ type: "peaking", freq: 1000, q: 1.0, gain: 0 }]' <<<"$state")"
   state="$(apply_headroom "$state")"
   state_write "$state"
   if sink_present; then
-    write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
-    service_restart >/dev/null 2>&1
+    if $from_para; then
+      live_apply_active "$(active_bands "$state")" "$state"
+    else
+      write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+      service_restart >/dev/null 2>&1
+    fi
   fi
 }
 
 cmd_remove_band() {
-  local index="$1" state count
+  local index="$1" state count from_para
   state="$(state_read)"
+  # As in cmd_add_band: the pool can only be written live if it is what the
+  # running graph already holds. Removing while graphic still rebuilds.
+  from_para=false
+  using_para_pool "$state" && from_para=true
+
   count="$(jq '.parametric | length' <<<"$state")"
   [[ $index =~ ^[0-9]+$ ]] || die "Band index must be a number."
   ((index < count)) || die "Band $index does not exist."
@@ -1003,8 +1168,12 @@ cmd_remove_band() {
   state="$(apply_headroom "$state")"
   state_write "$state"
   if sink_present; then
-    write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
-    service_restart >/dev/null 2>&1
+    if $from_para; then
+      live_apply_active "$(active_bands "$state")" "$state"
+    else
+      write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+      service_restart >/dev/null 2>&1
+    fi
   fi
 }
 
@@ -1022,7 +1191,7 @@ cmd_set_mode() {
 }
 
 cmd_apply_preset() {
-  local name="$1" preset state mode from_bands to_bands from_preamp to_preamp
+  local name="$1" preset state mode from_bands to_bands from_preamp to_preamp from_para
   preset="$(preset_read "$name")" || die "No preset named '$name'."
 
   # A preset may carry its own mode; a graphic preset applied while in
@@ -1033,36 +1202,51 @@ cmd_apply_preset() {
   need_mode "$mode"
   state="$(state_read)"
   # What is running right now: the ramp needs both ends, and the shape check
-  # decides whether a ramp is usable at all.
+  # decides whether a ramp is usable at all. The pool decision is made on the
+  # current state too, before the preset's mode is copied in: applying a
+  # parametric preset from graphic mode is a graph-shape change and still
+  # restarts, while a parametric preset into a running pool is a values change.
   from_bands="$(active_bands "$state")"
   from_preamp="$(jq -r '.preamp // 0' <<<"$state")"
+  from_para=false
+  using_para_pool "$state" && from_para=true
 
   state="$(jq -c --arg n "$name" --arg m "$mode" --argjson p "$preset" '
     .preset = $n | .mode = $m | .preamp = ($p.preamp // 0)
     | if ($p.graphic // null) != null and ($p.graphic | length) > 0 then .graphic = $p.graphic else . end
     | if ($p.parametric // null) != null and ($p.parametric | length) > 0 then .parametric = $p.parametric else . end
   ' <<<"$state")"
+  # An old user preset may hold more bands than the pool has; cap it here so the
+  # fragment, the live write and the headroom all see the same set.
+  state="$(cap_parametric_state "$state")"
   state="$(apply_headroom "$state")"
   to_bands="$(active_bands "$state")"
   to_preamp="$(jq -r '.preamp // 0' <<<"$state")"
   state_write "$state"
 
   if sink_present; then
-    # A preset whose shape matches the running chain (same band count, same
-    # sequence of filter types) can be crossfaded in place instead of dropping
-    # audio through a restart. Anything else -- a mode switch, a new band count,
-    # a filter-type swap -- needs the graph rebuilt: those nodes do not exist
-    # yet, or are wired in a different order. The fragment is written either
-    # way, so a later restart comes up with the new preset.
-    if [[ $(jq 'length' <<<"$from_bands") -eq $(jq 'length' <<<"$to_bands") ]] &&
-       [[ "$(jq -r '[.[].type] | join(",")' <<<"$from_bands")" == "$(jq -r '[.[].type] | join(",")' <<<"$to_bands")" ]]; then
-      write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+    write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+    if $from_para && [[ $mode == parametric ]]; then
+      # The pool already holds all 16 slots, so a parametric preset is a values
+      # change and lands live, without the ramp the biquad chain needs.
+      live_apply_para "$to_bands" "$to_preamp" || {
+        write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+        service_restart >/dev/null 2>&1
+      }
+    elif $from_para; then
+      # Leaving the pool for the biquad chain is a graph-shape change.
+      service_restart >/dev/null 2>&1
+    elif [[ $(jq 'length' <<<"$from_bands") -eq $(jq 'length' <<<"$to_bands") ]] &&
+         [[ "$(jq -r '[.[].type] | join(",")' <<<"$from_bands")" == "$(jq -r '[.[].type] | join(",")' <<<"$to_bands")" ]]; then
+      # A preset whose shape matches the running chain (same band count, same
+      # sequence of filter types) crossfades in place instead of dropping audio
+      # through a restart. Anything else needs the graph rebuilt: those nodes do
+      # not exist yet, or are wired in a different order.
       live_ramp_bands "$from_bands" "$to_bands" "$from_preamp" "$to_preamp" || {
         write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
         service_restart >/dev/null 2>&1
       }
     else
-      write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
       service_restart >/dev/null 2>&1
     fi
   fi
@@ -1099,11 +1283,13 @@ cmd_delete_preset() {
 }
 
 cmd_reset() {
-  local state mode from_bands to_bands from_preamp to_preamp
+  local state mode from_bands to_bands from_preamp to_preamp from_para
   state="$(state_read)"
   mode="$(jq -r '.mode' <<<"$state")"
   from_bands="$(active_bands "$state")"
   from_preamp="$(jq -r '.preamp // 0' <<<"$state")"
+  from_para=false
+  using_para_pool "$state" && from_para=true
   # Reset means flat, so the preamp goes back to unity with the bands -- an
   # imported profile's cut left behind would quietly halve the output.
   state="$(jq -c --arg m "$mode" '
@@ -1119,8 +1305,14 @@ cmd_reset() {
   state_write "$state"
   if sink_present; then
     # Reset only flattens gains, so the running chain already has the right
-    # shape: ramp to it rather than dropping audio through a restart.
-    live_ramp_bands "$from_bands" "$to_bands" "$from_preamp" "$to_preamp" || true
+    # shape: write it live rather than dropping audio through a restart. The
+    # biquad chain gets the crossfade; the pool gets one whole-set write.
+    if $from_para; then
+      sync_fragment "$state"
+      live_apply_para "$to_bands" "$to_preamp" || true
+    else
+      live_ramp_bands "$from_bands" "$to_bands" "$from_preamp" "$to_preamp" || true
+    fi
   fi
 }
 
@@ -1404,6 +1596,9 @@ cmd_import_autoeq() {
   state="$(state_read)"
   state="$(jq -c --argjson b "$bands" --argjson p "$preamp" \
     '.mode = "parametric" | .parametric = $b | .preamp = $p' <<<"$state")"
+  # A profile with more filters than the pool has is capped the same way a
+  # hand-edited state is, so the imported bands and the applied graph agree.
+  state="$(cap_parametric_state "$state")"
   state="$(apply_headroom "$state")"
   state_write "$state"
 
