@@ -1042,12 +1042,40 @@ cmd_disable() {
 # Re-aim the EQ at the new device (live stream move, no restart) and take the
 # default back.
 cmd_retarget() {
-  local state default target id
+  local state default target id live
   state="$(state_read)"
   [[ $(jq -r '.enabled' <<<"$state") == true ]] || return 0
   sink_present || return 0
   default="$(current_default_sink)"
-  [[ -n $default && $default != "$sink_name" ]] || return 0
+  [[ -n $default ]] || return 0
+
+  # With the EQ on, the default sink is the EQ itself, so a removed device never
+  # shows up here as a changed default -- yet the device its target names can be
+  # gone all the same: a Bluetooth device that sleeps, errors, or is switched off
+  # vanishes from pactl, and the EQ then plays into a name that no longer exists.
+  # The graph looks healthy and sound stops everywhere. Validate the remembered
+  # target on every pass: a dead one is replaced by a device that still exists
+  # (a live stream move, no restart), the same live recovery the path below does
+  # for a user's new pick; with nothing else live the dead target is kept for
+  # when the device returns. The user's previous default is left alone so a later
+  # disable still restores the device they actually chose.
+  if [[ $default == "$sink_name" ]]; then
+    target="$(jq -r '.targetSink // empty' <<<"$state")"
+    [[ -n $target ]] || return 0
+    if pactl list sinks short 2>/dev/null | awk '{print $2}' | grep -Fx "$target" >/dev/null; then
+      return 0
+    fi
+    live="$(first_output_sink)"
+    [[ -n $live ]] || return 0
+    need_sink_name "$live"
+    state="$(jq -c --arg tgt "$live" '.targetSink = $tgt' <<<"$state")"
+    state_write "$state"
+    write_fragment "$state" "$live"
+    id="$(eq_output_input_id)"
+    [[ -n $id ]] && pactl move-sink-input "$id" "$live" >/dev/null 2>&1
+    return 0
+  fi
+
   target="$(chain_target)"
   [[ -n $target && $target != "$sink_name" ]] || return 0
   need_sink_name "$target"

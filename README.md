@@ -100,7 +100,13 @@ it if you plan to install the plugin again.
 - Two user units: `omarchy-equalizer.service` (the filter-chain) and
   `omarchy-equalizer-follow.service`, which re-aims the equalizer when the output
   device changes — plugging in headphones otherwise leaves the equalizer playing
-  into the old device while apps bypass it.
+  into the old device while apps bypass it. Each removal event also re-validates
+  the remembered target: a Bluetooth device that is switched off, sleeps, or
+  errors out vanishes from pactl while the EQ stays the default sink, and the
+  equalizer would otherwise play into a name that no longer exists, with the
+  graph healthy and sound stopped everywhere. A dead target is replaced by a
+  device that still exists (a live stream move, no restart), or kept when
+  nothing else is live so the device's return can still be aimed at.
 - The panel is QML (`Panel.qml`, `ResponseCurve.qml`, the slider and switch
   widgets). Its text and number fields (`presetNameField`, the AutoEq query,
   the band frequency and Q) are drawn from key events (`KeyField.qml`): an
@@ -117,7 +123,7 @@ it if you plan to install the plugin again.
 ```
 status                          JSON state for the shell plugin
 enable | disable | toggle       Switch the equalizer on or off
-retarget                        Re-aim the EQ at the current output device
+retarget                        Re-aim the EQ at the current output device, replacing one that vanished
 follow                          Watch for output changes (run by systemd)
 set-mode <graphic|parametric>   Choose which band set is processed
 set-gain <index> <dB>           Set one band's gain (live, no restart)
