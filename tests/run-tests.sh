@@ -300,6 +300,54 @@ check "the manual path keeps the same aim for the live device" "$state_before" \
 run disable >/dev/null
 unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
 
+echo "== routing: the stream's aim is converged onto the remembered target =="
+# A pactl move is a one-shot redirect: no target.object lands on the stream, so
+# WirePlumber is free to relink it right after, and one second after the user
+# picks a device their stream can be on the highest-priority sink while state
+# and fragment name what they chose -- issue #2's one-second swing. A retarget
+# pass therefore reads the EQ output stream's actual sink back and moves it over
+# whenever the two disagree, instead of assuming the last move stuck.
+run disable >/dev/null
+export PACTL_DEVICE_SINK=bluez_output.12_34_56_78_9A.BC
+export PACTL_DEFAULT_SINK=bluez_output.12_34_56_78_9A.BC
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+export PACTL_LOG="$T/pactl-reconverge.log"
+: >"$SYSTEMCTL_LOG"
+: >"$PACTL_LOG"
+
+# The stream has drifted back onto the EQ itself: the convergence pass pushes it
+# at the remembered device.
+export PACTL_EQ_AIM=drifted
+export PACTL_EQ_AIM_SINK_ID=1
+out="$(run retarget)"; rc=$?
+check "retargeting a drifted stream succeeds" "0" "$rc"
+check "a drifted stream is moved onto the remembered target" "1" \
+  "$(grep -c 'move-sink-input 99 bluez_output.12_34_56_78_9A.BC' "$PACTL_LOG")"
+check "the convergence pass is a live move, not a restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+
+# The stream now sits on the remembered device: a converged pass must not keep
+# moving it, nor chase its own tail.
+export PACTL_EQ_AIM_SINK_ID=2
+out="$(run retarget)"; rc=$?
+check "a converged stream is left where it is" "1" \
+  "$(grep -c 'move-sink-input 99 bluez_output.12_34_56_78_9A.BC' "$PACTL_LOG")"
+
+# The dead-target replacement and a drifted stream land in one pass: the
+# fallback picks the live device, and the stream is pushed at it immediately.
+export PACTL_DEVICE_SINK=alsa_output.pci-0000_00_1f.3.analog-stereo
+export PACTL_EQ_AIM_SINK_ID=1
+out="$(run retarget)"; rc=$?
+check "a dead target plus a drifted stream is one pass" "0" "$rc"
+check "the replacement re-aims the drifted stream at the live device" "1" \
+  "$(grep -c 'move-sink-input 99 alsa_output.pci-0000_00_1f.3.analog-stereo' "$PACTL_LOG")"
+check "the fallback target lands in the state" "alsa_output.pci-0000_00_1f.3.analog-stereo" \
+  "$(jq -r '.targetSink' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+check "the replacement names the live device in the fragment" "1" \
+  "$(grep -c 'target.object = "alsa_output.pci-0000_00_1f.3.analog-stereo"' "$frag")"
+run disable >/dev/null
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG
+
 echo "== preset delete =="
 run save-preset ScratchPreset >/dev/null
 run apply-preset ScratchPreset >/dev/null

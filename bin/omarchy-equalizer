@@ -914,6 +914,23 @@ eq_output_input_id() {
     index($0, n) {print id; exit}'
 }
 
+# The sink NAME the EQ's own output stream is actually linked to. A live
+# move-sink-input only redirects for the moment: nothing on the pulse or pw
+# surface pins a stream's target.object, so WirePlumber is free to relink the
+# stream again at any default change -- one second after the user picks a
+# device, their stream can be on the highest-priority sink while the state and
+# the fragment both name what they chose. The remembered target is therefore the
+# authority and the actual sink must be read back instead of assumed.
+eq_output_aim() {
+  local want aim
+  want="$(eq_output_input_id)"
+  [[ -n $want ]] || return 0
+  aim="$(pactl list sink-inputs 2>/dev/null | awk -v want="$want" '
+    /^Sink Input #/  {cur = substr($3, 2)}
+    /^	Sink: / && cur == want {sub(/.*Sink: /, ""); print; exit}')"
+  [[ -n $aim ]] && pactl list sinks short 2>/dev/null | awk -v i="$aim" '$1 == i {print $2; exit}'
+}
+
 write_unit() {
   mkdir -p "$config_home/systemd/user"
   cat >"$unit" <<EOF
@@ -1063,16 +1080,27 @@ cmd_retarget() {
     target="$(jq -r '.targetSink // empty' <<<"$state")"
     [[ -n $target ]] || return 0
     if pactl list sinks short 2>/dev/null | awk '{print $2}' | grep -Fx "$target" >/dev/null; then
-      return 0
+      :
+    else
+      live="$(first_output_sink)"
+      [[ -n $live ]] || return 0
+      need_sink_name "$live"
+      state="$(jq -c --arg tgt "$live" '.targetSink = $tgt' <<<"$state")"
+      state_write "$state"
+      write_fragment "$state" "$live"
+      target="$live"
     fi
-    live="$(first_output_sink)"
-    [[ -n $live ]] || return 0
-    need_sink_name "$live"
-    state="$(jq -c --arg tgt "$live" '.targetSink = $tgt' <<<"$state")"
-    state_write "$state"
-    write_fragment "$state" "$live"
+    # And whatever the target is now, the stream itself has to be on it: a live
+    # move pins nothing, so WirePlumber relinks the stream on its own afterwards
+    # and the one-second swing of issue #2 -- stream on the highest-priority
+    # sink, state naming the picked device -- is exactly this disagreement seen
+    # the other way. Read the aim back every pass and move over when it differs.
     id="$(eq_output_input_id)"
-    [[ -n $id ]] && pactl move-sink-input "$id" "$live" >/dev/null 2>&1
+    [[ -n $id ]] || return 0
+    aim="$(eq_output_aim "$id")"
+    if [[ $aim != "$target" ]]; then
+      pactl move-sink-input "$id" "$target" >/dev/null 2>&1
+    fi
     return 0
   fi
 
@@ -1089,13 +1117,17 @@ cmd_retarget() {
 }
 
 # Long-running watcher (omarchy-equalizer-follow.service): retarget when the
-# default sink changes or a sink appears/disappears. Bursts are drained first.
+# default sink changes, a sink appears/disappears, or a stream changes address.
+# Drift (the one-shot aim of issue #2: the EQ stream can be relinked by
+# WirePlumber a second after every move) is corrected by the same retarget pass;
+# change events on the streams and sinks fuel that. Bursts are drained first.
 cmd_follow() {
   need pactl
   cmd_retarget
   pactl subscribe 2>/dev/null | while IFS= read -r line; do
     case "$line" in
-      *" on server"* | *"'new' on sink #"* | *"'remove' on sink #"*)
+      *" on server"* | *"'new' on sink #"* | *"'remove' on sink #"* | \
+      *"'change' on sink #"* | *"'change' on sink-input #"*)
         while IFS= read -r -t 0.4 _; do :; done
         cmd_retarget
         ;;
