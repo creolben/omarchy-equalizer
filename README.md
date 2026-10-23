@@ -100,7 +100,15 @@ it if you plan to install the plugin again.
 - Two user units: `omarchy-equalizer.service` (the filter-chain) and
   `omarchy-equalizer-follow.service`, which re-aims the equalizer when the output
   device changes — plugging in headphones otherwise leaves the equalizer playing
-  into the old device while apps bypass it.
+  into the old device while apps bypass it. Each pass re-validates the
+  remembered target and the aim of the EQ's own output stream against it: a
+  Bluetooth device that is switched off, sleeps, or errors out vanishes from
+  pactl while the EQ stays the default sink, and a live `pactl move` pins
+  nothing, so WirePlumber is free to relink the stream again — a vanished target
+  is replaced by a device that still exists (or kept when nothing else is live,
+  so the device's return can still be aimed at), and a drifted aim is moved back
+  onto the remembered target. A later disable still restores the device the user
+  actually chose.
 - The panel is QML (`Panel.qml`, `ResponseCurve.qml`, the slider and switch
   widgets). Its text and number fields (`presetNameField`, the AutoEq query,
   the band frequency and Q) are drawn from key events (`KeyField.qml`): an
@@ -117,7 +125,8 @@ it if you plan to install the plugin again.
 ```
 status                          JSON state for the shell plugin
 enable | disable | toggle       Switch the equalizer on or off
-retarget                        Re-aim the EQ at the current output device
+retarget                        Re-aim the EQ at the current output device, replacing a target
+                                that vanished and converging an aim that drifted
 follow                          Watch for output changes (run by systemd)
 set-mode <graphic|parametric>   Choose which band set is processed
 set-gain <index> <dB>           Set one band's gain (live, no restart)
@@ -185,7 +194,7 @@ keys control its level, which is applied before the bands.
 ## Tests
 
 ```sh
-bash tests/run-tests.sh     # 224 assertions, no real sink touched
+bash tests/run-tests.sh     # 244 assertions, no real sink touched
 node tests/curve-check.js   # Model.js response maths vs PipeWire's own biquads
 ```
 

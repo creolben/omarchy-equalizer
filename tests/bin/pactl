@@ -2,17 +2,34 @@
 # Stub pactl for the backend tests.
 #
 # The equalizer sink always exists, so sink_present is true and the fragment/live
-# paths are exercised at all. A second, device-like sink and the default sink can be
-# set per test: PACTL_DEVICE_SINK adds a line to `list sinks short`, PACTL_DEFAULT_SINK
-# changes what `get-default-sink` prints. The routing tests use them to put a DSP sink
-# in the seat the equalizer has to chain in front of.
+# paths are exercised at all. A second, device-like sink and the default sink can
+# be set per test: PACTL_DEVICE_SINK adds a line to `list sinks short`,
+# PACTL_DEFAULT_SINK changes what `get-default-sink` prints. The routing tests
+# use them to put a DSP sink in the seat the equalizer has to chain in front of.
+#
+# PACTL_LOG records every invocation's arguments one per line, for tests that
+# assert on the move/aim calls themselves. PACTL_EQ_AIM makes `list sink-inputs`
+# return one canned entry for the EQ's own output stream (id 99) aimed at the
+# sink deck PACTL_EQ_AIM_SINK_ID (default 2, the device sink). Unset, `list
+# sink-inputs` keeps today's table print, so the EQ output stream has no id and
+# the aim reads as unknown -- the no-stream state of a real machine between
+# starts.
 sinks="1	omarchy_equalizer	PipeWire	s16le 2ch 48000Hz	SUSPENDED"
 if [[ -n ${PACTL_DEVICE_SINK:-} ]]; then
   sinks="$sinks
 2	$PACTL_DEVICE_SINK	PipeWire	s16le 2ch 48000Hz	SUSPENDED"
 fi
+[[ -n ${PACTL_LOG:-} ]] && printf '%s\n' "$*" >>"$PACTL_LOG"
 case "$1" in
-  list) printf '%s\n' "$sinks" ;;
+  list)
+    if [[ ${2:-} == sink-inputs && -n ${PACTL_EQ_AIM:-} ]]; then
+      { printf 'Sink Input #99\n\tSink: %s\n\tProperties:\n' "${PACTL_EQ_AIM_SINK_ID:-2}"
+        printf '\t\tnode.name = "omarchy_equalizer.output"\n'
+      }
+    else
+      printf '%s\n' "$sinks"
+    fi
+    ;;
   get-default-sink) printf '%s\n' "${PACTL_DEFAULT_SINK:-omarchy_equalizer}" ;;
 esac
 exit 0
