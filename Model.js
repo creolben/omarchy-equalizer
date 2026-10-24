@@ -67,6 +67,38 @@ function waveSeries(peak, phase, count) {
   return out
 }
 
+// Bar heights for the meter, in the style of a bar-type sound-wave animation:
+// a row of rounded bars that all play one height sequence, each a little later
+// than its neighbour, so a pulse travels along the row. Heights are 0..peak.
+//
+// BAR_KEYS is that sequence (relative heights, 25 keys) and is interpolated
+// with a cosine ease so a bar never jumps between keys. `phase` runs 0..10 like
+// waveSeries; five keys per phase unit makes ten units a whole 50 keys, two full
+// laps, so the timer's wrap at 10 is seamless. A window shortens the outer bars.
+var BAR_KEYS = [100, 237, 264, 248, 197, 29, 26, 158, 217, 250, 125, 163, 100,
+                37, 52, 92, 50, 154, 115, 157, 98, 168, 39, 73, 27]
+function barSeries(peak, phase, count) {
+  var n = Math.round(Number(count))
+  if (!(n >= 1)) n = 1
+  if (n > 256) n = 256
+  var p = clamp(Number(peak) || 0, 0, 1)
+  var pos0 = (Number(phase) || 0) * 5
+  var len = BAR_KEYS.length
+  var out = []
+  for (var i = 0; i < n; i++) {
+    var pos = pos0 + i * 1.3
+    pos = ((pos % len) + len) % len
+    var k = Math.floor(pos)
+    var f = pos - k
+    var e = (1 - Math.cos(Math.PI * f)) / 2
+    var a = BAR_KEYS[k], b = BAR_KEYS[(k + 1) % len]
+    var u = n > 1 ? i / (n - 1) : 0.5
+    var window = 1 - 0.5 * Math.pow(2 * u - 1, 2)
+    out.push((a + (b - a) * e) / 264 * window * p)
+  }
+  return out
+}
+
 // Which control, if any, a wheel event belongs to. One implementation, so the
 // sliders cannot drift from each other or from tests/input-policy-check.js.
 //
