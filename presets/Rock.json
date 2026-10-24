@@ -2,6 +2,7 @@
   "name": "Rock",
   "description": "Scooped low mids with a 3-4 kHz presence lift",
   "order": 30,
+  "category": "genre",
   "mode": "graphic",
   "preamp": -0.5,
   "graphic": [

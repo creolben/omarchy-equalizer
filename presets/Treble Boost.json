@@ -2,6 +2,7 @@
   "name": "Treble Boost",
   "description": "Bright and open: bass trimmed ~5 dB to make room for the top",
   "order": 21,
+  "category": "tone",
   "mode": "graphic",
   "preamp": 0,
   "graphic": [

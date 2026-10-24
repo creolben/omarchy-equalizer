@@ -1,6 +1,7 @@
 import QtQuick
 import qs.Commons
 import qs.Ui
+import "Model.js" as Model
 
 // Horizontal bipolar gain slider for the parametric rows: compact, with the fill
 // growing out of the 0 dB centre and a visible track.
@@ -18,6 +19,9 @@ Item {
   property real step: 0.5
 
   property QtObject bar: null
+  // Injected by the panel: moves the enclosing scroll area when the wheel is
+  // declined. Without it a declined wheel still does nothing to the gain.
+  property var scrollBy: null
   property color foreground: bar ? bar.foreground : Color.foreground
   property color accent: Color.accent
   property color background: bar ? bar.background : Color.background
@@ -28,7 +32,6 @@ Item {
   readonly property alias containsMouse: mouse.containsMouse
   property bool dragging: false
   property real liveValue: value
-  property bool focusable: true
   readonly property bool hot: containsMouse || dragging || activeFocus
 
   signal moved(real value)
@@ -48,7 +51,8 @@ Item {
   readonly property real zeroX: trackLeft + zeroProgress * trackLength
 
   implicitHeight: Math.max(knobHeight, trackHeight)
-  activeFocusOnTab: focusable
+  // Focus is click-only: a click arms the wheel and reveals the ring below.
+  activeFocusOnTab: false
 
   function rgba(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
@@ -79,6 +83,19 @@ Item {
     color: root.rgba(root.foreground, 0.10)
     border.width: 1
     border.color: root.rgba(root.foreground, 0.07)
+  }
+
+  // Focus is what arms the wheel, so it has to be visible. Hover stays
+  // cosmetic; this ring is only activeFocus.
+  Rectangle {
+    anchors.centerIn: track
+    width: track.width + Style.space(8)
+    height: track.height + Style.space(8)
+    radius: height / 2
+    color: "transparent"
+    border.width: Math.max(1, Style.space(2))
+    border.color: root.rgba(root.accent, 0.4)
+    visible: root.activeFocus
   }
 
   // Fill from the 0 dB mark to the knob, so a cut and a boost are told apart by
@@ -123,6 +140,9 @@ Item {
     anchors.fill: parent
     hoverEnabled: true
     cursorShape: Qt.PointingHandCursor
+    // Right-click resets the band; without the right button here the branches
+    // below never saw one.
+    acceptedButtons: Qt.LeftButton | Qt.RightButton
 
     onPressed: function(m) {
       if (m.button === Qt.RightButton) return
@@ -145,7 +165,16 @@ Item {
       root.released(root.liveValue)
     }
     onWheel: function(wheel) {
-      root.nudge(wheel.angleDelta.y > 0 ? root.step : -root.step)
+      // Never rely on a declined wheel reaching the Flickable: accept it either
+      // way, and scroll ourselves when the policy says the wheel is not ours.
+      var dy = Model.wheelDelta(wheel.angleDelta.x, wheel.angleDelta.y, wheel.modifiers)
+      if (!Model.wheelOwns("fader", wheel.modifiers, root.activeFocus, dy)) {
+        if (root.scrollBy) root.scrollBy(-wheel.angleDelta.y / 2)
+        wheel.accepted = true
+        return
+      }
+      root.nudge(dy > 0 ? root.step : -root.step)
+      wheel.accepted = true
     }
   }
 }

@@ -1,3 +1,8 @@
 #!/bin/bash
 printf "%s\n" "$*" >> "$SYSTEMCTL_LOG"
+# SYSTEMCTL_RESTART_FAILS names a file a restart creates: with PACTL_NO_EQ_SINK set
+# to the same path, the equalizer sink does not come back after the restart.
+if [[ -n ${SYSTEMCTL_RESTART_FAILS:-} && " $* " == *" restart "* ]]; then
+  : >"$SYSTEMCTL_RESTART_FAILS"
+fi
 exit 0

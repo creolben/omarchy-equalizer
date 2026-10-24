@@ -2,6 +2,7 @@
   "name": "Pop",
   "description": "Gentle vocal-forward curve, smooth top end",
   "order": 31,
+  "category": "genre",
   "mode": "graphic",
   "preamp": -1.5,
   "graphic": [

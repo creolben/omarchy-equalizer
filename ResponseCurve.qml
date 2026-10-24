@@ -36,6 +36,9 @@ Item {
   property bool freqEditable: false
   // The fader bank: graphic mode's control, on the plot's own axis.
   property bool showFaders: false
+  // Wheel scroll passthrough: the panel injects its scrollByDelta here and the
+  // bank's faders call it when the wheel is not theirs.
+  property var scrollBy: null
 
   property real minDb: -18
   property real maxDb: 18
@@ -46,6 +49,13 @@ Item {
   property real draftGain: 0
   property real draftFreq: 0
   property int hoverIndex: -1
+  // The band the keyboard acts on: set by a press on its handle or by ←/→
+  // while the curve has focus. -1 until one is chosen.
+  property int selectedIndex: -1
+  // The range a band's gain may take, the same one the faders and the panel
+  // clamp to; the plot itself is drawn wider so a +12 handle is not on the edge.
+  property real gainMin: -12
+  property real gainMax: 12
 
   signal bandGainMoved(int index, real gain)
   signal bandGainCommitted(int index, real gain)
@@ -119,19 +129,48 @@ Item {
     return b ? Number(b.gain) || 0 : 0
   }
 
+  // Where a band's handle is drawn. drawHandles() and the tests read the same
+  // function, so a test on it is a test on the drawing.
+  function handleXFor(index) { return xFor(bandFreqAt(index)) }
+  function handleYFor(index) { return yFor(bandGainAt(index)) }
+
   function bandFreqAt(index) {
     if (index === dragIndex) return draftFreq
     var b = bands[index]
     return b ? Number(b.freq) || 1000 : 1000
   }
 
-  // Pass filters have no gain, so they have no handle to grab.
-  function nearestBand(x, y) {
-    var best = -1, bestDistance = Style.space(18)
+  // Pass filters have no gain, so they have no handle.
+  function hasHandle(index) {
+    var b = bands[index]
+    return !!b && (b.type === undefined || Model.typeHasGain(b.type))
+  }
+
+  // The grab radius: 18 px, but never more than half the gap between the two
+  // closest handles, so a press between neighbours cannot reach past the one it
+  // is nearer to. It never shrinks below the drawn handle itself.
+  function hitRadius() {
+    var r = Style.space(18)
+    var pts = []
     for (var i = 0; i < bands.length; i++) {
+      if (!hasHandle(i)) continue
+      pts.push({ x: xFor(bands[i].freq), y: yFor(bands[i].gain) })
+    }
+    for (var a = 0; a < pts.length; a++) {
+      for (var c = a + 1; c < pts.length; c++) {
+        var dx = pts[a].x - pts[c].x, dy = pts[a].y - pts[c].y
+        r = Math.min(r, Math.sqrt(dx * dx + dy * dy) / 2)
+      }
+    }
+    return Math.max(Math.max(6, Style.space(8)), r)
+  }
+
+  // The nearest handle within the grab radius, or -1.
+  function nearestBand(x, y) {
+    var best = -1, bestDistance = hitRadius()
+    for (var i = 0; i < bands.length; i++) {
+      if (!hasHandle(i)) continue
       var b = bands[i]
-      if (!b) continue
-      if (b.type !== undefined && !Model.typeHasGain(b.type)) continue
       var dx = xFor(b.freq) - x
       var dy = yFor(b.gain) - y
       var d = Math.sqrt(dx * dx + dy * dy)
@@ -140,15 +179,57 @@ Item {
     return best
   }
 
+  // ←/→ walk the handles, skipping pass filters; from nothing selected the
+  // first step lands on the first or last handle.
+  function stepSelection(direction) {
+    var n = bands.length
+    if (n === 0) return
+    var i = selectedIndex
+    for (var tries = 0; tries < n; tries++) {
+      if (i < 0 || i >= n) i = direction > 0 ? 0 : n - 1
+      else i = (i + direction + n) % n
+      if (hasHandle(i)) { selectedIndex = i; return }
+    }
+  }
+
+  function nudgeSelected(delta) {
+    if (selectedIndex < 0 || selectedIndex >= bands.length || !hasHandle(selectedIndex)) return
+    var g = Math.max(gainMin, Math.min(gainMax, snapGain(bandGainAt(selectedIndex) + delta)))
+    bandGainCommitted(selectedIndex, g)
+  }
+
+  activeFocusOnTab: editable
+  Keys.onLeftPressed: stepSelection(-1)
+  Keys.onRightPressed: stepSelection(1)
+  Keys.onUpPressed: nudgeSelected(gainStep)
+  Keys.onDownPressed: nudgeSelected(-gainStep)
+  // Every other key goes on to the panel's key catcher (e / m / r, Escape).
+  Keys.onPressed: function(event) {
+    if (event.key === Qt.Key_0 && selectedIndex >= 0 && hasHandle(selectedIndex)) {
+      bandGainCommitted(selectedIndex, 0)
+      event.accepted = true
+    } else {
+      event.accepted = false
+    }
+  }
+  onActiveFocusChanged: {
+    if (activeFocus && selectedIndex < 0) stepSelection(1)
+    repaint()
+  }
+
   function repaint() { canvas.requestPaint() }
 
-  onBandsChanged: repaint()
+  onBandsChanged: {
+    if (selectedIndex >= bands.length) selectedIndex = -1
+    repaint()
+  }
   onPreampChanged: repaint()
   onSampleRateChanged: repaint()
   onWidthChanged: repaint()
   onHeightChanged: repaint()
   onDragIndexChanged: repaint()
   onHoverIndexChanged: repaint()
+  onSelectedIndexChanged: repaint()
   onForegroundChanged: repaint()
   onAccentChanged: repaint()
 
@@ -167,6 +248,7 @@ Item {
       ctx.restore()
       root.drawScales(ctx)
       root.drawHandles(ctx)
+      if (root.activeFocus) root.drawFocusRing(ctx)
     }
   }
 
@@ -176,8 +258,12 @@ Item {
   // the gridlines are drawn with. Its model is the band count, never the band
   // array: the panel echoes every write back as a new array, and a Repeater over
   // an array rebuilds all ten delegates, which kills the drag in progress.
+  // Above the plot's MouseArea, which fills the whole console: without it the
+  // plot took every press, hover and wheel over the bank, so a fader could not
+  // be dragged, focused (the wheel's arm) or double-clicked back to zero.
   Item {
     id: faderLayer
+    z: 1
     visible: root.showFaders
     x: root.plotX
     y: root.faderY
@@ -238,6 +324,7 @@ Item {
           foreground: root.foreground
           accent: root.accent
           background: root.background
+          scrollBy: root.scrollBy
           onGainMoved: function(g) { root.bandGainMoved(index, g) }
           onGainCommitted: function(g) { root.bandGainCommitted(index, g) }
           onResetRequested: root.bandGainCommitted(index, 0)
@@ -448,6 +535,16 @@ Item {
     ctx.stroke()
   }
 
+  // The same ring the sliders show: 2 px of accent at 40 % round the console.
+  function drawFocusRing(ctx) {
+    var w = Math.max(1, Style.space(2))
+    roundedRect(ctx, plotX + w / 2, plotY + w / 2, plotW - w, consoleBottom - plotY - w, Style.cornerRadius)
+    ctx.lineWidth = w
+    ctx.setLineDash([])
+    ctx.strokeStyle = rgba(accent, 0.4)
+    ctx.stroke()
+  }
+
   function drawHandles(ctx) {
     var radius = Math.max(6, Style.space(8))
     var numberSize = Math.max(8, Style.font.caption - 1)
@@ -455,10 +552,11 @@ Item {
       var b = bands[i]
       if (!b) continue
       if (b.type !== undefined && !Model.typeHasGain(b.type)) continue
-      var x = xFor(bandFreqAt(i))
-      var y = yFor(bandGainAt(i))
+      var x = handleXFor(i)
+      var y = handleYFor(i)
       var dragging = (i === dragIndex)
       var hot = dragging || (i === hoverIndex && dragIndex < 0)
+        || (activeFocus && i === selectedIndex && dragIndex < 0)
       var shaped = Math.abs(bandGainAt(i)) >= 0.05
       var r = hot ? radius * 1.2 : radius
 
@@ -483,7 +581,8 @@ Item {
       ctx.fillText(String(i + 1), x, y + 0.5)
     }
     var readout = dragIndex >= 0 ? dragIndex : hoverIndex
-    if (readout >= 0) drawReadout(ctx, readout)
+    if (readout < 0 && activeFocus) readout = selectedIndex
+    if (readout >= 0 && readout < bands.length) drawReadout(ctx, readout)
   }
 
   // Floating tag with the band's frequency and gain, kept inside the plot.
@@ -524,10 +623,16 @@ Item {
 
     onPressed: function(m) {
       var index = root.nearestBand(m.x, m.y)
+      // A press on the plot takes keyboard focus, so ←/→ ↑/↓ and 0 work next.
+      root.forceActiveFocus()
       if (index < 0) return
-      root.dragIndex = index
-      root.draftGain = root.snapGain(root.dbForY(m.y))
+      // Read the band's frequency before dragIndex marks it as dragged: bandFreqAt()
+      // returns draftFreq for that band, so the old order read back the previous
+      // drag's frequency (0 on the first drag) and drew the handle at 1 kHz.
       root.draftFreq = root.bandFreqAt(index)
+      root.dragIndex = index
+      root.selectedIndex = index
+      root.draftGain = root.snapGain(root.dbForY(m.y))
       root.bandGainMoved(index, root.draftGain)
     }
 
@@ -555,7 +660,18 @@ Item {
 
     onDoubleClicked: function(m) {
       var index = root.nearestBand(m.x, m.y)
+      // Drop the drag the second press began, so its release cannot commit the
+      // pressed position over the reset.
+      root.dragIndex = -1
       if (index >= 0) root.bandGainCommitted(index, 0)
+      root.repaint()
+    }
+
+    // The plot never adjusts on the wheel; it scrolls the panel itself rather
+    // than trusting a declined event to reach the Flickable.
+    onWheel: function(wheel) {
+      if (root.scrollBy) root.scrollBy(-wheel.angleDelta.y / 2)
+      wheel.accepted = true
     }
   }
 }

@@ -2,6 +2,7 @@
   "name": "Flat",
   "description": "All bands at 0 dB: the neutral reference",
   "order": 10,
+  "category": "reference",
   "mode": "graphic",
   "preamp": 0,
   "graphic": [

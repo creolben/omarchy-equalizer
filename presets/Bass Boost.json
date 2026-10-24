@@ -2,6 +2,7 @@
   "name": "Bass Boost",
   "description": "Bass-forward without the level drop: treble rolled off ~5 dB",
   "order": 20,
+  "category": "tone",
   "mode": "graphic",
   "preamp": 0,
   "graphic": [

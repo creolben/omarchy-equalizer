@@ -2,6 +2,7 @@
   "name": "Podcast",
   "description": "Spoken word: rumble cut below 125 Hz, speech band at unity",
   "order": 40,
+  "category": "speech",
   "mode": "graphic",
   "preamp": -0.5,
   "graphic": [

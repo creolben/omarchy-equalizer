@@ -15,6 +15,7 @@ Item {
   property var edits: []
   property int acceptedCount: 0
   property int finishedCount: 0
+  property int cancelledCount: 0
 
   KeyField {
     id: field
@@ -25,6 +26,7 @@ Item {
     onTextEdited: scene.edits = scene.edits.concat([text])
     onAccepted: scene.acceptedCount++
     onEditingFinished: scene.finishedCount++
+    onCancelled: scene.cancelledCount++
   }
 
   // The band row's shape: digits and a dot only, capped length.
@@ -53,6 +55,7 @@ Item {
       scene.edits = []
       scene.acceptedCount = 0
       scene.finishedCount = 0
+      scene.cancelledCount = 0
     }
 
     function focusField(f) { mouseClick(f, 20, f.height / 2) }
@@ -94,6 +97,7 @@ Item {
       keyClick(Qt.Key_X)
       keyClick(Qt.Key_Escape)
       compare(field.text, "Hello", "Escape restores the model's text")
+      compare(scene.cancelledCount, 1, "Escape reports a cancel (the preset picker closes on it)")
     }
 
     function test_ctrl_u_clears_and_ctrl_v_does_nothing() {

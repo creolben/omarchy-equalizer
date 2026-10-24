@@ -2,6 +2,7 @@
   "name": "Small Speakers",
   "description": "Laptop speakers: 55 Hz high-pass, boxiness cut, 3 kHz lift",
   "order": 52,
+  "category": "situation",
   "mode": "parametric",
   "preamp": -2.0,
   "parametric": [

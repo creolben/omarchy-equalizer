@@ -13,22 +13,39 @@
 # sink deck PACTL_EQ_AIM_SINK_ID (default 2, the device sink). Unset, `list
 # sink-inputs` keeps today's table print, so the EQ output stream has no id and
 # the aim reads as unknown -- the no-stream state of a real machine between
-# starts.
+# starts. PACTL_APP_STREAM adds an application stream (id 42) playing into the
+# equalizer, for the tests that check a restart parks it instead of dropping it.
 sinks="1	omarchy_equalizer	PipeWire	s16le 2ch 48000Hz	SUSPENDED"
+# PACTL_NO_EQ_SINK names a file; while it exists the equalizer sink is gone (the
+# systemctl stub creates it for a restart that does not come back).
+[[ -n ${PACTL_NO_EQ_SINK:-} && -e $PACTL_NO_EQ_SINK ]] && sinks="0	placeholder.unused	PipeWire	s16le 2ch 48000Hz	SUSPENDED"
 if [[ -n ${PACTL_DEVICE_SINK:-} ]]; then
   sinks="$sinks
 2	$PACTL_DEVICE_SINK	PipeWire	s16le 2ch 48000Hz	SUSPENDED"
 fi
+if [[ -n ${PACTL_DEVICE_SINK2:-} ]]; then
+  sinks="$sinks
+3	$PACTL_DEVICE_SINK2	PipeWire	float32le 2ch 48000Hz	SUSPENDED"
+fi
 [[ -n ${PACTL_LOG:-} ]] && printf '%s\n' "$*" >>"$PACTL_LOG"
 case "$1" in
   list)
-    if [[ ${2:-} == sink-inputs && -n ${PACTL_EQ_AIM:-} ]]; then
+    if [[ ${2:-} == sink-inputs && -n ${PACTL_APP_STREAM:-} ]]; then
+      printf 'Sink Input #42\n\tSink: 1\n\tProperties:\n\t\tapplication.name = "Chromium"\n'
+    elif [[ ${2:-} == sink-inputs && -n ${PACTL_EQ_AIM:-} ]]; then
       { printf 'Sink Input #99\n\tSink: %s\n\tProperties:\n' "${PACTL_EQ_AIM_SINK_ID:-2}"
         printf '\t\tnode.name = "omarchy_equalizer.output"\n'
       }
     else
       printf '%s\n' "$sinks"
     fi
+    ;;
+  subscribe)
+    # PACTL_SUBSCRIBE_COUNT change events on the EQ's stream, spaced wider than
+    # the follower's 0.4 s drain so each one is its own pass.
+    for ((i = 0; i < ${PACTL_SUBSCRIBE_COUNT:-0}; i++)); do
+      sleep 0.5; printf "Event 'change' on sink-input #99\n"
+    done
     ;;
   get-default-sink) printf '%s\n' "${PACTL_DEFAULT_SINK:-omarchy_equalizer}" ;;
 esac

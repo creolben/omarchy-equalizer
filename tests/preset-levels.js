@@ -40,6 +40,19 @@ const PEAK_MAX = 0.5;       // the applied curve may not run over 0 dBFS
 // sweep still has energy down there to measure it with.
 const DEEPEST = -26, LOUDEST = 4;
 
+// The explicit category and the order band are two encodings of the same idea.
+// Keeping both is useful (order still sorts, category is what the picker shows),
+// but only if they cannot drift: the table below is the contract, and every file
+// is checked against it.
+const CATEGORIES = ['reference', 'tone', 'genre', 'speech', 'situation'];
+const BAND_CATEGORY = {
+  1: 'reference',   // order 10-19
+  2: 'tone',        // order 20-29
+  3: 'genre',       // order 30-39
+  4: 'speech',      // order 40-49
+  5: 'situation'    // order 50-59
+};
+
 let pass = 0, fail = 0;
 function ok(name) { console.log('PASS  ' + name); pass++; }
 function bad(name, detail) { console.log('FAIL  ' + name + ' -- ' + detail); fail++; }
@@ -112,9 +125,21 @@ for (const file of files) {
     bad(name + ' has a sort order', 'order is ' + JSON.stringify(doc.order));
   else ok(name + ' has a sort order');
 
+  if (!CATEGORIES.includes(doc.category))
+    bad(name + ' has a category', 'category is ' + JSON.stringify(doc.category) +
+      ', allowed ' + CATEGORIES.join(', '));
+  else ok(name + ' has a category');
+  const bandCategory = Number.isInteger(doc.order) ? BAND_CATEGORY[Math.floor(doc.order / 10)] : null;
+  if (bandCategory && doc.category === bandCategory)
+    ok(name + ' category agrees with its order band');
+  else
+    bad(name + ' category agrees with its order band', 'order ' + JSON.stringify(doc.order) +
+      ' maps to ' + JSON.stringify(bandCategory) + ', category is ' + JSON.stringify(doc.category));
+
   const s = analyseAll(bands, Number(doc.preamp) || 0);
-  results.push({ name, ...s });
-  console.log('      ' + name.padEnd(16) + 'level ' + fmt(s.level).padStart(6) +
+  results.push({ name, category: doc.category, ...s });
+  console.log('      ' + name.padEnd(16) + ' ' + String(doc.category || '?').padEnd(10) +
+    ' level ' + fmt(s.level).padStart(6) +
     '  (pink ' + fmt(s.pink) + ', A ' + fmt(s.a) + ')  peak ' + fmt(s.peak).padStart(5) +
     '  range ' + fmt(s.lo) + ' .. ' + fmt(s.hi));
 }
@@ -131,6 +156,34 @@ for (const r of results) {
     bad(r.name + ' stays in range', 'contour ' + fmt(r.lo) + ' .. ' + fmt(r.hi));
   else ok(r.name + ' stays in range');
 }
+
+// The set needs one neutral reference, and it has to be the file named Flat:
+// every level below is measured against it.
+const references = results.filter(r => r.category === 'reference');
+if (references.length === 1)
+  ok('exactly one preset is the reference');
+else
+  bad('exactly one preset is the reference', references.length + ' found' +
+    (references.length ? ': ' + references.map(r => r.name).join(', ') : ''));
+if (references.length === 1 && references[0].name === 'Flat')
+  ok('the reference preset is Flat');
+else
+  bad('the reference preset is Flat', references.length === 1
+    ? 'the reference is ' + references[0].name
+    : 'no single reference to check');
+
+// Files are named by preset, so a duplicate here would be a file whose name
+// field collides with another one. It would make the picker ambiguous.
+const seenNames = new Set();
+const duplicates = [];
+for (const r of results) {
+  if (seenNames.has(r.name)) duplicates.push(r.name);
+  seenNames.add(r.name);
+}
+if (duplicates.length)
+  bad('preset names are unique', 'duplicates: ' + duplicates.join(', '));
+else
+  ok('preset names are unique');
 
 if (results.length) {
   const hi = Math.max(...results.map(r => r.level)), lo = Math.min(...results.map(r => r.level));

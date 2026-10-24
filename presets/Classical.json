@@ -2,6 +2,7 @@
   "name": "Classical",
   "description": "Near-flat with a soft 500 Hz dip and a touch of air",
   "order": 34,
+  "category": "genre",
   "mode": "graphic",
   "preamp": -1.5,
   "graphic": [
