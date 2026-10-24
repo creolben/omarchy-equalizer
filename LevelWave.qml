@@ -38,7 +38,7 @@ Item {
   property color accent: foreground
   property color urgent: 'red'
 
-  implicitHeight: Style.space(64)
+  implicitHeight: Style.space(44)
 
   readonly property real barWidth: Math.max(1.5, Style.spaceReal(2))
   readonly property real barGap: Math.max(2, barWidth * 1.25)
