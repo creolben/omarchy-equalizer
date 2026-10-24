@@ -250,7 +250,7 @@ keys control its level, which is applied before the bands.
 ## Tests
 
 ```sh
-bash tests/run-tests.sh     # 338 assertions, no real sink touched
+bash tests/run-tests.sh     # 346 assertions, no real sink touched
 ```
 
 The suite also runs `tests/curve-check.js` (the response maths against
