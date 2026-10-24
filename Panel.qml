@@ -287,8 +287,12 @@ Panel {
   // Everything else -- presets, mode, import -- is a distinct action in order.
   function actionKey(args) {
     var name = String(args[0] || "")
-    if (name === "set-gain" || name === "set-band" || name === "set-preamp")
+    if (name === "set-gain" || name === "set-preamp")
       return name + ":" + String(args[1] || "")
+    // A band's freq and its Q are different edits: only the same property of
+    // the same band may replace a queued one.
+    if (name === "set-band")
+      return name + ":" + String(args[1] || "") + ":" + String(args[2] || "")
     return ""
   }
 

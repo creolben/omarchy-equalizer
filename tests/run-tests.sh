@@ -294,6 +294,26 @@ check "the preamp slider is the plugin's own component" "yes" \
 check "the shell's wheel-adjusting PanelSlider is no longer used" "0" \
   "$(grep -c 'PanelSlider' "$here/../Panel.qml")"
 
+echo "== the panel queue keeps distinct edits apart =="
+node "$here/queue-check.js" >"$T/queue-check.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/queue-check.log"
+check "queue keys and the band settle timer hold" "0" "$rc"
+
+echo "== the curve maths matches PipeWire's biquads =="
+node "$here/curve-check.js" >"$T/curve-check.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/curve-check.log"
+check "curve-check.js passes" "0" "$rc"
+
+echo "== concurrent commands do not lose edits =="
+# Each command reads, edits and writes the whole state; without the lock ten
+# parallel gain changes kept one.
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-mode graphic >/dev/null
+for i in 0 1 2 3 4 5 6 7 8 9; do run set-gain "$i" 2 >/dev/null & done; wait
+check "ten parallel gain changes all land" "10" \
+  "$(jq '[.graphic[] | select(.gain == 2)] | length' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+
 echo "== preset list =="
 check "every preset file is listed" \
   "$(ls "$here/../presets"/*.json | wc -l)" "$(run status | jq '[.presets[] | select(.builtin)] | length')"
@@ -364,6 +384,9 @@ run enable >/dev/null
 run disable >/dev/null
 
 echo "== a restart parks the app streams instead of dropping them =="
+# With LSP nothing here restarts (both modes run in the pool), so this is the
+# biquad chain of a machine without it, where a mode change still rebuilds.
+export OMARCHY_EQ_LV2_DIR="$T/lv2-missing"; mkdir -p "$OMARCHY_EQ_LV2_DIR"
 # A graph-shape change restarts the chain, and the EQ sink vanishes for a moment.
 # A browser playing into it takes that as its device going away and pauses the
 # song. The streams are parked on the device the EQ plays into for the restart and
@@ -416,6 +439,7 @@ unset PACTL_APP_STREAM PACTL_LOG OMARCHY_EQ_RESTART_TIMEOUT PACTL_NO_EQ_SINK
 run set-mode graphic >/dev/null
 unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
 run disable >/dev/null
+export OMARCHY_EQ_LV2_DIR="$T/lv2"
 run enable >/dev/null
 
 echo "== routing: a vanished target is replaced, not trusted =="
@@ -630,6 +654,42 @@ unset PACTL_DEVICE_SINK2 PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG
 run disable >/dev/null
 unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
 
+echo "== routing: a headset that connects and carries the stream is followed =="
+# Seen live: a different headset than the remembered one connects, WirePlumber
+# relinks the EQ stream to it, the default stays the EQ -- and convergence used to
+# drag the stream back to the speakers ("connected, but the sound is still on the
+# speakers"). A sink that appeared after the target was picked and carries the
+# stream is the new device; one that was already there (issue #2) is not.
+run disable >/dev/null
+export PACTL_DEVICE_SINK=audio_effect.stub-dsp PACTL_DEFAULT_SINK=audio_effect.stub-dsp
+run enable >/dev/null
+st="$XDG_STATE_HOME/omarchy-equalizer/state.json"
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+run retarget >/dev/null
+check "the first pass records the outputs as already there" "0" "$(jq -r '.seenSinks["audio_effect.stub-dsp"]' "$st")"
+# The pick happened a while ago; then the headset connects.
+jq -c '.targetPickedAt = 100' "$st" >"$st.x" && mv "$st.x" "$st"
+export PACTL_DEVICE_SINK2=bluez_output.AA_BB_CC_DD_EE_FF.1
+run retarget >/dev/null
+check "the new output is timestamped when it appears" "yes" \
+  "$( (( $(jq -r '.seenSinks["bluez_output.AA_BB_CC_DD_EE_FF.1"]' "$st") > 100 )) && echo yes || echo no)"
+export PACTL_EQ_AIM=1 PACTL_EQ_AIM_SINK_ID=3 PACTL_LOG="$T/pactl-new.log"; : >"$PACTL_LOG"
+run retarget >/dev/null
+check "a new headset carrying the stream becomes the target" "bluez_output.AA_BB_CC_DD_EE_FF.1" "$(jq -r '.targetSink' "$st")"
+check "and the device of record" "bluez_output.AA_BB_CC_DD_EE_FF.1" "$(jq -r '.previousDefaultSink' "$st")"
+check "the stream is left on it" "0" "$(grep -c 'move-sink-input' "$PACTL_LOG")"
+check "the fragment names it" "1" "$(grep -c 'target.object = "bluez_output.AA_BB_CC_DD_EE_FF.1"' "$frag")"
+# Issue #2 still holds: an output that was there before the pick is not adopted.
+: >"$PACTL_LOG"
+export PACTL_EQ_AIM_SINK_ID=2
+run retarget >/dev/null
+check "a relink to an output older than the pick is moved back" "1" \
+  "$(grep -c '^move-sink-input 99 bluez_output.AA_BB_CC_DD_EE_FF.1$' "$PACTL_LOG")"
+check "and the target is kept" "bluez_output.AA_BB_CC_DD_EE_FF.1" "$(jq -r '.targetSink' "$st")"
+unset PACTL_DEVICE_SINK2 PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG
+run disable >/dev/null
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
+
 echo "== preset delete =="
 run save-preset ScratchPreset >/dev/null
 run apply-preset ScratchPreset >/dev/null
@@ -656,6 +716,14 @@ check "the profile path asked for is the one downloaded" "1" "$(grep -c 'Test%20
 out="$(run import-autoeq 'Test HP (velour)')"
 check "a name import still searches the index" "1" "$(grep -c 'INDEX.md' "$CURL_LOG")"
 check "a name import resolves the variant asked for" "Test HP (velour)" "$(jq -r '.preset' <<<"$out")"
+
+# Index paths are untrusted too: "../" leaves the AutoEq tree, brackets glob.
+: >"$CURL_LOG"
+out="$(run import-autoeq 'X' './../../../evil/repo/main/X')"; rc=$?
+check "a profile path with ../ is refused" "1" "$rc"
+out="$(run import-autoeq 'X' 'oratory1990/over-ear/X[1-9999]')"; rc=$?
+check "a profile path with a curl glob is refused" "1" "$rc"
+check "neither is downloaded" "0" "$(wc -l <"$CURL_LOG" | tr -d ' ')"
 
 # A profile is untrusted input and its fields land unquoted in the fragment. A
 # JSON string carrying an escaped brace and newline -- awk splits on whitespace,
@@ -773,6 +841,8 @@ rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
 
 echo "== preset ramp =="
+# The crossfade belongs to the biquad chain, i.e. a machine without LSP.
+export OMARCHY_EQ_LV2_DIR="$T/lv2-missing"; mkdir -p "$OMARCHY_EQ_LV2_DIR"
 # Get into graphic mode with a flat graphic set, then clear the logs so only the
 # preset application is measured. The ramp is enabled here; every other test
 # collapses it with OMARCHY_EQ_NO_RAMP.
@@ -791,6 +861,12 @@ check "the last ramp step carries the preset's final gains" "yes" \
 run apply-preset "Speech Clarity" >/dev/null
 check "a parametric preset rebuilds the graph" "yes" \
   "$(grep -c restart "$SYSTEMCTL_LOG" | sed 's/^0$/no/;s/^[1-9].*/yes/')"
+# Back to LSP: the first command finds the biquad chain still running and
+# rebuilds it into the pool once; after that the pool is written live.
+export OMARCHY_EQ_LV2_DIR="$T/lv2"
+: >"$SYSTEMCTL_LOG"
+run set-mode parametric >/dev/null
+check "a biquad graph left running is rebuilt into the pool once" "1" "$(grep -c restart "$SYSTEMCTL_LOG")"
 : >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
 run add-band >/dev/null
 check "adding a band to a running pool does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
@@ -802,7 +878,7 @@ check "the boost defaults off" "off" "$(run status | jq -r '.boost')"
 check "the output stage is active" "true" "$(run status | jq -r '.outputStage')"
 
 echo "== output stage in the fragment =="
-# The graphic set is a fixed 10 bands, so "the last band" is g9.
+# With LSP the graphic set runs in the pool too, so the bands are one node.
 run set-mode graphic >/dev/null
 frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
 check "the fragment hosts the multiband compressor" "1" "$(grep -c 'lv2/mb_compressor_mono' "$frag")"
@@ -820,8 +896,8 @@ check "the treble band's split is switched on" "1" "$(grep -c '"cbe_2" = 1' "$fr
 check "the fourth band's split stays off" "1" "$(grep -c '"cbe_3" = 0' "$frag")"
 check "the limiter oversamples to catch true peaks" "1" \
   "$(grep 'name = limit' "$frag" | grep -c '"ovs" = 12')"
-check "the last band feeds the compressor" "1" \
-  "$(grep -c 'g9:Out" input = "boost:in"' "$frag")"
+check "the band pool feeds the compressor" "1" \
+  "$(grep -c 'para:out" input = "boost:in"' "$frag")"
 check "the compressor feeds the limiter" "1" \
   "$(grep -c 'boost:out" input = "limit:in"' "$frag")"
 check "the limiter is the graph output" "0" "$(grep -c 'limit:out' "$frag")"
@@ -956,29 +1032,30 @@ check "a pool remove is one pw-cli call" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')
 check "the freed slot is written Off" "yes" \
   "$(grep -q '"para:ft_8" 0' "$PWCLI_LOG" && echo yes || echo no)"
 
-echo "== a parametric preset shaped like the graphic chain still rebuilds into the pool =="
-# Ten bells match the graphic chain's shape, so the shape check used to ramp
-# them into the biquads -- leaving every later edit sending para:* controls to a
-# graph that has none. Into or out of the pool is always a restart.
+echo "== with LSP a preset of any mode or shape is live, never a rebuild =="
+# A rebuild drops the sink, and a browser playing into it pauses (Warm Speakers
+# from a graphic preset did). Both modes run in the pool, so a parametric preset
+# from graphic mode, and back, is one values write.
 run set-mode graphic >/dev/null
-jq -c '. + { "Ten Bells": { mode: "parametric",
-  parametric: [ range(10) | { type: "peaking", freq: (100 * (. + 1)), q: 1.0, gain: 1 } ] } }' \
-  "$XDG_STATE_HOME/omarchy-equalizer/presets.json" >"$T/p.json" &&
-  mv "$T/p.json" "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
+run apply-preset Rock >/dev/null
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run apply-preset "Warm Speakers" >/dev/null
+check "graphic -> Warm Speakers does not restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "it is one live write to the pool" "1" "$(grep -c 'para:ft_0' "$PWCLI_LOG")"
+check "the low shelf lands live (ft 5)" "1" "$(grep -c '"para:ft_0" 5' "$PWCLI_LOG")"
+check "the fragment stays the pool" "1" "$(grep -c 'name = para plugin' "$frag")"
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run apply-preset Rock >/dev/null
+check "Warm Speakers -> a graphic preset does not restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
 : >"$SYSTEMCTL_LOG"
-run apply-preset "Ten Bells" >/dev/null
-check "graphic -> ten-bell parametric preset restarts" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
-check "the fragment is the pool" "1" "$(grep -c 'para_equalizer_x16_mono' "$frag")"
-jq -c '. + { "Ten Graphic": { mode: "graphic",
-  graphic: [ range(10) | { type: "peaking", freq: (100 * (. + 1)), q: 1.41, gain: 1 } ] } }' \
-  "$XDG_STATE_HOME/omarchy-equalizer/presets.json" >"$T/p.json" &&
-  mv "$T/p.json" "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
+run set-mode parametric >/dev/null
+run set-mode graphic >/dev/null
+check "a mode switch does not restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
 : >"$SYSTEMCTL_LOG"
-run apply-preset "Ten Graphic" >/dev/null
-check "pool -> graphic preset restarts" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
-check "the fragment is the biquad chain again" "0" "$(grep -c 'para_equalizer_x16_mono' "$frag")"
-jq -c 'del(.["Ten Bells"], .["Ten Graphic"])' "$XDG_STATE_HOME/omarchy-equalizer/presets.json" >"$T/p.json" &&
-  mv "$T/p.json" "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
+for p in "Bass Boost" "Small Speakers" "Speech Clarity" "Flat" "Warm Speakers" "Zouk"; do
+  run apply-preset "$p" >/dev/null
+done
+check "six presets across both modes: no restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
 run set-mode parametric >/dev/null
 
 echo "== parametric band cap =="
@@ -1002,13 +1079,21 @@ check "the truncation says so on stderr" "1" "$(grep -c 'keeping the first 16' "
 check "the truncation is persisted" "16" \
   "$(jq '.parametric | length' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
 
-echo "== graphic type changes still restart =="
+echo "== a graphic type change is live in the pool, a rebuild on biquads =="
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 run set-mode graphic >/dev/null
 : >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
 run set-band 0 type lowshelf >/dev/null
-check "a graphic type change restarts" "1" "$(grep -c restart "$SYSTEMCTL_LOG")"
-check "a graphic type change writes no live param" "0" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+check "a graphic type change in the pool does not restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "a graphic type change in the pool is one live write" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+export OMARCHY_EQ_LV2_DIR="$T/lv2-missing"
+run set-band 0 type peaking >/dev/null
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run set-band 0 type lowshelf >/dev/null
+check "a graphic type change on biquads restarts" "1" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "a graphic type change on biquads writes no live param" "0" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+run set-band 0 type peaking >/dev/null
+export OMARCHY_EQ_LV2_DIR="$T/lv2"
 
 echo "== no-LSP parametric stays the biquad path =="
 export OMARCHY_EQ_LV2_DIR="$T/lv2-missing"

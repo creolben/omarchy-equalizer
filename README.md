@@ -37,10 +37,11 @@ omarchy plugin enable io.github.creolben.equalizer
 - `curl` for AutoEq import; `node` to run the test suite
 - Optional: `lsp-plugins-lv2` for the output stage. Without it the equalizer runs
   as a pure EQ and the limiter/boost controls report the stage as inactive.
-- Optional but recommended: with `lsp-plugins-lv2`, parametric mode also runs on
-  a resident 16-slot LSP equalizer, so changing a band's type or adding/removing
-  bands is a live `pw-cli` write rather than a filter-chain restart. Without it,
-  a shape change still restarts the chain (players may pause for it).
+- Optional but recommended: with `lsp-plugins-lv2`, both modes run on a resident
+  16-slot LSP equalizer, so every edit -- a preset of either mode, a mode switch,
+  a band's type, adding/removing bands, an AutoEq import -- is a live `pw-cli`
+  write rather than a filter-chain restart. Without it, a shape change still
+  restarts the chain (players may pause for it).
 
 Enabling makes the equalizer the default sink and moves application streams onto
 it; disabling restores the output you had selected. While it is on, the volume
@@ -86,14 +87,16 @@ it if you plan to install the plugin again.
   that drops every PulseAudio client connection.
 - The graph itself is regenerated at
   `~/.config/pipewire/omarchy-equalizer.conf.d/90-eq.conf` when the mode changes
-  and on enable/retarget, and is kept in step (values only) after a live edit. In
-  graphic mode the ten builtin biquads are fixed, so gain, frequency and Q are
-  written into the running graph with `pw-cli set-param` and never restart
-  anything. In parametric mode with `lsp-plugins-lv2` the whole band set runs on
-  one resident 16-slot `para_equalizer_x16_mono` node, so a band's type and the
-  band count are values too: type/add-band/remove-band are live writes as well.
-  Without LSP, parametric mode keeps the per-band biquad chain and a shape change
-  (type or count) rebuilds and restarts the unit as before.
+  and on enable/retarget, and is kept in step (values only) after a live edit.
+  With `lsp-plugins-lv2` the band set of either mode runs on one resident
+  16-slot `para_equalizer_x16_mono` node, so gain, frequency, Q, type, band count
+  and the mode itself are all values, written with one `pw-cli set-param`.
+  Without LSP each band is a builtin biquad: values are still live (a graphic
+  preset crossfades), but a shape change (type, count, mode) rebuilds and
+  restarts the unit, and the app streams are parked on the output device for
+  the moment that takes so players keep playing. Whether a write can be live is
+  decided from the graph actually running (the fragment it was built from), so
+  the first command after installing or removing LSP rebuilds once.
 - State lives outside the plugin, in
   `${XDG_STATE_HOME:-~/.local/state}/omarchy-equalizer/`: `state.json`,
   `presets.json` for user presets, and a cached AutoEq index.
@@ -109,8 +112,16 @@ it if you plan to install the plugin again.
   profile switch re-creates its sink, and a sibling profile sink is adopted at
   once), then replaced by the sink the stream is already on (or a live one; kept
   when nothing else is live, so the device's return can still be aimed at), and a drifted aim is moved back
-  onto the remembered target. A later disable still restores the device the user
-  actually chose.
+  onto the remembered target. Two exceptions keep a connecting headset from being
+  pulled back to the speakers: the device the user picked is aimed at again as
+  soon as it (or its other Bluetooth profile) is back, and an output that
+  connects after the target was picked and that WirePlumber puts the stream on
+  becomes the target. An output that was already there is not followed, which is
+  what keeps issue #2's relink to the highest-priority sink from winning. A later
+  disable still restores the device the user actually chose. Every command that
+  changes the state takes a lock (`flock` on the state directory), and the
+  follower takes it per pass, so concurrent edits are not lost and the follower
+  never acts halfway through a restart.
 - The panel is QML (`Panel.qml`, `ResponseCurve.qml`, the slider and switch
   widgets). Its text and number fields (`presetNameField`, the AutoEq query,
   the band frequency and Q) are drawn from key events (`KeyField.qml`): an
@@ -210,25 +221,26 @@ keys control its level, which is applied before the bands.
 - **Magic Boost** — `mb_compressor_mono` split into bass / mid / treble at 200 Hz
   and 4 kHz, Off / Low / Medium / High. Compresses and adds makeup gain. A
   single-band compressor would duck the whole spectrum on every bass hit.
-- **Parametric bands are resident with LSP.** In parametric mode with
-  `lsp-plugins-lv2` the bands run through one `para_equalizer_x16_mono` node whose
-  16 slots are always in the graph; unused slots are `Off`. Every parametric edit
-  — gain, frequency, Q, type, add and remove — is therefore a control write, sent
+- **Bands are resident with LSP.** With `lsp-plugins-lv2` the bands of either
+  mode run through one `para_equalizer_x16_mono` node whose 16 slots are always
+  in the graph; unused slots are `Off`. Every edit — gain, frequency, Q, type,
+  add and remove, a preset, a mode switch — is therefore a control write, sent
   as one `pw-cli set-param` call and never a restart, and the band count is capped
   at 16. The node runs the plugin's `APO (DR)` mode at slope x1, whose bell, shelf
   and pass shapes and `Q` meaning match the RBJ biquads `Model.js` draws and the
   backend's automatic headroom assumes.
-- Both output nodes — and the parametric pool when LSP is installed — stay in the
+- Both output nodes — and the band pool when LSP is installed — stay in the
   graph permanently; only their controls move, because a graph-shape change is a
-  unit restart and an audible dropout. Mode switch (graphic ↔ parametric) is the
-  one deliberate exception, and it keeps its single restart.
+  unit restart and an audible dropout (a browser pauses its media for it).
 
 ## Tests
 
 ```sh
-bash tests/run-tests.sh     # 318 assertions, no real sink touched
-node tests/curve-check.js   # Model.js response maths vs PipeWire's own biquads
+bash tests/run-tests.sh     # 338 assertions, no real sink touched
 ```
+
+The suite also runs `tests/curve-check.js` (the response maths against
+PipeWire's own biquads) and the other `tests/*.js` checks.
 
 The suite stubs `pactl`, `pw-cli`, `pw-dump`, `pw-metadata`, `systemctl` and
 `curl` on a scratch PATH and points `XDG_CONFIG_HOME`/`XDG_STATE_HOME` at a
@@ -337,8 +349,8 @@ Flat: a pink-noise sweep still has energy under the corner, while the speech and
 small-speaker material they are for does not.
 
 Graphic presets are all ten ISO bands as peaking filters, which is what lets a
-preset switch crossfade live instead of restarting the chain (see the ramp in
-`bin/omarchy-equalizer`). Keep that shape when adding one.
+preset switch crossfade live on a machine without LSP instead of restarting the
+chain (see the ramp in `bin/omarchy-equalizer`). Keep that shape when adding one.
 
 User presets live in `presets.json` under the state directory; they have no
 description and no order, so the picker labels them `Yours` and the loaded-preset

@@ -234,7 +234,7 @@ need_valid_state() {
 state_write() {
   need_valid_state "${1:-}"
   state_dir_ensure
-  jq . >"$state_file.tmp" <<<"$1" && mv "$state_file.tmp" "$state_file"
+  jq . >"$state_file.tmp.$$" <<<"$1" && mv "$state_file.tmp.$$" "$state_file"
 }
 
 # The bands the equalizer is currently processing.
@@ -250,16 +250,19 @@ active_bands() {
 # the graph. Bands reach here from a crafted profile as much as from a hand edit,
 # so walk the set and refuse the first field that is not a plain number.
 need_numeric_bands() {
-  local bands="$1" i count freq gain q
-  count="$(jq 'length' <<<"$bands")"
-  for ((i = 0; i < count; i++)); do
-    freq="$(jq -r ".[$i].freq // 1000" <<<"$bands")"
-    gain="$(jq -r ".[$i].gain // 0" <<<"$bands")"
-    q="$(jq -r ".[$i].q // 1.0" <<<"$bands")"
-    is_number "$freq" || die "Band $i freq must be a number, not '$freq'."
-    is_number "$gain" || die "Band $i gain must be a number, not '$gain'."
-    is_number "$q" || die "Band $i Q must be a number, not '$q'."
-  done
+  local problem
+  # One pass over the set (a jq per field per band made every slider step cost
+  # dozens of processes). The text tested is what jq -r would print, exactly as
+  # is_number sees it, so the rule is unchanged.
+  problem="$(jq -r '
+    def bad($i; $what; $v):
+      ($v | tostring) as $t
+      | if $t | test("^-?[0-9]+([.][0-9]+)?$") then empty
+        else "Band \($i) \($what) must be a number, not '"'"'\($t)'"'"'." end;
+    [ to_entries[] | .key as $i | .value as $b
+      | bad($i; "freq"; $b.freq // 1000), bad($i; "gain"; $b.gain // 0), bad($i; "Q"; $b.q // 1.0) ]
+    | first // empty' <<<"$bands" 2>/dev/null)" || die "The band set is not valid JSON."
+  [[ -z $problem ]] || die "$problem"
 }
 
 # ---------------------------------------------------------------- headroom
@@ -562,13 +565,20 @@ limiter_params() { limiter_values "${1:-on}" | stage_params limit; }
 
 # ---------------------------------------------------------------- parametric pool
 
-# The graph carries the 16-slot LSP pool instead of a per-band biquad chain only
-# in parametric mode with the plugins installed. write_fragment and every live
-# writer branch on this one predicate, so the graph on disk and the one running
-# can never disagree about whether "g0" or "para:ft_0" names a band.
-using_para_pool() {
-  [[ $(jq -r '.mode // "graphic"' <<<"$1") == parametric ]] && lsp_available
-}
+# With the plugins installed the graph carries the 16-slot LSP pool instead of a
+# per-band biquad chain, in both modes: ten graphic bells are ten slots like any
+# parametric set, so a mode switch, a preset of any shape, an import or a type
+# change is a values write and never a rebuild. A rebuild drops the sink for a
+# moment, which pauses a browser's media and restarts the follower with it.
+# Without LSP the biquads are emitted as before and a shape change still pays a
+# restart. write_fragment and every live writer branch on this one predicate.
+using_para_pool() { lsp_available; }
+
+# Whether the graph running now is the pool, read from the fragment it was built
+# from. The state says what the graph should be; this says what it is, which is
+# what a live write has to address -- right after an upgrade, or once LSP has
+# been installed or removed, the two differ until the next rebuild.
+running_pool() { [[ -f $fragment ]] && grep -q 'name = para plugin' "$fragment"; }
 
 # The panel's type names -> the plugin's Filter type enumeration. The values are
 # the TTL's own: Off 0, Bell 1, Hi-pass 2, Hi-shelf 3, Lo-pass 4, Lo-shelf 5,
@@ -598,22 +608,18 @@ para_type_code() {
 # wherever the plugin chose. Unused slots are ft 0 (Off) with defined values in
 # the fields a band enabled later would read.
 para_values() {
-  local bands="${1:-[]}" count i type freq q gain
-  count="$(jq 'length' <<<"$bands")"
+  local bands="${1:-[]}"
   printf 'enabled 1\nmode 0\nreact 0.2\nshift 1\nfsel 0\nquant 0\nife 0\nofe 0\ng_in 1\ng_out 1\n'
-  for ((i = 0; i < 16; i++)); do
-    if ((i < count)); then
-      type="$(jq -r ".[$i].type // \"peaking\"" <<<"$bands")"
-      freq="$(jq -r ".[$i].freq // 1000" <<<"$bands")"
-      q="$(jq -r ".[$i].q // 1.0" <<<"$bands")"
-      gain="$(jq -r ".[$i].gain // 0" <<<"$bands")"
-      printf 'ft_%d %s\nfm_%d 6\ns_%d 0\nf_%d %s\nq_%d %s\ng_%d %s\n' \
-        "$i" "$(para_type_code "$type")" "$i" "$i" "$i" "$freq" "$i" "$q" "$i" "$(db_to_mult "$gain")"
-    else
-      printf 'ft_%d 0\nfm_%d 6\ns_%d 0\nf_%d 1000\nq_%d 1.0\ng_%d 1\n' \
-        "$i" "$i" "$i" "$i" "$i" "$i"
-    fi
-  done
+  # One jq for the whole set and one awk for the slots: the type codes are
+  # para_type_code's and the gain is db_to_mult's, printed the same way.
+  jq -r '.[0:16][] | [ (.type // "peaking"), (.freq // 1000), (.q // 1.0), (.gain // 0) ] | @tsv' <<<"$bands" |
+    LC_ALL=C awk -F'\t' '
+      BEGIN { code["peaking"] = 1; code["highpass"] = 2; code["highshelf"] = 3; code["lowpass"] = 4
+              code["lowshelf"] = 5; code["notch"] = 6; code["allpass"] = 8; code["bandpass"] = 9 }
+      { i = NR - 1; c = ($1 in code) ? code[$1] : 1
+        printf "ft_%d %s\nfm_%d 6\ns_%d 0\nf_%d %s\nq_%d %s\ng_%d %.6f\n", i, c, i, i, i, $2, i, $3, i, 10 ^ ($4 / 20) }
+      END { for (i = NR; i < 16; i++)
+              printf "ft_%d 0\nfm_%d 6\ns_%d 0\nf_%d 1000\nq_%d 1.0\ng_%d 1\n", i, i, i, i, i, i }'
 }
 
 # The live param list for the pool: the preamp first (a gain or type edit changes
@@ -838,8 +844,14 @@ live_apply_para() {
 # that cannot find the node falls back to a rebuild, so a sink torn down under us
 # still comes back correct.
 live_apply_active() {
-  local bands="$1" state="$2" target
-  if using_para_pool "$state"; then
+  local bands="$1" state="$2" target want_pool=false
+  using_para_pool "$state" && want_pool=true
+  if { $want_pool && ! running_pool; } || { ! $want_pool && running_pool; }; then
+    # The running graph is the other kind: its controls have other names, so a
+    # live write would land on nothing. Rebuild it as the state says.
+    write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+    service_restart >/dev/null 2>&1
+  elif $want_pool; then
     sync_fragment "$state"
     live_apply_para "$bands" "$(jq -r '.preamp // 0' <<<"$state")" || {
       target="$(jq -r '.targetSink // ""' <<<"$state")"
@@ -1168,7 +1180,8 @@ cmd_enable() {
   # The previous default is remembered so turning the EQ off can restore exactly
   # the output the user had selected.
   state="$(jq -c --arg prev "$default" --arg tgt "$target" '
-    .enabled = true | .previousDefaultSink = $prev | .targetSink = $tgt' <<<"$state")"
+    .enabled = true | .previousDefaultSink = $prev | .targetSink = $tgt
+    | .targetPickedAt = (now | floor) | del(.seenSinks)' <<<"$state")"
   state_write "$state"
 
   pactl set-default-sink "$sink_name" >/dev/null 2>&1
@@ -1205,7 +1218,7 @@ cmd_disable() {
 # Re-aim the EQ at the new device (live stream move, no restart) and take the
 # default back.
 cmd_retarget() {
-  local state default target id live aim now gone since sibling preferred parked=()
+  local state default target id live aim now gone since sibling preferred seen parked=()
   local grace="${OMARCHY_EQ_VANISH_GRACE:-5}"
   retarget_pending=0
   converge_moved=0
@@ -1251,7 +1264,7 @@ cmd_retarget() {
         need_sink_name "$preferred"
         echo "omarchy-equalizer: $preferred is back, aiming at it again instead of $target" >&2
         state="$(jq -c --arg tgt "$preferred" '
-          .targetSink = $tgt | .previousDefaultSink = $tgt
+          .targetSink = $tgt | .previousDefaultSink = $tgt | .targetPickedAt = (now | floor)
           | del(.vanishedTargetSink, .targetMissingSince)' <<<"$state")"
         state_write "$state"
         write_fragment "$state" "$preferred"
@@ -1284,7 +1297,7 @@ cmd_retarget() {
       fi
       if [[ -n $sibling ]]; then
         need_sink_name "$sibling"
-        state="$(jq -c --arg tgt "$sibling" '.targetSink = $tgt | del(.vanishedTargetSink, .targetMissingSince)' <<<"$state")"
+        state="$(jq -c --arg tgt "$sibling" '.targetSink = $tgt | .targetPickedAt = (now | floor) | del(.vanishedTargetSink, .targetMissingSince)' <<<"$state")"
         state_write "$state"
         write_fragment "$state" "$sibling"
         target="$sibling"
@@ -1301,7 +1314,7 @@ cmd_retarget() {
       [[ -n $live ]] || live="$(first_output_sink)"
       [[ -n $live ]] || return 0
       need_sink_name "$live"
-      state="$(jq -c --arg tgt "$live" '.targetSink = $tgt | del(.vanishedTargetSink, .targetMissingSince)' <<<"$state")"
+      state="$(jq -c --arg tgt "$live" '.targetSink = $tgt | .targetPickedAt = (now | floor) | del(.vanishedTargetSink, .targetMissingSince)' <<<"$state")"
       state_write "$state"
       write_fragment "$state" "$live"
       target="$live"
@@ -1312,9 +1325,37 @@ cmd_retarget() {
     # and the one-second swing of issue #2 -- stream on the highest-priority
     # sink, state naming the picked device -- is exactly this disagreement seen
     # the other way. Read the aim back every pass and move over when it differs.
+    # When each output first showed up, so a device that connects can be told
+    # from one that was already there. A sink that goes away is dropped, so the
+    # same headset reconnecting counts as new again. On the first pass every
+    # sink present counts as old.
+    seen="$(pactl list sinks short 2>/dev/null | awk '{print $2}' | jq -R . | jq -sc --argjson old "$(jq -c '.seenSinks // null' <<<"$state")" '
+      (now | floor) as $now
+      | map({ key: ., value: (if $old == null then 0 else ($old[.] // $now) end) }) | from_entries')"
+    if [[ $seen != "$(jq -c '.seenSinks // null' <<<"$state")" ]]; then
+      state="$(jq -c --argjson s "$seen" '.seenSinks = $s' <<<"$state")"
+      state_write "$state"
+    fi
     id="$(eq_output_input_id)"
     [[ -n $id ]] || return 0
     aim="$(eq_output_aim "$id")"
+    # WirePlumber relinks the stream to an output that connects -- that is how a
+    # headset taking over looks while the EQ holds the default, and it is what
+    # WirePlumber would have made the default otherwise. An output that appeared
+    # after the target was picked and now carries the stream is the user's new
+    # device: follow it. One that was already there is issue #2's relink to the
+    # highest-priority sink, and the stream is moved back below.
+    if [[ -n $aim && $aim != "$target" && $aim != "$sink_name" ]] && sink_exists "$aim" &&
+       [[ $(jq --arg a "$aim" '(.seenSinks[$a] // 0) > (.targetPickedAt // 0)' <<<"$state") == true ]]; then
+      need_sink_name "$aim"
+      echo "omarchy-equalizer: $aim connected and the stream is on it; following it from $target" >&2
+      state="$(jq -c --arg tgt "$aim" '
+        .targetSink = $tgt | .previousDefaultSink = $tgt | .targetPickedAt = (now | floor)
+        | del(.vanishedTargetSink, .targetMissingSince)' <<<"$state")"
+      state_write "$state"
+      write_fragment "$state" "$aim"
+      target="$aim"
+    fi
     if [[ $aim != "$target" ]]; then
       converge_moved=1
       echo "omarchy-equalizer: stream $id was aimed at ${aim:-?}, moving it to $target" >&2
@@ -1327,7 +1368,7 @@ cmd_retarget() {
   target="$(chain_target)"
   [[ -n $target && $target != "$sink_name" ]] || return 0
   need_sink_name "$target"
-  state="$(jq -c --arg prev "$default" --arg tgt "$target" '.previousDefaultSink = $prev | .targetSink = $tgt' <<<"$state")"
+  state="$(jq -c --arg prev "$default" --arg tgt "$target" '.previousDefaultSink = $prev | .targetSink = $tgt | .targetPickedAt = (now | floor)' <<<"$state")"
   state_write "$state"
   write_fragment "$state" "$target"
   # Default first: the relink it triggers lands before the move, so the move is
@@ -1354,13 +1395,18 @@ follow_event_wanted() {
 cmd_follow() {
   need pactl
   local streak=0
-  follow_pass() {
+  locked_retarget() {
+    take_lock
     cmd_retarget
+    flock -u 9
+  }
+  follow_pass() {
+    locked_retarget
     # A vanished target waits out its grace period; no event will announce the
     # end of it, so look again once it has run.
     if ((retarget_pending)); then
       sleep "${OMARCHY_EQ_VANISH_GRACE:-5}"
-      cmd_retarget
+      locked_retarget
     fi
     # A move that does not stick (WirePlumber relinking it straight back) would
     # otherwise spin on its own change events: back off after a run of them.
@@ -1445,7 +1491,7 @@ cmd_add_band() {
   # before this command switches it to parametric. Adding from graphic mode is a
   # graph-shape change and still restarts.
   from_para=false
-  using_para_pool "$state" && from_para=true
+  running_pool && from_para=true
 
   (( $(jq '.parametric | length' <<<"$state") < 16 )) ||
     die "Parametric mode holds at most 16 bands."
@@ -1468,7 +1514,7 @@ cmd_remove_band() {
   # As in cmd_add_band: the pool can only be written live if it is what the
   # running graph already holds. Removing while graphic still rebuilds.
   from_para=false
-  using_para_pool "$state" && from_para=true
+  running_pool && from_para=true
 
   count="$(jq '.parametric | length' <<<"$state")"
   [[ $index =~ ^(0|[1-9][0-9]{0,2})$ ]] || die "Band index must be a plain number."
@@ -1493,7 +1539,12 @@ cmd_set_mode() {
   state="$(jq -c --arg m "$mode" '.mode = $m' <<<"$state")"
   state="$(apply_headroom "$state")" || exit 1
   state_write "$state"
-  if sink_present; then
+  sink_present || return 0
+  # In the pool the other set is only other values in the same slots; a biquad
+  # chain of the other set's shape has to be built.
+  if using_para_pool "$state"; then
+    live_apply_active "$(active_bands "$state")" "$state"
+  else
     write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
     service_restart >/dev/null 2>&1
   fi
@@ -1518,7 +1569,7 @@ cmd_apply_preset() {
   from_bands="$(active_bands "$state")"
   from_preamp="$(jq -r '.preamp // 0' <<<"$state")"
   from_para=false
-  using_para_pool "$state" && from_para=true
+  running_pool && from_para=true
 
   state="$(jq -c --arg n "$name" --arg m "$mode" --argjson p "$preset" '
     .preset = $n | .mode = $m | .preamp = ($p.preamp // 0)
@@ -1603,7 +1654,7 @@ cmd_reset() {
   from_bands="$(active_bands "$state")"
   from_preamp="$(jq -r '.preamp // 0' <<<"$state")"
   from_para=false
-  using_para_pool "$state" && from_para=true
+  running_pool && from_para=true
   # Reset means flat, so the preamp goes back to unity with the bands -- an
   # imported profile's cut left behind would quietly halve the output.
   state="$(jq -c --arg m "$mode" '
@@ -1621,9 +1672,8 @@ cmd_reset() {
     # Reset only flattens gains, so the running chain already has the right
     # shape: write it live rather than dropping audio through a restart. The
     # biquad chain gets the crossfade; the pool gets one whole-set write.
-    if $from_para; then
-      sync_fragment "$state"
-      live_apply_para "$to_bands" "$to_preamp" || true
+    if $from_para || using_para_pool "$state"; then
+      live_apply_active "$to_bands" "$state"
     else
       live_ramp_bands "$from_bands" "$to_bands" "$from_preamp" "$to_preamp" || true
     fi
@@ -1739,7 +1789,7 @@ fetch_autoeq_index() {
   fi
   state_dir_ensure
   need curl
-  curl -fsSL --max-time 25 -o "$autoeq_index.tmp" \
+  curl -fsSL -g --proto =https --proto-redir =https --max-filesize 5000000 --max-time 25 -o "$autoeq_index.tmp" \
     "$autoeq_raw_base/INDEX.md" >/dev/null 2>&1 || return 1
   mv "$autoeq_index.tmp" "$autoeq_index"
 }
@@ -1857,6 +1907,16 @@ autoeq_profile_json() {
   jq -c -n --argjson b "$bands" --argjson p "$preamp" '{ preamp: $p, bands: $b }'
 }
 
+# A profile path comes from the downloaded index, so it is not trusted: "../"
+# would leave the AutoEq tree for another repository on the same host, and
+# brackets or braces are curl globs (one entry could fan out into thousands of
+# requests). Index paths are plain "./source/type/Name" with %20 escapes.
+need_autoeq_path() {
+  case "$1" in
+    *..* | *[\[\]\{\}\?\#]* | "") die "Refusing the AutoEq profile path '$1'." ;;
+  esac
+}
+
 # Import by headphone name (downloaded), by an explicit index path, or from a
 # local ParametricEQ.txt file.
 cmd_import_autoeq() {
@@ -1875,9 +1935,10 @@ cmd_import_autoeq() {
     # different measurement of the same headphone than the one chosen.
     need curl
     path="$selected"
+    need_autoeq_path "$path"
     name="$(autoeq_name_from_path "$path")"
     url="$autoeq_raw_base/$path/$(basename "$path")%20ParametricEQ.txt"
-    curl -fsSL --max-time 25 -o "$file" "$url" >/dev/null 2>&1 || {
+    curl -fsSL -g --proto =https --proto-redir =https --max-filesize 5000000 --max-time 25 -o "$file" "$url" >/dev/null 2>&1 || {
       rm -f "$file"
       die "Could not download the profile for '$name'."
     }
@@ -1897,9 +1958,10 @@ cmd_import_autoeq() {
       | (if ($exact | length) > 0 then $exact else . end)
       | sort_by((if .source == "oratory1990" then 0 else 1 end), (.name | length))
       | .[0].path' <<<"$matches")"
+    need_autoeq_path "$path"
     name="$(autoeq_name_from_path "$path")"
     url="$autoeq_raw_base/$path/$(basename "$path")%20ParametricEQ.txt"
-    curl -fsSL --max-time 25 -o "$file" "$url" >/dev/null 2>&1 || {
+    curl -fsSL -g --proto =https --proto-redir =https --max-filesize 5000000 --max-time 25 -o "$file" "$url" >/dev/null 2>&1 || {
       rm -f "$file"
       die "Could not download the profile for '$name'."
     }
@@ -1925,9 +1987,15 @@ cmd_import_autoeq() {
   # An imported profile is kept as a preset: it has to survive the next import.
   cmd_save_preset "$name" >/dev/null 2>&1 || true
 
+  # A profile into the pool is a values write; into a biquad chain it is a new
+  # chain, and live_apply_active cannot tell its shape apart, so rebuild that.
   if sink_present; then
-    write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
-    service_restart >/dev/null 2>&1
+    if using_para_pool "$state"; then
+      live_apply_active "$(active_bands "$state")" "$state"
+    else
+      write_fragment "$state" "$(jq -r '.targetSink // ""' <<<"$state")"
+      service_restart >/dev/null 2>&1
+    fi
   fi
 
   jq -c -n --arg n "$name" --argjson p "$preamp" --argjson c "$(jq 'length' <<<"$bands")" \
@@ -2036,6 +2104,20 @@ EOF
 
 command="${1:-status}"
 shift 2>/dev/null || true
+
+# One command changes the state at a time. Each one reads, edits and writes the
+# whole state, and the follower and the panel do run at once -- without this, ten
+# quick gain changes kept one. The follower takes the lock per pass instead (it
+# never exits), which also keeps it from acting halfway through a restart.
+take_lock() {
+  state_dir_ensure
+  exec 9>"$state_root/.lock"
+  flock -w 30 9 || die "Another equalizer command is still running."
+}
+case "$command" in
+  status | follow | presets | autoeq-search | help | --help | -h | "") ;;
+  *) take_lock ;;
+esac
 
 case "$command" in
   status) cmd_status_full ;;
