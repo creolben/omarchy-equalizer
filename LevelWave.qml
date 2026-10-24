@@ -45,6 +45,9 @@ Item {
   // True while any bar is still moving, so the timer outlives the signal long
   // enough for the bars to settle instead of freezing mid-fall.
   property bool settling: false
+  // Timestamp of the previous frame: all easing below is per second, not per
+  // frame, so a late timer tick moves the bars further instead of stuttering.
+  property real lastFrame: 0
 
   function rgba(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
   function targetPeak() { return Math.max(0, Math.min(1, Number(peak) || 0)) }
@@ -97,6 +100,11 @@ Item {
     repeat: true
     running: root.active && (root.live || root.settling)
     onTriggered: {
+      var now = Date.now()
+      var dt = root.lastFrame > 0 ? Math.min(0.1, (now - root.lastFrame) / 1000) : 0.016
+      root.lastFrame = now
+      var attack = 1 - Math.exp(-dt / 0.05)
+      var release = 1 - Math.exp(-dt / 0.2)
       var n = root.barCount()
       var hs = root.heights.length === n ? root.heights : []
       var cs = root.caps.length === n ? root.caps : []
@@ -105,16 +113,16 @@ Item {
       // Fallback driver, also decays the synthetic level.
       var p = root.targetPeak()
       if (p >= root.level) root.level = p
-      else root.level += (p - root.level) * 0.12
+      else root.level += (p - root.level) * (1 - Math.exp(-dt / 0.14))
       if (root.level <= 0.01) root.level = 0
-      root.phase = (root.phase + 0.06) % 10
+      root.phase = (root.phase + 3.7 * dt) % 10
 
       var b = root.bands || []
       var haveBands = b.length >= 2 && root.bandMax > 2
       var synth = haveBands ? null : Model.barSeries(Math.pow(root.level, 0.5), root.phase, n)
       var moving = false
-      if (root.ripple < 1) root.ripple = Math.min(1, root.ripple + 0.045)
-      root.beat *= 0.93
+      if (root.ripple < 1) root.ripple = Math.min(1, root.ripple + 2.8 * dt)
+      root.beat *= Math.exp(-dt / 0.22)
       if (root.beat < 0.01) root.beat = 0
 
       for (var i = 0; i < n; i++) {
@@ -126,7 +134,7 @@ Item {
           var k = Math.floor(pos), f = pos - k
           var a0 = (Number(b[k]) || 0) / 100
           var a1 = (Number(b[Math.min(b.length - 1, k + 1)]) || 0) / 100
-          t = a0 + (a1 - a0) * f
+          t = a0 + (a1 - a0) * (1 - Math.cos(Math.PI * f)) / 2
           // Edges shorter, so the row has a rounded silhouette.
           t *= 1 - 0.35 * d * d
         } else {
@@ -137,16 +145,17 @@ Item {
           : 0
         t = Math.min(1, t * (1 + 0.25 * root.beat) + swell)
         var cur = hs[i]
-        cur += (t - cur) * (t > cur ? 0.55 : 0.14)
+        cur += (t - cur) * (t > cur ? attack : release)
         if (cur < 0.004 && t === 0) cur = 0
         hs[i] = cur
-        var cap = cs[i] - 0.010
+        var cap = cs[i] - 0.6 * dt
         cs[i] = cap > cur ? cap : cur
         if (cur > 0.004 || cs[i] > 0.004 || t > 0) moving = true
       }
       root.heights = hs
       root.caps = cs
       root.settling = moving
+      if (!moving) root.lastFrame = 0
       root.repaint()
     }
   }
