@@ -123,7 +123,8 @@ it if you plan to install the plugin again.
   `tests/headroom-check.js` keeps them honest against each other.
 
 The card has a fixed band and a tabbed one. The fixed band never moves: hero,
-the meter (a waveform envelope that goes quiet when the signal does), and the
+the meter (a row of bars driven by the output's loudness, beats and spectrum,
+that goes quiet when the signal does), and the
 preset picker with its reset/delete actions. Below it a tab bar picks one page:
 **Response** (the curve, the faders in 10-band mode, the mode control and the
 preamp row directly under them), **Bands** (one row per band, parametric mode
@@ -180,6 +181,11 @@ keys control its level, which is applied before the bands.
 
 ## Gain staging
 
+- **Every band value is range-checked**: gain −30…+20 dB, frequency 10 Hz…24 kHz,
+  Q 0.05…30, preamp −60…+20 dB, and the filter type must be one the graph knows.
+  A value outside that is refused with a message, whether it comes from the CLI, a
+  preset or an AutoEq profile, so a well-formed but extreme profile cannot turn
+  the chain into an amplifier. A refused command leaves the state as it was.
 - **Automatic headroom** (`headroom: auto`) recomputes the preamp from the peak of
   the whole curve on every band, mode, preset or import change, so a boost cannot
   clip. Moving the preamp by hand switches it to `manual`.
@@ -220,7 +226,7 @@ keys control its level, which is applied before the bands.
 ## Tests
 
 ```sh
-bash tests/run-tests.sh     # 244 assertions, no real sink touched
+bash tests/run-tests.sh     # 318 assertions, no real sink touched
 node tests/curve-check.js   # Model.js response maths vs PipeWire's own biquads
 ```
 
