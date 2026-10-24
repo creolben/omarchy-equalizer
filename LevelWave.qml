@@ -35,6 +35,10 @@ Item {
   property real level: 0
   // Phase into the two partials, advanced only while the timer runs.
   property real phase: 0
+  // Slow average of the peak and a 0..1 beat pulse (Model.beatStep): the bars
+  // kick taller and the pulse runs faster for a moment on every onset.
+  property real avg: 0
+  property real beat: 0
 
   function rgba(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
   function targetPeak() { return Math.max(0, Math.min(1, Number(peak) || 0)) }
@@ -63,6 +67,8 @@ Item {
       // stale ribbon.
       level = 0
       phase = 0
+      avg = 0
+      beat = 0
     }
     repaint()
   }
@@ -93,7 +99,10 @@ Item {
       // Wrap at 10, not 1: the second partial runs at 1.7x the phase, and only
       // a multiple of 10 keeps 1.7 * phase a whole number of cycles -- a wrap
       // at 1 jumped that partial by 0.7 cycle every ~0.73 s.
-      root.phase = (root.phase + 0.045) % 10
+      var bs = Model.beatStep(root.avg, p, root.beat)
+      root.avg = bs[0]
+      root.beat = bs[1]
+      root.phase = (root.phase + 0.045 * (1 + 2 * root.beat)) % 10
     }
   }
 
@@ -144,7 +153,7 @@ Item {
       var minH = bw   // a quiet bar is still a round dot, never a sliver
       ctx.fillStyle = root.rgba(color, 0.9)
       for (var i = 0; i < n; i++) {
-        var bh = Math.min(h, Math.max(minH, values[i] * amplitude * 2))
+        var bh = Math.min(h, Math.max(minH, values[i] * (1 + 0.45 * root.beat) * amplitude * 2))
         var x = x0 + i * (bw + gap)
         var y = mid - bh / 2
         var r = bw / 2

@@ -99,6 +99,20 @@ function barSeries(peak, phase, count) {
   return out
 }
 
+// Beat follower for the meter. The monitor reports only a peak, so a beat is an
+// onset: a peak that jumps clearly above its own slow average. Call once per
+// frame; returns [avg, beat], where beat is 1 on an onset and decays toward 0.
+// A new onset is ignored while the last beat is still above half strength, so
+// one drum hit cannot retrigger on its own tail.
+function beatStep(avg, peak, beat) {
+  var p = clamp(Number(peak) || 0, 0, 1)
+  var a = clamp(Number(avg) || 0, 0, 1)
+  var b = clamp(Number(beat) || 0, 0, 1) * 0.84
+  var onset = p > 0.05 && p > a * 1.3 + 0.03 && b < 0.5
+  a += (p - a) * (p > a ? 0.15 : 0.05)
+  return [a, onset ? 1 : b]
+}
+
 // Which control, if any, a wheel event belongs to. One implementation, so the
 // sliders cannot drift from each other or from tests/input-policy-check.js.
 //
