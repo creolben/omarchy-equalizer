@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Live spectrum of the equalizer's output, for the panel's meter.
+
+Reads the equalizer sink's monitor with parec and prints one line per frame:
+BANDS space-separated integers, 0..100, low frequencies first. The panel runs
+this only while it is open and the equalizer is on.
+
+Goertzel per band over a Hann window, in plain Python so there is no numpy
+dependency; the sizes below keep it to a few percent of one core.
+"""
+import array
+import math
+import signal
+import subprocess
+import sys
+
+RATE = 12000
+WINDOW = 512
+HOP = 400
+BANDS = 16
+LOW, HIGH = 60.0, 5400.0
+SINK = sys.argv[1] if len(sys.argv) > 1 else "omarchy_equalizer"
+
+hann = [0.5 - 0.5 * math.cos(2 * math.pi * i / (WINDOW - 1)) for i in range(WINDOW)]
+freqs = [LOW * (HIGH / LOW) ** ((b + 0.5) / BANDS) for b in range(BANDS)]
+coefs = [2 * math.cos(2 * math.pi * f / RATE) for f in freqs]
+# Tilt: music falls roughly 4.5 dB per octave, so without it the bass bars pin
+# the top and the treble bars never move.
+tilt = [(f / LOW) ** 0.35 for f in freqs]
+
+proc = subprocess.Popen(
+    ["parec", "-d", SINK + ".monitor", "--format=float32le", "--rate=%d" % RATE,
+     "--channels=1", "--latency-msec=30"],
+    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+signal.signal(signal.SIGTERM, lambda *_: (proc.terminate(), sys.exit(0)))
+
+buf = array.array("f")
+ref = 1e-4
+need = HOP * 4
+pending = b""
+out = sys.stdout
+while True:
+    chunk = proc.stdout.read1(need)
+    if not chunk:
+        break
+    pending += chunk
+    usable = len(pending) - len(pending) % 4
+    buf.frombytes(pending[:usable])
+    pending = pending[usable:]
+    while len(buf) >= WINDOW:
+        frame = [buf[i] * hann[i] for i in range(WINDOW)]
+        del buf[:HOP]
+        mags = []
+        for c, t in zip(coefs, tilt):
+            s1 = s2 = 0.0
+            for x in frame:
+                s1, s2 = x + c * s1 - s2, s1
+            p = s1 * s1 + s2 * s2 - c * s1 * s2
+            mags.append(math.sqrt(p if p > 0 else 0.0) * t)
+        top = max(mags)
+        ref = max(ref * 0.995, top, 1e-3)
+        vals = []
+        for m in mags:
+            v = min(1.0, m / ref)
+            vals.append(int(round(100 * math.sqrt(v))))
+        try:
+            out.write(" ".join(map(str, vals)) + "\n")
+            out.flush()
+        except BrokenPipeError:
+            proc.terminate()
+            sys.exit(0)

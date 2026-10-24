@@ -693,6 +693,25 @@ Panel {
     enabled: root.opened && !!root.sinkNode
   }
 
+  // Live spectrum of the equalizer output for the meter's bars. Runs only while
+  // the panel is open and the equalizer is on; stopping the process also stops
+  // the capture it owns.
+  property var spectrum: []
+  Process {
+    id: spectrumProc
+    command: [root.pluginDir + "/bin/omarchy-equalizer-spectrum", "omarchy_equalizer"]
+    running: root.opened && root.enabled
+    stdout: SplitParser {
+      onRead: function(line) {
+        var parts = String(line).trim().split(/\s+/)
+        var out = []
+        for (var i = 0; i < parts.length; i++) out.push(Number(parts[i]) || 0)
+        root.spectrum = out
+      }
+    }
+    onRunningChanged: if (!running) root.spectrum = []
+  }
+
   // A clip lasts milliseconds; the indicator holds it long enough to be seen.
   property bool clipHeld: false
   Connections {
@@ -828,6 +847,7 @@ Panel {
                 width: parent.width - levelText.implicitWidth - Style.space(6)
                 anchors.verticalCenter: parent.verticalCenter
                 peak: peakMonitor.peak
+                bands: root.spectrum
                 // Only animate while the card is on screen and the EQ is on.
                 // The component's timer binds to this property.
                 active: root.opened && root.enabled
