@@ -28,7 +28,7 @@ Item {
   property color foreground: 'white'
   property color urgent: 'red'
 
-  implicitHeight: Style.space(20)
+  implicitHeight: Style.space(40)
 
   // Smoothed peak, used only by the fallback pattern.
   property real level: 0
