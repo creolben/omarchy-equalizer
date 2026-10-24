@@ -603,12 +603,41 @@ Panel {
     if (opened) refresh()
   }
 
+  // The bar icon comes from status too, and the panel is instantiated with the
+  // bar, so the first read happens at shell start rather than on first open.
+  Component.onCompleted: refresh()
+
+  // An enable, disable or preset from a terminal or keybind rewrites state.json;
+  // watching it keeps the bar icon right while the panel is closed. The backend
+  // renames a temp file over it, which the shell's own config FileViews survive.
+  // Status itself never writes the file, so this cannot loop.
+  property bool refreshQueued: false
+
+  FileView {
+    path: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state"))
+      + "/omarchy-equalizer/state.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: {
+      reload()
+      if (statusProc.running) root.refreshQueued = true
+      else root.refresh()
+    }
+  }
+
   // Status is re-read whenever the panel opens and after every action; the open
   // panel also polls slowly so an external change (a terminal, or the speaker
   // tuning being switched) is reflected without reopening.
   Process {
     id: statusProc
     command: [root.helper, "status"]
+    onExited: {
+      // A state change that landed during this read may not be in it.
+      if (root.refreshQueued) {
+        root.refreshQueued = false
+        Qt.callLater(root.refresh)
+      }
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyStatus(text)
