@@ -226,10 +226,10 @@ node "$here/metrics-check.js" >"$T/metrics-check.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] || sed 's/^/      /' "$T/metrics-check.log"
 check "the metrics memo is correct and builds coefficients once" "0" "$rc"
 
-echo "== the meter's waveform is bounded, silent at zero, and phase-driven =="
+echo "== the meter: spectrum parsing, bar spread, fallback series and beats =="
 node "$here/wave-check.js" >"$T/wave-check.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] || sed 's/^/      /' "$T/wave-check.log"
-check "the waveform series is pure, bounded, and animates only with phase" "0" "$rc"
+check "the meter functions are pure, bounded, and parse only real frames" "0" "$rc"
 
 echo "== one input policy: the wheel scrolls, it does not edit =="
 node "$here/input-policy-check.js" >"$T/input-policy-check.log" 2>&1; rc=$?

@@ -37,44 +37,57 @@ function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
 }
 
-// The meter's waveform. Pure numbers so it can be tested without Qt: the panel
-// draws what this returns, and the shape is defined here rather than in Canvas.
-//
-// There is no sample data to draw -- the monitor reports a peak -- so this is a
-// synthetic envelope scaled by that peak: two partials inside a window that
-// tapers to the midline at both ends. Amplitude is linear in peak rather than a
-// dB conversion, because the dB text beside the meter stays the precise number;
-// the shape only has to show that the signal is moving.
-//
-// The two partials give the ribbon a broken, non-sinusoidal profile and the
-// window keeps its ends at the midline, so the envelope does not look cut off at
-// the edges of the slot. No state and no cache: phase is supplied by the
-// component's animation timer.
-function waveSeries(peak, phase, count) {
+// The meter. Pure numbers so they can be tested without Qt; LevelWave.qml only
+// eases and draws what these return.
+
+// One line from bin/omarchy-equalizer-spectrum: "BEAT V1 .. Vn", all integers
+// 0..100. Returns { beat: 0..1, bands: [0..1, ...] }, or null for a line that
+// is not a frame (blank, too short, or not numbers), so a stray message on the
+// helper's stdout can never reach the bars.
+function parseSpectrumLine(line) {
+  var parts = String(line === undefined || line === null ? "" : line).trim().split(/\s+/)
+  if (parts.length < 3) return null
+  var nums = []
+  for (var i = 0; i < parts.length; i++) {
+    if (!/^\d+$/.test(parts[i])) return null
+    nums.push(clamp(Number(parts[i]), 0, 100) / 100)
+  }
+  return { beat: nums[0], bands: nums.slice(1) }
+}
+
+// Spread a spectrum across `count` bars. Bands are interpolated with a cosine
+// ease so neighbouring bars never form a kink. Unmirrored, bass is on the left;
+// mirrored, bass is in the centre and the row is symmetric. A mild taper keeps
+// the ends a little shorter so the row has a rounded silhouette.
+function spectrumBars(bands, count, mirrored) {
   var n = Math.round(Number(count))
-  if (!(n >= 8)) n = 8
+  if (!(n >= 1)) n = 1
   if (n > 512) n = 512
-  var p = clamp(Number(peak) || 0, 0, 1)
-  var ph = Number(phase) || 0
+  var b = bands || []
   var out = []
   for (var i = 0; i < n; i++) {
-    var u = i / (n - 1)
-    var body = Math.sin(2 * Math.PI * (u + ph)) * 0.7 +
-               Math.sin(2 * Math.PI * (2.7 * u + 1.7 * ph)) * 0.3
-    var window = 1 - 0.55 * Math.pow(2 * u - 1, 2)
-    out.push(body * window * p)
+    if (b.length === 0) { out.push(0); continue }
+    var u = (i + 0.5) / n
+    var x = mirrored ? Math.abs(2 * u - 1) : u
+    var pos = x * (b.length - 1)
+    var k = Math.min(b.length - 1, Math.floor(pos)), f = pos - k
+    var a0 = clamp(Number(b[k]) || 0, 0, 1)
+    var a1 = clamp(Number(b[Math.min(b.length - 1, k + 1)]) || 0, 0, 1)
+    var v = a0 + (a1 - a0) * (1 - Math.cos(Math.PI * f)) / 2
+    var edge = mirrored ? x : Math.abs(2 * u - 1)
+    out.push(v * (1 - 0.25 * edge * edge))
   }
   return out
 }
 
-// Bar heights for the meter, in the style of a bar-type sound-wave animation:
-// a row of rounded bars that all play one height sequence, each a little later
-// than its neighbour, so a pulse travels along the row. Heights are 0..peak.
+// Fallback bar heights, for when no spectrum arrives (the helper is missing or
+// failed): a row of bars that all play one height sequence, each a little later
+// than its neighbour, scaled by the peak monitor. Heights are 0..peak.
 //
 // BAR_KEYS is that sequence (relative heights, 25 keys) and is interpolated
-// with a cosine ease so a bar never jumps between keys. `phase` runs 0..10 like
-// waveSeries; five keys per phase unit makes ten units a whole 50 keys, two full
-// laps, so the timer's wrap at 10 is seamless. A window shortens the outer bars.
+// with a cosine ease so a bar never jumps between keys. `phase` runs 0..10;
+// five keys per phase unit makes ten units a whole 50 keys, two full laps, so
+// a wrap at 10 is seamless. A window shortens the outer bars.
 var BAR_KEYS = [100, 237, 264, 248, 197, 29, 26, 158, 217, 250, 125, 163, 100,
                 37, 52, 92, 50, 154, 115, 157, 98, 168, 39, 73, 27]
 function barSeries(peak, phase, count) {
@@ -99,18 +112,23 @@ function barSeries(peak, phase, count) {
   return out
 }
 
-// Beat follower for the meter. The monitor reports only a peak, so a beat is an
-// onset: a peak that jumps clearly above its own slow average. Call once per
-// frame; returns [avg, beat], where beat is 1 on an onset and decays toward 0.
-// A new onset is ignored while the last beat is still above half strength, so
-// one drum hit cannot retrigger on its own tail.
-function beatStep(avg, peak, beat) {
+// Fallback beat follower, on the peak monitor alone (the spectrum helper does
+// its own, better detection). An onset is a peak that rises clearly above its
+// own slow average *since the previous call*, judged on the rise rather than
+// the level, so a loud, steady track still has beats. Call once per peak
+// update; returns [avg, onset] with onset 0 or 1. It does not decay anything:
+// the caller owns the visible pulse and passes it in as `pulse`, and a new
+// onset is refused while that pulse is still above half strength.
+function beatStep(avg, peak, pulse) {
   var p = clamp(Number(peak) || 0, 0, 1)
   var a = clamp(Number(avg) || 0, 0, 1)
-  var b = clamp(Number(beat) || 0, 0, 1) * 0.84
-  var onset = p > 0.05 && p > a * 1.3 + 0.03 && b < 0.5
-  a += (p - a) * (p > a ? 0.15 : 0.05)
-  return [a, onset ? 1 : b]
+  var b = clamp(Number(pulse) || 0, 0, 1)
+  var onset = p > 0.05 && p - a > Math.max(0.04, a * 0.15) && b < 0.5
+  // An onset resets the average to the new level, so a plateau after a hit is
+  // not read as a string of further hits.
+  if (onset) a = p
+  else a += (p - a) * (p > a ? 0.15 : 0.05)
+  return [a, onset ? 1 : 0]
 }
 
 // Which control, if any, a wheel event belongs to. One implementation, so the

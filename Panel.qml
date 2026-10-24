@@ -693,23 +693,27 @@ Panel {
     enabled: root.opened && !!root.sinkNode
   }
 
-  // Live spectrum of the equalizer output for the meter's bars. Runs only while
-  // the panel is open and the equalizer is on; stopping the process also stops
-  // the capture it owns.
+  // Live spectrum and beat track of the equalizer output, for the meter. Runs
+  // only while the panel is open and the equalizer is on; stopping the process
+  // also stops the capture it owns. The beat is set before the bands, because
+  // the meter reads it when the bands change.
   property var spectrum: []
+  property real spectrumBeat: 0
+  // OMARCHY_EQ_METER_DEBUG=1 in the shell's environment shows the raw values.
+  readonly property bool meterDebug: Quickshell.env("OMARCHY_EQ_METER_DEBUG") === "1"
   Process {
     id: spectrumProc
     command: [root.pluginDir + "/bin/omarchy-equalizer-spectrum", "omarchy_equalizer"]
     running: root.opened && root.enabled
     stdout: SplitParser {
       onRead: function(line) {
-        var parts = String(line).trim().split(/\s+/)
-        var out = []
-        for (var i = 0; i < parts.length; i++) out.push(Number(parts[i]) || 0)
-        root.spectrum = out
+        var frame = Model.parseSpectrumLine(line)
+        if (!frame) return
+        root.spectrumBeat = frame.beat
+        root.spectrum = frame.bands
       }
     }
-    onRunningChanged: if (!running) root.spectrum = []
+    onRunningChanged: if (!running) { root.spectrumBeat = 0; root.spectrum = [] }
   }
 
   // A clip lasts milliseconds; the indicator holds it long enough to be seen.
@@ -833,11 +837,9 @@ Panel {
                 }
               }
             }
-            // Meter: peak level leaving the equalizer (see eqOutputNode), with a
-            // red CLIP hold when it hits full scale. The ribbon is a synthetic
-            // envelope -- the monitor reports a peak, not samples -- but it gives
-            // the same number a visible release and a zero reference instead of
-            // reading as a progress bar. The dB text stays the precise value.
+            // Meter: a live spectrum of the equalizer's output (spectrumProc),
+            // with the peak monitor as fallback and for the red CLIP hold. The
+            // dB text beside it stays the precise level.
             Row {
               width: parent.width
               spacing: Style.space(6)
@@ -848,6 +850,9 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 peak: peakMonitor.peak
                 bands: root.spectrum
+                beatIn: root.spectrumBeat
+                accent: Color.accent
+                debug: root.meterDebug
                 // Only animate while the card is on screen and the EQ is on.
                 // The component's timer binds to this property.
                 active: root.opened && root.enabled
