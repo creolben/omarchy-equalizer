@@ -690,6 +690,46 @@ unset PACTL_DEVICE_SINK2 PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG
 run disable >/dev/null
 unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
 
+echo "== routing: earbuds that connect, drop and reconnect (the WF-1000XM6 sequence) =="
+# Seen live, every time the earbuds leave the case: they connect on a fallback
+# endpoint, drop about 40 s later ("No matching connection for device"), and
+# reconnect 4-6 s after that. The sound must end on the earbuds each time, never
+# be pulled to the speakers once they are back.
+run disable >/dev/null
+export PACTL_DEVICE_SINK=audio_effect.j313-convolver PACTL_DEFAULT_SINK=audio_effect.j313-convolver
+run enable >/dev/null
+st="$XDG_STATE_HOME/omarchy-equalizer/state.json"
+export PACTL_DEFAULT_SINK=omarchy_equalizer PACTL_LOG="$T/pactl-buds.log"
+run retarget >/dev/null
+jq -c '.targetPickedAt = 100' "$st" >"$st.x" && mv "$st.x" "$st"
+buds=bluez_output.58_18_62_91_BB_8F.1
+# 1. Out of the case: the earbuds appear and WirePlumber puts the stream on them.
+export PACTL_DEVICE_SINK2=$buds; run retarget >/dev/null
+export PACTL_EQ_AIM=1 PACTL_EQ_AIM_SINK_ID=3; : >"$PACTL_LOG"; run retarget >/dev/null
+check "buds out: the earbuds are the target" "$buds" "$(jq -r '.targetSink' "$st")"
+check "buds out: the stream is not moved off them" "0" "$(grep -c move-sink-input "$PACTL_LOG")"
+# 2. The link drops; WirePlumber parks the stream on the speakers meanwhile.
+export PACTL_DEVICE_SINK2= PACTL_EQ_AIM_SINK_ID=2 OMARCHY_EQ_VANISH_GRACE=5
+run retarget >/dev/null
+check "drop: inside the grace the earbuds stay the target" "$buds" "$(jq -r '.targetSink' "$st")"
+# 3. Back within the grace.
+export PACTL_DEVICE_SINK2=$buds PACTL_EQ_AIM_SINK_ID=3; : >"$PACTL_LOG"; run retarget >/dev/null
+check "back within the grace: still the earbuds" "$buds" "$(jq -r '.targetSink' "$st")"
+check "back within the grace: nothing moved" "0" "$(grep -c move-sink-input "$PACTL_LOG")"
+# 4. Another drop that outlasts the grace: the speakers take over ...
+export PACTL_DEVICE_SINK2= PACTL_EQ_AIM_SINK_ID=2; run retarget >/dev/null
+jq -c '.targetMissingSince = 1' "$st" >"$st.x" && mv "$st.x" "$st"; run retarget >/dev/null
+check "a long drop falls back to the speakers" "audio_effect.j313-convolver" "$(jq -r '.targetSink' "$st")"
+# ... and the earbuds coming back win again, whether WirePlumber has already
+# put the stream on them or not.
+export PACTL_DEVICE_SINK2=$buds; : >"$PACTL_LOG"; run retarget >/dev/null
+check "reconnect after a long drop: the earbuds again" "$buds" "$(jq -r '.targetSink' "$st")"
+check "the stream is moved onto them" "1" "$(grep -c "^move-sink-input 99 $buds\$" "$PACTL_LOG")"
+unset PACTL_DEVICE_SINK2 PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG
+export OMARCHY_EQ_VANISH_GRACE=0
+run disable >/dev/null
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
+
 echo "== preset delete =="
 run save-preset ScratchPreset >/dev/null
 run apply-preset ScratchPreset >/dev/null
