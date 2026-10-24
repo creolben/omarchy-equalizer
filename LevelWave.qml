@@ -40,8 +40,8 @@ Item {
 
   implicitHeight: Style.space(64)
 
-  readonly property real barWidth: Math.max(2, Style.spaceReal(3.5))
-  readonly property real barGap: Math.max(2, Math.round(barWidth * 0.75))
+  readonly property real barWidth: Math.max(1.5, Style.spaceReal(2))
+  readonly property real barGap: Math.max(2, barWidth * 1.25)
   readonly property int barCount: Math.max(1, Math.floor((width + barGap) / (barWidth + barGap)))
   readonly property real rowLeft: (width - (barCount * barWidth + (barCount - 1) * barGap)) / 2
   readonly property color barColor: clipped ? urgent : foreground
@@ -246,7 +246,7 @@ Item {
       Rectangle {
         visible: slot.capClear
         width: parent.width
-        height: Math.max(2, root.barWidth * 0.6)
+        height: Math.max(1.5, root.barWidth * 0.75)
         radius: height / 2
         y: (root.height - slot.capLevel * root.height) / 2 - height
         color: root.rgba(root.tipColor, 0.8)
@@ -254,7 +254,7 @@ Item {
       Rectangle {
         visible: slot.capClear
         width: parent.width
-        height: Math.max(2, root.barWidth * 0.6)
+        height: Math.max(1.5, root.barWidth * 0.75)
         radius: height / 2
         y: (root.height + slot.capLevel * root.height) / 2
         color: root.rgba(root.tipColor, 0.8)
