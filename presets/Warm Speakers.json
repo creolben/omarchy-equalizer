@@ -2,6 +2,7 @@
   "name": "Warm Speakers",
   "description": "Warm for small drivers: low shelf up, treble down ~3 dB",
   "order": 23,
+  "category": "tone",
   "mode": "parametric",
   "preamp": -1.5,
   "parametric": [

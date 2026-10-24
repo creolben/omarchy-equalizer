@@ -217,6 +217,37 @@ node "$here/preset-levels.js" >"$T/preset-levels.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] || sed 's/^/      /' "$T/preset-levels.log"
 check "every built-in preset is level-matched, in range, and describes itself" "0" "$rc"
 
+echo "== the panel's response metrics are computed once per band change =="
+node "$here/metrics-check.js" >"$T/metrics-check.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/metrics-check.log"
+check "the metrics memo is correct and builds coefficients once" "0" "$rc"
+
+echo "== the meter's waveform is bounded, silent at zero, and phase-driven =="
+node "$here/wave-check.js" >"$T/wave-check.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/wave-check.log"
+check "the waveform series is pure, bounded, and animates only with phase" "0" "$rc"
+
+echo "== one input policy: the wheel scrolls, it does not edit =="
+node "$here/input-policy-check.js" >"$T/input-policy-check.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/input-policy-check.log"
+check "the wheel policy follows the rule table exactly" "0" "$rc"
+
+echo "== a band's first drag starts from its own frequency =="
+# The press handler must read the band's frequency before it marks the band as
+# dragged: bandFreqAt() answers with draftFreq for the dragged band, so the other
+# order reads back the previous drag -- 0 on the first one -- and the handle is
+# drawn at the 1 kHz fallback. tests/press-order-check.js holds the order, and
+# fails against the pre-fix handler.
+node "$here/press-order-check.js" >"$T/press-order-check.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/press-order-check.log"
+check "the press handler reads the frequency before it marks the drag" "0" "$rc"
+
+echo "== the preamp slider is plugin-owned and cannot take the wheel =="
+check "the preamp slider is the plugin's own component" "yes" \
+  "$(grep -q 'PreampSlider' "$here/../Panel.qml" && echo yes || echo no)"
+check "the shell's wheel-adjusting PanelSlider is no longer used" "0" \
+  "$(grep -c 'PanelSlider' "$here/../Panel.qml")"
+
 echo "== preset list =="
 check "every preset file is listed" \
   "$(ls "$here/../presets"/*.json | wc -l)" "$(run status | jq '[.presets[] | select(.builtin)] | length')"
@@ -226,6 +257,45 @@ check "the list carries a description for the selected preset" "yes" \
   "$(run status | jq -r '[.presets[] | select(.name == "Rock")][0].description | if . == null then "no" else "yes" end')"
 check "a built-in is marked as one" "true" \
   "$(run status | jq -r '[.presets[] | select(.name == "Rock")][0].builtin')"
+check "every built-in preset carries a category" \
+  "$(ls "$here/../presets"/*.json | wc -l)" \
+  "$(run status | jq '[.presets[] | select(.builtin) | select(.category != null and .category != "other")] | length')"
+check "the list carries the category the file declares" "genre" \
+  "$(run status | jq -r '[.presets[] | select(.name == "Rock")][0].category')"
+
+echo "== the panel can tell an edited preset from the loaded one =="
+run set-mode graphic >/dev/null
+run apply-preset Rock >/dev/null
+check "a freshly applied preset is not marked edited" "false" \
+  "$(run status | jq -r '.presetDirty')"
+rock_gain="$(run status | jq -r '.bands[5].gain')"
+run set-gain 5 -1 >/dev/null
+check "changing one band marks the preset edited" "true" \
+  "$(run status | jq -r '.presetDirty')"
+run set-gain 5 "$rock_gain" >/dev/null
+check "restoring the band clears the edited mark" "false" \
+  "$(run status | jq -r '.presetDirty')"
+# A user preset is compared the same way, and a deleted one must not look
+# edited: the state still names it ("Custom" after deletion), but no preset
+# document resolves, so there is nothing to compare against.
+run save-preset ScratchDirty >/dev/null
+run apply-preset ScratchDirty >/dev/null
+check "a user preset is categorised as user" "user" \
+  "$(run status | jq -r '[.presets[] | select(.name == "ScratchDirty")][0].category')"
+check "a freshly saved preset is not marked edited" "false" \
+  "$(run status | jq -r '.presetDirty')"
+run delete-preset ScratchDirty >/dev/null
+check "a preset whose file is gone does not read as edited" "false" \
+  "$(run status | jq -r '.presetDirty')"
+check "and its label falls back to Custom" "Custom" \
+  "$(run status | jq -r '.preset')"
+# A graphic-only preset says nothing about parametric mode: the absent array
+# must read as not edited, since there is no preset shape to differ from.
+run apply-preset Flat >/dev/null
+run set-mode parametric >/dev/null
+check "a graphic preset viewed in parametric mode is not edited" "false" \
+  "$(run status | jq -r '.presetDirty')"
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 
 echo "== routing: a DSP output is chained in front of, not resolved past ==
 # WirePlumber resolves a DSP sink's stream down to the hardware it feeds. Chaining
@@ -736,22 +806,31 @@ for qml in "$here"/../*.qml; do
   clipboard=$((clipboard + $(strip_qml_comments "$qml" | grep -ci 'clipboard')))
 done
 check "no native text-input type in shipped QML" "0" "$native"
+# The shell kit's own pickers and fields wrap those types too: SearchableDropdown
+# and MultiSelect lead their popups with a TextField, NumberField is a TextInput.
+# Using one brings the clipboard read back without naming a text input here.
+kit_inputs=0
+for qml in "$here"/../*.qml; do
+  kit_inputs=$((kit_inputs + $(strip_qml_comments "$qml" | grep -cE '\b(SearchableDropdown|MultiSelect|NumberField)[[:space:]]*\{')))
+done
+check "no shell component that wraps a native text input" "0" "$kit_inputs"
+check "the preset picker searches through a KeyField" "1" "$(strip_qml_comments "$here/../PresetPicker.qml" | grep -c 'KeyField {')"
 check "no clipboard reference in shipped QML" "0" "$clipboard"
 check "the preset name and AutoEq query are KeyFields" "2" "$(grep -c 'KeyField {' "$here/../Panel.qml")"
 check "the frequency and Q fields are KeyFields" "2" "$(grep -c 'KeyField {' "$here/../ParametricBandRow.qml")"
 check "the band row needs no Qt Quick Controls" "0" "$(grep -c '^import QtQuick.Controls' "$here/../ParametricBandRow.qml")"
 
-echo "== offscreen QML field tests =="
+echo "== offscreen QML tests (key fields, response curve) =="
 qmltestrunner=""
 [[ -x /usr/lib/qt6/bin/qmltestrunner ]] && qmltestrunner=/usr/lib/qt6/bin/qmltestrunner
 if [[ -n $qmltestrunner ]]; then
   qml_out="$(QT_QPA_PLATFORM=offscreen HOME="$T" timeout 90 "$qmltestrunner" \
     -import "$here/qml/imports" -input "$here/qml" 2>&1 || true)"
   printf '%s\n' "$qml_out" | grep -E 'Totals:' | sed 's/^/      /'
-  check "the key-field tests pass offscreen" "yes" \
+  check "the offscreen QML tests pass" "yes" \
     "$(printf '%s' "$qml_out" | grep -qE 'Totals: [0-9]+ passed, 0 failed' && echo yes || echo no)"
 else
-  printf 'SKIP  offscreen QML field tests (qmltestrunner is not installed)\n'
+  printf 'SKIP  offscreen QML tests (qmltestrunner is not installed)\n'
 fi
 
 rm -rf "$T"

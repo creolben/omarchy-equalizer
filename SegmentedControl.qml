@@ -20,15 +20,35 @@ Item {
   property color background: Color.background
   property bool focusable: true
   property int cursorIndex: -1
+  // A caller that needs a specific cell width (the card-wide tab bar) can ask
+  // for one; otherwise the cells size themselves to the labels below.
+  property int cellWidthOverride: 0
+  property real fontSize: Style.font.body
 
   signal changed(string value)
   signal hovered(int index, bool isHovered)
 
   readonly property int segmentCount: options ? options.length : 0
+  // Cells size themselves to their own labels when no override is given. A
+  // fixed cell narrower than its text centres the label and spills it onto
+  // both neighbours -- "Parametric" over "10-band" -- because nothing clips
+  // inside a segment. The widest label, measured bold (a theme may not use a
+  // mono face), sizes every cell so the segments stay equal.
+  readonly property real widestLabel: {
+    var w = 0
+    for (var i = 0; i < segmentCount; i++) {
+      var advance = labelMetrics.advanceWidth(optionLabel(options[i]))
+      if (optionIcon(options[i]) !== "") advance += Style.font.iconSmall + Style.space(6)
+      w = Math.max(w, advance)
+    }
+    return w
+  }
   readonly property int cellWidth: segmentCount > 0
-    ? Math.max(Style.space(64), Style.space(104))
+    ? (cellWidthOverride > 0
+      ? Math.max(Style.space(36), Math.round(cellWidthOverride))
+      : Math.ceil(widestLabel) + Style.space(20))
     : 0
-  readonly property int cellHeight: Math.max(Style.spacing.controlHeight, Style.font.body + Style.spacing.controlPaddingY * 2)
+  readonly property int cellHeight: Math.max(Style.spacing.controlHeight, fontSize + Style.spacing.controlPaddingY * 2)
   readonly property real padding: Math.max(2, Style.space(2))
   readonly property int selectedIndex: {
     for (var i = 0; i < segmentCount; i++) if (optionValue(options[i]) === value) return i
@@ -68,6 +88,15 @@ Item {
     color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.07)
     border.width: 1
     border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.10)
+  }
+
+  // The measure for widestLabel: same family and size as the segment text,
+  // bold, because the selected segment's label is bold.
+  FontMetrics {
+    id: labelMetrics
+    font.family: Style.font.family
+    font.pixelSize: root.fontSize
+    font.bold: true
   }
 
   // The selected segment. Slides rather than jumping, so the eye can follow
@@ -128,7 +157,7 @@ Item {
             ? root.foreground
             : Qt.darker(root.foreground, segmentMouse.containsMouse ? 1.15 : 1.5)
           font.family: Style.font.family
-          font.pixelSize: Style.font.body
+          font.pixelSize: root.fontSize
           font.bold: parent.selected
           anchors.verticalCenter: parent.verticalCenter
           anchors.left: segmentIcon.visible ? segmentIcon.right : undefined

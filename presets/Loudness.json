@@ -2,6 +2,7 @@
   "name": "Loudness",
   "description": "Equal-loudness smiley: bass and air up, ~3 dB dip at 1 kHz",
   "order": 22,
+  "category": "tone",
   "mode": "graphic",
   "preamp": -1.5,
   "graphic": [

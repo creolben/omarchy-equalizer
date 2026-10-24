@@ -2,6 +2,7 @@
   "name": "Late Night",
   "description": "Quiet hours: bass and treble trimmed, presence kept",
   "order": 50,
+  "category": "situation",
   "mode": "graphic",
   "preamp": 0,
   "graphic": [

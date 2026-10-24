@@ -2,6 +2,7 @@
   "name": "Jazz",
   "description": "Warm and smooth: top octaves rolled off",
   "order": 33,
+  "category": "genre",
   "mode": "graphic",
   "preamp": 0,
   "graphic": [

@@ -2,6 +2,7 @@
   "name": "Gaming",
   "description": "Low-mid boom cut and a 3-4 kHz footsteps lift",
   "order": 51,
+  "category": "situation",
   "mode": "graphic",
   "preamp": -0.5,
   "graphic": [

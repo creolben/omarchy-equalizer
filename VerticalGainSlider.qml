@@ -17,6 +17,9 @@ Item {
   property real step: 0.5
 
   property QtObject bar: null
+  // Injected by the panel: moves the enclosing scroll area when the wheel is
+  // declined. Without it a declined wheel still does nothing to the gain.
+  property var scrollBy: null
   property color foreground: bar ? bar.foreground : Color.foreground
   property color accent: Color.accent
   property color background: bar ? bar.background : Color.background
@@ -27,7 +30,6 @@ Item {
   readonly property alias containsMouse: mouse.containsMouse
   property bool dragging: false
   property real liveGain: gain
-  property bool focusable: true
   readonly property bool hot: containsMouse || dragging || activeFocus
 
   signal gainMoved(real gain)
@@ -54,7 +56,9 @@ Item {
 
   implicitWidth: Style.space(30)
   implicitHeight: Style.space(150)
-  activeFocusOnTab: focusable
+  // Focus is click-only: ten tab stops through the plot would be worse than
+  // none. A click arms the wheel and reveals the ring below.
+  activeFocusOnTab: false
 
   function rgba(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
@@ -101,6 +105,19 @@ Item {
     color: root.rgba(root.foreground, 0.08)
     border.width: 1
     border.color: root.rgba(root.foreground, 0.06)
+  }
+
+  // Focus is what arms the wheel, so it has to be visible. Hover stays
+  // cosmetic (the halo and chip below); this ring is only activeFocus.
+  Rectangle {
+    anchors.centerIn: track
+    width: root.capWidth + Style.space(8)
+    height: track.height + Style.space(8)
+    radius: Math.min(width, height) / 2
+    color: "transparent"
+    border.width: Math.max(1, Style.space(2))
+    border.color: root.rgba(root.accent, 0.4)
+    visible: root.activeFocus
   }
 
   Rectangle {
@@ -205,7 +222,16 @@ Item {
     }
     onDoubleClicked: root.resetRequested()
     onWheel: function(wheel) {
-      root.nudge(wheel.angleDelta.y > 0 ? root.step : -root.step)
+      // Never rely on a declined wheel reaching the Flickable: accept it either
+      // way, and scroll ourselves when the policy says the wheel is not ours.
+      var dy = Model.wheelDelta(wheel.angleDelta.x, wheel.angleDelta.y, wheel.modifiers)
+      if (!Model.wheelOwns("fader", wheel.modifiers, root.activeFocus, dy)) {
+        if (root.scrollBy) root.scrollBy(-wheel.angleDelta.y / 2)
+        wheel.accepted = true
+        return
+      }
+      root.nudge(dy > 0 ? root.step : -root.step)
+      wheel.accepted = true
     }
   }
 }

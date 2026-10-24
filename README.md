@@ -120,6 +120,30 @@ it if you plan to install the plugin again.
   the backend computes are the same formulas, in JS and `awk` respectively, and
   `tests/headroom-check.js` keeps them honest against each other.
 
+The card has a fixed band and a tabbed one. The fixed band never moves: hero,
+the meter (a waveform envelope that goes quiet when the signal does), and the
+preset picker with its reset/delete actions. Below it a tab bar picks one page:
+**Response** (the curve, the faders in 10-band mode, the mode control and the
+preamp row directly under them), **Bands** (one row per band, parametric mode
+only), **Output** (limiter and Magic Boost) and **AutoEq**. Every open starts on
+Response. A page only scrolls when it is taller than the card can fit -- the
+Response page on a short (768 px) screen, or a long parametric band list.
+Errors and AutoEq feedback appear in a one-line status strip pinned at the
+bottom, which clears 8 s after the last message. The `e`, `m` and `r` shortcuts
+are named in the tooltips of the power switch, the mode control and the preset
+reset.
+
+The preset picker filters as you type, on each preset's name, category and
+description ("compas" finds Kompa). Its search box is drawn from key events like
+the panel's other fields, so the picker never creates a native text input.
+
+The wheel scrolls the panel. Over a band fader it nudges the band instead — hold
+Alt, or click the fader first, to arm it. The preamp only moves by dragging or
+with the arrow keys, because a vertical wheel over a horizontal control is never
+a deliberate edit. The curve ignores the wheel too. Click the curve (or Tab to
+it) and the keyboard drives it: ←/→ pick a band, ↑/↓ move it 0.5 dB, `0`
+flattens it.
+
 ## Command line
 
 ```
@@ -207,7 +231,8 @@ edit does not restart the unit" is an assertion rather than an observation.
 `node tests/preset-levels.js` also runs inside the suite: it measures every
 built-in preset's applied curve with the plugin's own model (at each graph rate
 the chain can run at) and enforces the level-matching rules described under
-[Presets](#presets), plus that each file names and describes itself.
+[Presets](#presets), plus that each file names itself, describes itself, and
+declares a category that agrees with its order band.
 
 The suite also scans every shipped `.qml` (comments stripped) for Qt's native
 text-input types and for the clipboard — the panel must never give the shell a
@@ -225,6 +250,7 @@ describes itself:
   "name": "Rock",
   "description": "Scooped low mids with a 3-4 kHz presence lift",
   "order": 30,
+  "category": "genre",
   "mode": "graphic",
   "preamp": -0.5,
   "graphic": [ { "type": "peaking", "freq": 31, "q": 1.41, "gain": 0 }, … ]
@@ -232,9 +258,15 @@ describes itself:
 ```
 
 `name` is what the panel lists and what `apply-preset` takes; it has to match the
-filename, and the test suite checks that. `description` is the line the panel
-shows under the preset dropdown. `order` sorts the list — Flat first, then tone,
-genre, speech, situation — and the user's own presets follow the built-ins. A
+filename, and the test suite checks that. `description` is the line the searchable
+picker shows under a preset's row, and it filters on both the category-prefixed
+name and this description — typing "zou" finds Zouk, "compas" finds Kompa through
+its description. `order` sorts the list, and the explicit `category` groups it:
+Flat is `reference`, the tone controls are `tone`, the genres are `genre`, the
+speech presets are `speech`, and the situations are `situation`. The suite holds
+`category` to that closed set and to the `order` band (`10`–`19` reference, `20`–`29`
+tone, `30`–`39` genre, `40`–`49` speech, `50`–`59` situation), so the two encodings
+cannot drift. The user's own presets follow the built-ins and read as `Yours`. A
 file without a `name` is not listed at all, so a half-written preset cannot
 appear as a nameless entry.
 
@@ -271,24 +303,26 @@ equality for every file.
 
 The set, in list order:
 
-| Order | Preset | Mode | What it does |
-| --- | --- | --- | --- |
-| 10 | Flat | graphic | The neutral reference. |
-| 20 | Bass Boost | graphic | Bass plateaus, top rolled off ~5 dB. |
-| 21 | Treble Boost | graphic | The mirror: bass trimmed ~5 dB, top open. |
-| 22 | Loudness | graphic | Equal-loudness smiley, ~3 dB dip at 1 kHz. |
-| 23 | Warm Speakers | parametric | Low shelf up, treble down — warm and forward. |
-| 30 | Rock | graphic | Scooped low mids, presence lift at 3–4 kHz. |
-| 31 | Pop | graphic | Gentle and vocal-forward with a smooth top. |
-| 32 | Dance | graphic | Bass plateau, broad 300 Hz–2 kHz scoop. |
-| 33 | Jazz | graphic | Warm and smooth, top octaves rolled off. |
-| 34 | Classical | graphic | Near-flat, soft 500 Hz dip, a touch of air. |
-| 35 | Vocal | graphic | Bass trimmed, presence lifted. |
-| 40 | Podcast | graphic | Rumble cut below 125 Hz, speech band at unity. |
-| 41 | Speech Clarity | parametric | 55 Hz high-pass, 3 kHz intelligibility lift. |
-| 50 | Late Night | graphic | Quiet hours: bass and treble trimmed, presence kept. |
-| 51 | Gaming | graphic | Low-mid boom cut, 3–4 kHz footsteps lift. |
-| 52 | Small Speakers | parametric | 55 Hz high-pass, boxiness cut, 3 kHz lift. |
+| Order | Category | Preset | Mode | What it does |
+| --- | --- | --- | --- | --- |
+| 10 | reference | Flat | graphic | The neutral reference. |
+| 20 | tone | Bass Boost | graphic | Bass plateaus, top rolled off ~5 dB. |
+| 21 | tone | Treble Boost | graphic | The mirror: bass trimmed ~5 dB, top open. |
+| 22 | tone | Loudness | graphic | Equal-loudness smiley, ~3 dB dip at 1 kHz. |
+| 23 | tone | Warm Speakers | parametric | Low shelf up, treble down — warm and forward. |
+| 30 | genre | Rock | graphic | Scooped low mids, presence lift at 3–4 kHz. |
+| 31 | genre | Pop | graphic | Gentle and vocal-forward with a smooth top. |
+| 32 | genre | Dance | graphic | Bass plateau, broad 300 Hz–2 kHz scoop. |
+| 33 | genre | Jazz | graphic | Warm and smooth, top octaves rolled off. |
+| 34 | genre | Classical | graphic | Near-flat, soft 500 Hz dip, a touch of air. |
+| 35 | genre | Vocal | graphic | Bass trimmed, presence lifted. |
+| 36 | genre | Zouk | graphic | Round low-mid warmth, kick forward, soft top. |
+| 37 | genre | Kompa | graphic | Forward horns and guitars, tight bass, gentle top. |
+| 40 | speech | Podcast | graphic | Rumble cut below 125 Hz, speech band at unity. |
+| 41 | speech | Speech Clarity | parametric | 55 Hz high-pass, 3 kHz intelligibility lift. |
+| 50 | situation | Late Night | graphic | Quiet hours: bass and treble trimmed, presence kept. |
+| 51 | situation | Gaming | graphic | Low-mid boom cut, 3–4 kHz footsteps lift. |
+| 52 | situation | Small Speakers | parametric | 55 Hz high-pass, boxiness cut, 3 kHz lift. |
 
 The two high-pass presets are the only ones that deliberately sit ~2 dB below
 Flat: a pink-noise sweep still has energy under the corner, while the speech and
@@ -299,8 +333,8 @@ preset switch crossfade live instead of restarting the chain (see the ramp in
 `bin/omarchy-equalizer`). Keep that shape when adding one.
 
 User presets live in `presets.json` under the state directory; they have no
-description and no order, so the panel shows their band count instead.
-`import-autoeq` downloads a measured profile from
+description and no order, so the picker labels them `Yours` and the loaded-preset
+line falls back to their band count. `import-autoeq` downloads a measured profile from
 [AutoEq](https://github.com/jaakkopasanen/AutoEq) (MIT), applies it and saves it
 as a preset. Profile names and the preset list are matched exactly, so check that
 the model you import is the device you are listening on — an over-ear profile

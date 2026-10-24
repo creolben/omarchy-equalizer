@@ -25,6 +25,8 @@ Item {
   property string bandType: "peaking"
 
   property QtObject bar: null
+  // Wheel scroll passthrough for this row's gain slider, injected by the panel.
+  property var scrollBy: null
   property color foreground: bar ? bar.foreground : Color.foreground
   property color accent: Color.accent
   property color background: bar ? bar.background : Color.background
@@ -151,6 +153,7 @@ Item {
       value: root.bandGain
       opacity: root.showGain ? 1.0 : 0.3
       enabled: root.showGain
+      scrollBy: root.scrollBy
       onMoved: function(v) { root.liveGain = v; root.gainChanged(v) }
       onReleased: function(v) { root.liveGain = v; root.gainCommitted(v) }
       onRightClicked: root.gainCommitted(0)

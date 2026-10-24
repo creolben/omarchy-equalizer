@@ -18,7 +18,8 @@ import qs.Ui
 //
 // `value` is the model's current text. The field follows it while it is not
 // being edited; `text` holds what the user typed. Typing emits textEdited();
-// Return emits accepted(); leaving the field emits editingFinished().
+// Return emits accepted(); leaving the field emits editingFinished(); Escape
+// restores the model's text and emits cancelled().
 Item {
   id: root
 
@@ -39,6 +40,7 @@ Item {
   signal textEdited()
   signal accepted()
   signal editingFinished()
+  signal cancelled()
 
   readonly property bool _hot: mouse.containsMouse
   readonly property var _borderSpec: Border.controlSpec(activeFocus ? "focus" : (_hot ? "hover-cursor" : "normal"), root.foreground, root.accent)
@@ -84,6 +86,7 @@ Item {
       event.accepted = true
     } else if (event.key === Qt.Key_Escape) {
       root.edit(root.value)
+      root.cancelled()
       event.accepted = true
     } else {
       var value = root.typed(event)

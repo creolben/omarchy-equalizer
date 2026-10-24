@@ -373,7 +373,8 @@ preset_list_json() {
     # A built-in names itself in its own file, which is also what makes the list
     # independent of how the file happens to be called.
     builtin_json="$(jq -c -s '
-      map({ name: (.name // ""), description: (.description // null), order: (.order // 999) })
+      map({ name: (.name // ""), description: (.description // null), order: (.order // 999),
+            category: (.category // "other") })
       | map(select(.name != ""))' "${files[@]}")"
   fi
   presets_ensure
@@ -383,7 +384,8 @@ preset_list_json() {
   jq -c -n --argjson b "$builtin_json" --argjson u "$(cat "$user_presets")" '
     ($b | sort_by(.order, .name) | map(. + { builtin: true }))
     + ($u | keys | sort | map({ name: ., builtin: false,
-                                description: ($u[.].description // null), order: 999 }))
+                                description: ($u[.].description // null), order: 999,
+                                category: "user" }))
   '
 }
 
@@ -1677,13 +1679,29 @@ cmd_import_autoeq() {
 # One JSON document for the panel: what is on, what the bands are, what presets
 # exist. The panel never reads the state file itself.
 cmd_status() {
-  local state bands
+  local state bands preset_name preset_doc
   state="$(state_read)"
   bands="$(active_bands "$state")"
+  # The preset the state names may no longer resolve ("Custom", or a user preset
+  # whose file was deleted). One read for the whole document, not one per band;
+  # a missing one becomes null and the jq below reports "not edited" instead of
+  # failing or treating the absence as a difference.
+  preset_name="$(jq -r '.preset // "Flat"' <<<"$state")"
+  preset_doc="$(preset_read "$preset_name" 2>/dev/null)" || preset_doc='null'
   jq -c -n --argjson s "$state" --argjson b "$bands" --argjson p "$(preset_list_json)" \
+     --argjson d "$preset_doc" \
      --argjson r "$(graph_rate)" --argjson ap "$(auto_preamp_db "$bands")" \
      --argjson oa "$(lsp_available && echo true || echo false)" '
-    {
+    ($d // {}) as $preset
+    | ($s.mode // "graphic") as $mode
+    # Only an array this preset actually defines for the active mode can be
+    # compared. A graphic-only preset viewed in parametric mode says nothing
+    # about parametric, so it must not read as edited.
+    | (if ($preset | type) == "object" and ($preset | has($mode))
+            and (($preset[$mode] | type) == "array")
+            and (($preset[$mode] | length) > 0)
+       then $preset[$mode] else null end) as $presetBands
+    | {
       sampleRate: $r,
       enabled: ($s.enabled // false),
       mode: ($s.mode // "graphic"),
@@ -1701,6 +1719,10 @@ cmd_status() {
       sinkPresent: false,
       targetSink: ($s.targetSink // ""),
       bands: $b,
+      # Whether the loaded preset still matches the running band set. Value
+      # equality on the parsed arrays, so formatting and the preset order or
+      # description can never make a match look edited.
+      presetDirty: ($presetBands != null and $b != $presetBands),
       graphicCount: ($s.graphic | length),
       parametricCount: ($s.parametric | length),
       presets: $p

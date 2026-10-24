@@ -2,6 +2,7 @@
   "name": "Speech Clarity",
   "description": "High-passed at 55 Hz with a 3 kHz intelligibility lift",
   "order": 41,
+  "category": "speech",
   "mode": "parametric",
   "preamp": -2.0,
   "parametric": [

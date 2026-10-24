@@ -2,6 +2,7 @@
   "name": "Vocal",
   "description": "Bass trimmed, presence lifted for lead vocals",
   "order": 35,
+  "category": "genre",
   "mode": "graphic",
   "preamp": 0,
   "graphic": [
