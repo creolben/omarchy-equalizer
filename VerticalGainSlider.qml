@@ -220,7 +220,13 @@ Item {
       root.dragging = false
       root.gainCommitted(root.liveGain)
     }
-    onDoubleClicked: root.resetRequested()
+    // The second press of a double-click starts a drag like any press; end it
+    // here, or its release commits the pressed position over the reset.
+    onDoubleClicked: {
+      root.dragging = false
+      root.liveGain = 0
+      root.resetRequested()
+    }
     onWheel: function(wheel) {
       // Never rely on a declined wheel reaching the Flickable: accept it either
       // way, and scroll ourselves when the policy says the wheel is not ours.

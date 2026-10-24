@@ -451,6 +451,16 @@ Panel {
   }
 
   function sendBandNow(index, gain) {
+    // An immediate commit supersedes the settle timer, as for the preamp: a
+    // drag's last position must not fire 120 ms after a reset and undo it. A
+    // different band still waiting is sent first rather than dropped.
+    bandCommitTimer.stop()
+    if (pendingBandIndex >= 0 && pendingBandIndex !== index) {
+      var waiting = pendingBandIndex
+      pendingBandIndex = -1
+      sendBandNow(waiting, pendingBandGain)
+    }
+    pendingBandIndex = -1
     // Local echo first: a slider that waits for a subprocess round trip feels
     // broken on a fast drag.
     var next = bands.slice()

@@ -660,7 +660,11 @@ Item {
 
     onDoubleClicked: function(m) {
       var index = root.nearestBand(m.x, m.y)
+      // Drop the drag the second press began, so its release cannot commit the
+      // pressed position over the reset.
+      root.dragIndex = -1
       if (index >= 0) root.bandGainCommitted(index, 0)
+      root.repaint()
     }
 
     // The plot never adjusts on the wheel; it scrolls the panel itself rather

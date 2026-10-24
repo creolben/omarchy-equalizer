@@ -99,6 +99,24 @@ Item {
       verify(!curve.activeFocus, "the fader, not the plot, took focus")
     }
 
+    // The second press of a double-click is a drag too; its release must not
+    // commit the pressed position after the reset (the panel's 120 ms settle
+    // timer turned that into the last word).
+    function test_faderDoubleClickResetsLast() {
+      var fx = curve.xFor(1000)
+      var fy = curve.faderY + curve.faderLabelH + curve.faderTravel * 0.25
+      mouseDoubleClickSequence(curve, fx, fy)
+      verify(scene.committed.length > 0)
+      compare(scene.committed[scene.committed.length - 1], [5, 0], "the reset is the last commit")
+    }
+
+    function test_handleDoubleClickResetsLast() {
+      var hx = curve.handleXFor(2), hy = curve.handleYFor(2)
+      mouseDoubleClickSequence(curve, hx, hy)
+      compare(scene.committed[scene.committed.length - 1], [2, 0], "the reset is the last commit")
+      compare(curve.dragIndex, -1)
+    }
+
     function test_keyboardSelectsNudgesAndResets() {
       // A press on empty plot focuses the curve and selects the first handle.
       mouseClick(curve, curve.xFor(700), curve.yFor(-15))
