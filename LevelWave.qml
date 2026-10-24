@@ -80,20 +80,20 @@ Item {
   // stops; because `active` is the panel's `opened && enabled`, a closed panel
   // cannot animate this item inside the shell process.
   Timer {
-    interval: 33
+    interval: 22
     repeat: true
     running: root.active && root.level > 0.01
     onTriggered: {
       var p = root.targetPeak()
       if (p >= root.level) root.level = p
-      else root.level += (p - root.level) * 0.18
+      else root.level += (p - root.level) * 0.12
       // Below the idle line the timer stops, so land on exactly zero rather
       // than leaving a residue the next attack would start from.
       if (root.level <= 0.01) root.level = 0
       // Wrap at 10, not 1: the second partial runs at 1.7x the phase, and only
       // a multiple of 10 keeps 1.7 * phase a whole number of cycles -- a wrap
       // at 1 jumped that partial by 0.7 cycle every ~0.73 s.
-      root.phase = (root.phase + 0.045) % 10
+      root.phase = (root.phase + 0.03) % 10
     }
   }
 
@@ -131,27 +131,41 @@ Item {
       }
 
       var n = Math.max(8, Math.min(96, Math.round(w / 6)))
-      var values = Model.waveSeries(root.level, root.phase, n)
       var amplitude = Math.max(1, h / 2 - hairline)
+      var color = root.clipped ? root.urgent : root.foreground
 
-      // One path per frame: the top edge left to right, the same values mirrored
-      // about the midline on the way back, then close and fill. No per-sample
-      // strokes, so the ribbon holds together at 20 px.
-      ctx.beginPath()
-      for (var i = 0; i < n; i++) {
-        var x = w * i / (n - 1)
-        var y = mid - values[i] * amplitude
-        if (i === 0) ctx.moveTo(x, y)
-        else ctx.lineTo(x, y)
+      // Three layered ribbons, back to front, each a phase-shifted and smaller
+      // copy of the envelope. The overlap of translucent fills gives the soft,
+      // flowing depth of stacked waves; the front layer carries the level.
+      var layers = [
+        { scale: 1.0,  shift: 0.62, alpha: 0.18 },
+        { scale: 0.82, shift: 0.31, alpha: 0.32 },
+        { scale: 0.62, shift: 0.0,  alpha: 0.85 }
+      ]
+      for (var k = 0; k < layers.length; k++) {
+        var L = layers[k]
+        var values = Model.waveSeries(root.level, root.phase + L.shift, n)
+        var xs = [], top = [], bottom = []
+        for (var i = 0; i < n; i++) {
+          xs.push(w * i / (n - 1))
+          top.push(mid - values[i] * L.scale * amplitude)
+          bottom.push(mid + values[i] * L.scale * amplitude)
+        }
+        // Smooth edges: quadratic curves through the midpoints of the samples,
+        // so the ribbon has no visible corners at any width.
+        ctx.beginPath()
+        ctx.moveTo(xs[0], top[0])
+        for (var t = 1; t < n - 1; t++)
+          ctx.quadraticCurveTo(xs[t], top[t], (xs[t] + xs[t + 1]) / 2, (top[t] + top[t + 1]) / 2)
+        ctx.lineTo(xs[n - 1], top[n - 1])
+        ctx.lineTo(xs[n - 1], bottom[n - 1])
+        for (var u = n - 2; u > 0; u--)
+          ctx.quadraticCurveTo(xs[u], bottom[u], (xs[u] + xs[u - 1]) / 2, (bottom[u] + bottom[u - 1]) / 2)
+        ctx.lineTo(xs[0], bottom[0])
+        ctx.closePath()
+        ctx.fillStyle = root.rgba(color, L.alpha)
+        ctx.fill()
       }
-      for (var j = n - 1; j >= 0; j--) {
-        var xb = w * j / (n - 1)
-        var yb = mid + values[j] * amplitude
-        ctx.lineTo(xb, yb)
-      }
-      ctx.closePath()
-      ctx.fillStyle = root.rgba(root.clipped ? root.urgent : root.foreground, 0.85)
-      ctx.fill()
     }
   }
 }
