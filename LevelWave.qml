@@ -149,7 +149,9 @@ Item {
       var gap = Math.max(2, Math.round(bw * 0.8))
       var n = Math.max(1, Math.floor((w + gap) / (bw + gap)))
       var x0 = (w - (n * bw + (n - 1) * gap)) / 2
-      var values = Model.barSeries(root.level, root.phase, n)
+      var values = Model.barSeries(Math.pow(root.level, 0.5), root.phase, n)
+      // The monitor's peak is linear and music mostly sits low (0.05..0.3), which
+      // would leave every bar a dot; the square root gives it a usable range.
       var minH = bw   // a quiet bar is still a round dot, never a sliver
       ctx.fillStyle = root.rgba(color, 0.9)
       for (var i = 0; i < n; i++) {
