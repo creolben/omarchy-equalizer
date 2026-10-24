@@ -61,6 +61,14 @@ Item {
   property real avg: 0
   property int beats: 0          // count, for the debug overlay
 
+  // Stagger: the bars change one after another, left to right, instead of all
+  // on the same frame. Each bar reads the target the row had `sweep` seconds
+  // ago times its position, so a change runs across the row as a wave. The
+  // history is a plain array of recent { t, v } frames; nothing binds to it.
+  property real sweep: 0.28
+  property var history: []
+  property real clock: 0
+
   readonly property bool haveBands: (bands || []).length >= 2
   property bool live: false
   // True while any bar or cap is still above the floor, so the loop outlives
@@ -98,7 +106,7 @@ Item {
 
   onActiveChanged: {
     if (!active) {
-      heights = []; caps = []; capSpeed = []
+      heights = []; caps = []; capSpeed = []; history = []; clock = 0
       beat = 0; ripple = 1; level = 0; phase = 0; avg = 0
       live = false; settling = false
     }
@@ -127,9 +135,21 @@ Item {
       if (root.level <= 0.01) root.level = 0
       root.phase = (root.phase + 3.7 * dt) % 10
 
-      var target = root.haveBands
+      var now = root.haveBands
         ? Model.spectrumBars(root.bands, n, root.mirrored)
         : Model.barSeries(Math.sqrt(root.level), root.phase, n)
+      root.clock += dt
+      var hist = root.history
+      if (hist.length && hist[hist.length - 1].v.length !== n) hist = []
+      hist.push({ t: root.clock, v: now })
+      while (hist.length > 2 && hist[1].t < root.clock - root.sweep - 0.05) hist.shift()
+      root.history = hist
+      // The frame at or just before `when`, oldest kept if none is that old.
+      var sample = function(when) {
+        for (var j = hist.length - 1; j > 0; j--)
+          if (hist[j].t <= when) return hist[j].v
+        return hist[0].v
+      }
 
       if (root.ripple < 1) root.ripple = Math.min(1, root.ripple + 2.2 * dt)
       root.beat *= Math.exp(-dt / 0.18)
@@ -142,7 +162,8 @@ Item {
         var swell = root.ripple < 1
           ? 0.4 * Math.exp(-Math.pow((d - root.ripple) / 0.18, 2)) * (1 - root.ripple)
           : 0
-        var t = Math.min(1, target[i] * (1 + 0.55 * root.beat) + swell)
+        var lag = n > 1 ? root.sweep * i / (n - 1) : 0
+        var t = Math.min(1, sample(root.clock - lag)[i] * (1 + 0.55 * root.beat) + swell)
 
         var cur = hs[i]
         cur += (t - cur) * (t > cur ? attack : release)
