@@ -79,7 +79,49 @@ check "set-band rejects a non-number" "1|'xyz' is not a number." "$rc|$out"
 out="$(run remove-band 99)"; rc=$?
 check "remove-band rejects an out-of-range index" "1|Band 99 does not exist." "$rc|$out"
 out="$(run remove-band zz)"; rc=$?
-check "remove-band rejects a non-number" "1|Band index must be a number." "$rc|$out"
+check "remove-band rejects a non-number" "1|Band index must be a plain number." "$rc|$out"
+
+echo "== band values are range-checked, and a failure never empties the state =="
+# A well-formed profile can still be dangerous: "Gain 120 dB" with a negative Q is
+# about +96 dB through auto headroom's -24 dB floor. And any jq or awk failure
+# upstream of the write used to leave a 0-byte state.json, losing the bands and
+# both remembered sinks.
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-gain 0 3 >/dev/null
+st="$XDG_STATE_HOME/omarchy-equalizer/state.json"
+before="$(cat "$st")"
+out="$(run set-band 0 gain 120)"; rc=$?
+check "an out-of-range gain is refused" "1|Band 0 gain 120 is outside -30..20 (graphic set)." "$rc|$out"
+out="$(run set-band 0 q -0.5)"; rc=$?
+check "a negative Q is refused" "1" "$rc"
+out="$(run set-band 0 freq 90000)"; rc=$?
+check "an out-of-range freq is refused" "1" "$rc"
+out="$(run set-band 0 type "a b c d e")"; rc=$?
+check "an unknown filter type is refused" "1" "$rc"
+check "the refusal names the type" "1" "$(grep -c 'is not one of' <<<"$out")"
+out="$(run set-gain 18446744073709551615 5)"; rc=$?
+check "an overflowing band index is refused" "1" "$rc"
+out="$(run set-gain 010 5)"; rc=$?
+check "a leading-zero band index is refused (bash reads it as octal)" "1" "$rc"
+check "the refusals leave the state intact" "$before" "$(cat "$st")"
+check "the graphic set still has 10 bands" "10" "$(jq '.graphic | length' "$st")"
+mkdir -p "$XDG_STATE_HOME/omarchy-equalizer"
+jq -c '. + { "Nan Preamp": { mode: "graphic", preamp: "+nan", graphic: [] } }' \
+  "$XDG_STATE_HOME/omarchy-equalizer/presets.json" 2>/dev/null >"$T/p.json" ||
+  printf '{"Nan Preamp":{"mode":"graphic","preamp":"+nan","graphic":[]}}\n' >"$T/p.json"
+mv "$T/p.json" "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
+out="$(run apply-preset "Nan Preamp")"; rc=$?
+check "a non-numeric preset preamp is refused" "1" "$rc"
+check "the nan preamp never reaches the state" "$before" "$(cat "$st")"
+check "the state file is never left empty" "yes" "$([[ -s $st ]] && echo yes || echo no)"
+printf 'Preamp: -6 dB\nFilter 1: ON PK Fc 1000 Hz Gain 120 dB Q -0.5\n' >"$T/Loud ParametricEQ.txt"
+out="$(run import-autoeq "$T/Loud ParametricEQ.txt")"; rc=$?
+check "an out-of-range AutoEq profile is refused" "1" "$rc"
+check "the profile refusal says why" "1" "$(grep -c 'The profile is out of range: Band 0 gain 120' <<<"$out")"
+check "the refused profile saves no preset" "0" "$(run presets | grep -c '^Loud$')"
+jq -c 'del(.["Nan Preamp"])' "$XDG_STATE_HOME/omarchy-equalizer/presets.json" >"$T/p.json" &&
+  mv "$T/p.json" "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
+rm -f "$st"
 
 echo "== graph rate =="
 check "the status carries the graph rate, not a hardcoded one" "44100" "$(run status | jq -r '.sampleRate')"
@@ -321,6 +363,61 @@ unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
 run enable >/dev/null
 run disable >/dev/null
 
+echo "== a restart parks the app streams instead of dropping them =="
+# A graph-shape change restarts the chain, and the EQ sink vanishes for a moment.
+# A browser playing into it takes that as its device going away and pauses the
+# song. The streams are parked on the device the EQ plays into for the restart and
+# brought back to the new sink after it.
+run disable >/dev/null
+export PACTL_DEVICE_SINK=bluez_output.12_34_56_78_9A.BC
+export PACTL_DEFAULT_SINK=bluez_output.12_34_56_78_9A.BC
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+run set-mode graphic >/dev/null
+export PACTL_APP_STREAM=1 PACTL_LOG="$T/pactl-park.log"; : >"$PACTL_LOG"; : >"$SYSTEMCTL_LOG"
+run apply-preset "Small Speakers" >/dev/null
+check "the mode-changing preset still restarts the chain" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
+check "the app stream is parked on the device, then returned to the EQ" \
+  "move-sink-input 42 bluez_output.12_34_56_78_9A.BC|set-default-sink omarchy_equalizer|move-sink-input 42 omarchy_equalizer" \
+  "$(grep -E '^(move-sink-input|set-default-sink)' "$PACTL_LOG" | paste -sd'|')"
+run set-mode graphic >/dev/null
+unset PACTL_APP_STREAM PACTL_LOG PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
+run disable >/dev/null
+run enable >/dev/null
+
+echo "== a restart that does not come back leaves the parked streams for the follower =="
+# If the sink never returns, the streams parked on the device would play there
+# unequalized for good. They are remembered in the state, and the follower's
+# next pass -- once systemd has brought the sink back -- returns them.
+run disable >/dev/null
+export PACTL_DEVICE_SINK=bluez_output.12_34_56_78_9A.BC
+export PACTL_DEFAULT_SINK=bluez_output.12_34_56_78_9A.BC
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+run set-mode graphic >/dev/null
+export PACTL_APP_STREAM=1 PACTL_LOG="$T/pactl-fail.log" OMARCHY_EQ_RESTART_TIMEOUT=1
+export SYSTEMCTL_RESTART_FAILS="$T/eq-gone" PACTL_NO_EQ_SINK="$T/eq-gone"
+rm -f "$T/eq-gone"; : >"$PACTL_LOG"
+run apply-preset "Small Speakers" >/dev/null
+st="$XDG_STATE_HOME/omarchy-equalizer/state.json"
+check "the stream was parked on the device" "1" \
+  "$(grep -c '^move-sink-input 42 bluez_output.12_34_56_78_9A.BC$' "$PACTL_LOG")"
+check "nothing is moved back onto a sink that is not there" "0" \
+  "$(grep -c '^move-sink-input 42 omarchy_equalizer$' "$PACTL_LOG")"
+check "the parked stream is remembered" "[42]" "$(jq -c '.parkedStreams' "$st")"
+# systemd brings the sink back; the follower's pass returns the stream.
+rm -f "$T/eq-gone"; unset SYSTEMCTL_RESTART_FAILS; : >"$PACTL_LOG"
+run retarget >/dev/null
+check "the follower returns the parked stream" "1" \
+  "$(grep -c '^move-sink-input 42 omarchy_equalizer$' "$PACTL_LOG")"
+check "and takes the default back" "1" "$(grep -c '^set-default-sink omarchy_equalizer$' "$PACTL_LOG")"
+check "the parked record is cleared" "null" "$(jq -c '.parkedStreams // null' "$st")"
+unset PACTL_APP_STREAM PACTL_LOG OMARCHY_EQ_RESTART_TIMEOUT PACTL_NO_EQ_SINK
+run set-mode graphic >/dev/null
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
+run disable >/dev/null
+run enable >/dev/null
+
 echo "== routing: a vanished target is replaced, not trusted =="
 # A Bluetooth device that is switched off, sleeps, or errors out disappears from
 # pactl entirely. While the EQ is on the default sink is the EQ itself, so the
@@ -496,6 +593,40 @@ run retarget >/dev/null
 check "after the grace the fallback replaces the target" "alsa_output.pci-0000_00_1f.3.analog-stereo" "$(jq -r '.targetSink' "$st")"
 check "the fallback clears the vanish record" "null" "$(jq -r '.vanishedTargetSink // "null"' "$st")"
 export OMARCHY_EQ_VANISH_GRACE=0
+run disable >/dev/null
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
+
+echo "== routing: the picked device coming back after the grace wins over the fallback =="
+# The grace ran out and the fallback took over; then the headset returns.
+# WirePlumber relinks the EQ stream to it, and convergence used to drag it back
+# to the fallback. The pick (previousDefaultSink) is live again, so it is the
+# target again.
+run disable >/dev/null
+export PACTL_DEVICE_SINK=bluez_output.12_34_56_78_9A.BC.1
+export PACTL_DEFAULT_SINK=$PACTL_DEVICE_SINK
+run enable >/dev/null
+st="$XDG_STATE_HOME/omarchy-equalizer/state.json"
+export PACTL_DEVICE_SINK=alsa_output.pci-0000_00_1f.3.analog-stereo
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+run retarget >/dev/null
+check "with the headset gone the fallback is the target" "alsa_output.pci-0000_00_1f.3.analog-stereo" "$(jq -r '.targetSink' "$st")"
+check "the pick is still remembered" "bluez_output.12_34_56_78_9A.BC.1" "$(jq -r '.previousDefaultSink' "$st")"
+export PACTL_DEVICE_SINK2=bluez_output.12_34_56_78_9A.BC.1
+export PACTL_EQ_AIM=1 PACTL_EQ_AIM_SINK_ID=3 PACTL_LOG="$T/pactl-return.log"; : >"$PACTL_LOG"
+run retarget >/dev/null
+check "the returning headset is the target again" "bluez_output.12_34_56_78_9A.BC.1" "$(jq -r '.targetSink' "$st")"
+check "the stream already on it is not moved away" "0" "$(grep -c 'move-sink-input' "$PACTL_LOG")"
+check "the fragment names the headset" "1" "$(grep -c 'target.object = "bluez_output.12_34_56_78_9A.BC.1"' "$frag")"
+# Back under a new profile suffix counts as the same device.
+export PACTL_DEVICE_SINK2=
+export PACTL_DEVICE_SINK=alsa_output.pci-0000_00_1f.3.analog-stereo
+run retarget >/dev/null
+jq -c '.targetMissingSince = 1' "$st" >"$st.x" && mv "$st.x" "$st"
+run retarget >/dev/null
+export PACTL_DEVICE_SINK2=bluez_output.12_34_56_78_9A.BC.2
+run retarget >/dev/null
+check "a sibling profile of the pick is adopted on return" "bluez_output.12_34_56_78_9A.BC.2" "$(jq -r '.targetSink' "$st")"
+unset PACTL_DEVICE_SINK2 PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG
 run disable >/dev/null
 unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
 
@@ -824,6 +955,31 @@ check "a pool remove does not restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
 check "a pool remove is one pw-cli call" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
 check "the freed slot is written Off" "yes" \
   "$(grep -q '"para:ft_8" 0' "$PWCLI_LOG" && echo yes || echo no)"
+
+echo "== a parametric preset shaped like the graphic chain still rebuilds into the pool =="
+# Ten bells match the graphic chain's shape, so the shape check used to ramp
+# them into the biquads -- leaving every later edit sending para:* controls to a
+# graph that has none. Into or out of the pool is always a restart.
+run set-mode graphic >/dev/null
+jq -c '. + { "Ten Bells": { mode: "parametric",
+  parametric: [ range(10) | { type: "peaking", freq: (100 * (. + 1)), q: 1.0, gain: 1 } ] } }' \
+  "$XDG_STATE_HOME/omarchy-equalizer/presets.json" >"$T/p.json" &&
+  mv "$T/p.json" "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
+: >"$SYSTEMCTL_LOG"
+run apply-preset "Ten Bells" >/dev/null
+check "graphic -> ten-bell parametric preset restarts" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
+check "the fragment is the pool" "1" "$(grep -c 'para_equalizer_x16_mono' "$frag")"
+jq -c '. + { "Ten Graphic": { mode: "graphic",
+  graphic: [ range(10) | { type: "peaking", freq: (100 * (. + 1)), q: 1.41, gain: 1 } ] } }' \
+  "$XDG_STATE_HOME/omarchy-equalizer/presets.json" >"$T/p.json" &&
+  mv "$T/p.json" "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
+: >"$SYSTEMCTL_LOG"
+run apply-preset "Ten Graphic" >/dev/null
+check "pool -> graphic preset restarts" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
+check "the fragment is the biquad chain again" "0" "$(grep -c 'para_equalizer_x16_mono' "$frag")"
+jq -c 'del(.["Ten Bells"], .["Ten Graphic"])' "$XDG_STATE_HOME/omarchy-equalizer/presets.json" >"$T/p.json" &&
+  mv "$T/p.json" "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
+run set-mode parametric >/dev/null
 
 echo "== parametric band cap =="
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
