@@ -39,6 +39,8 @@ Item {
   // kick taller and the pulse runs faster for a moment on every onset.
   property real avg: 0
   property real beat: 0
+  // Shockwave from the centre on each beat: 0 at the onset, 1 once it has left.
+  property real ripple: 1
 
   function rgba(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
   function targetPeak() { return Math.max(0, Math.min(1, Number(peak) || 0)) }
@@ -69,6 +71,7 @@ Item {
       phase = 0
       avg = 0
       beat = 0
+      ripple = 1
     }
     repaint()
   }
@@ -80,6 +83,7 @@ Item {
   onClippedChanged: repaint()
   onLevelChanged: repaint()
   onPhaseChanged: repaint()
+  onRippleChanged: repaint()
 
   // One frame per 33 ms while the panel is open, the equalizer is on, and there
   // is a signal worth showing. At rest the condition is false and the timer
@@ -101,8 +105,10 @@ Item {
       // at 1 jumped that partial by 0.7 cycle every ~0.73 s.
       var bs = Model.beatStep(root.avg, p, root.beat)
       root.avg = bs[0]
+      if (bs[1] === 1) root.ripple = 0
+      else if (root.ripple < 1) root.ripple = Math.min(1, root.ripple + 0.07)
       root.beat = bs[1]
-      root.phase = (root.phase + 0.045 * (1 + 2 * root.beat)) % 10
+      root.phase = (root.phase + 0.06 * (1 + 2 * root.beat)) % 10
     }
   }
 
@@ -145,7 +151,7 @@ Item {
       // A row of rounded bars mirrored about the midline. Each bar plays the same
       // height sequence slightly later than its neighbour (Model.barSeries), so
       // a pulse travels along the row.
-      var bw = Math.max(2, Style.spaceReal(3))
+      var bw = Math.max(2, Style.spaceReal(2.5))
       var gap = Math.max(2, Math.round(bw * 0.8))
       var n = Math.max(1, Math.floor((w + gap) / (bw + gap)))
       var x0 = (w - (n * bw + (n - 1) * gap)) / 2
@@ -153,9 +159,20 @@ Item {
       // The monitor's peak is linear and music mostly sits low (0.05..0.3), which
       // would leave every bar a dot; the square root gives it a usable range.
       var minH = bw   // a quiet bar is still a round dot, never a sliver
-      ctx.fillStyle = root.rgba(color, 0.9)
+      // Brightest at the centre, fading toward both ends.
+      var grad = ctx.createLinearGradient(0, 0, w, 0)
+      grad.addColorStop(0, root.rgba(color, 0.4))
+      grad.addColorStop(0.5, root.rgba(color, 1))
+      grad.addColorStop(1, root.rgba(color, 0.4))
+      ctx.fillStyle = grad
       for (var i = 0; i < n; i++) {
-        var bh = Math.min(h, Math.max(minH, values[i] * (1 + 0.45 * root.beat) * amplitude * 2))
+        // The shockwave is a bump travelling outward from the centre; bars under
+        // it swell, then settle once it has passed.
+        var d = Math.abs((i + 0.5) / n * 2 - 1)
+        var swell = root.ripple < 1
+          ? 0.7 * Math.exp(-Math.pow((d - root.ripple) / 0.22, 2)) * (1 - root.ripple)
+          : 0
+        var bh = Math.min(h, Math.max(minH, values[i] * (1 + 0.45 * root.beat + swell) * amplitude * 2))
         var x = x0 + i * (bw + gap)
         var y = mid - bh / 2
         var r = bw / 2
