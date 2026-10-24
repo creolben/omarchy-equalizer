@@ -5,7 +5,15 @@ output: a 10-band graphic EQ, up to 16 parametric bands, level-matched presets,
 AutoEq headphone import, automatic headroom, and an output stage (brickwall
 limiter plus a multiband "Magic Boost" compressor).
 
-![The equalizer panel](docs/panel.png)
+<p align="center">
+  <img src="docs/panel.png" width="430" alt="The equalizer panel: power switch and level meter, the preset picker, and the Response tab with the curve, ten faders and the preamp">
+</p>
+
+The panel keeps the power switch, the level meter and the preset picker fixed at
+the top; below them a tab bar switches between **Response** (the curve, the
+10-band faders or the parametric handles, the mode switch and the preamp),
+**Bands** (one row per band, parametric mode only), **Output** (limiter and
+Magic Boost) and **AutoEq**.
 
 Everything is driven from the panel; the same operations are available from the
 command line.
@@ -290,7 +298,9 @@ cannot drift. The user's own presets follow the built-ins and read as `Yours`. A
 file without a `name` is not listed at all, so a half-written preset cannot
 appear as a nameless entry.
 
-![The preset section](docs/presets.png)
+<p align="center">
+  <img src="docs/presets.png" width="430" alt="The preset section: category, picker with reset and delete, the preset's description, and the save field">
+</p>
 
 ### Presets are level-matched
 
