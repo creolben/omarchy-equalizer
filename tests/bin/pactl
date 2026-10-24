@@ -19,6 +19,10 @@ if [[ -n ${PACTL_DEVICE_SINK:-} ]]; then
   sinks="$sinks
 2	$PACTL_DEVICE_SINK	PipeWire	s16le 2ch 48000Hz	SUSPENDED"
 fi
+if [[ -n ${PACTL_DEVICE_SINK2:-} ]]; then
+  sinks="$sinks
+3	$PACTL_DEVICE_SINK2	PipeWire	float32le 2ch 48000Hz	SUSPENDED"
+fi
 [[ -n ${PACTL_LOG:-} ]] && printf '%s\n' "$*" >>"$PACTL_LOG"
 case "$1" in
   list)
@@ -29,6 +33,13 @@ case "$1" in
     else
       printf '%s\n' "$sinks"
     fi
+    ;;
+  subscribe)
+    # PACTL_SUBSCRIBE_COUNT change events on the EQ's stream, spaced wider than
+    # the follower's 0.4 s drain so each one is its own pass.
+    for ((i = 0; i < ${PACTL_SUBSCRIBE_COUNT:-0}; i++)); do
+      sleep 0.5; printf "Event 'change' on sink-input #99\n"
+    done
     ;;
   get-default-sink) printf '%s\n' "${PACTL_DEFAULT_SINK:-omarchy_equalizer}" ;;
 esac

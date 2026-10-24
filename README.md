@@ -105,8 +105,10 @@ it if you plan to install the plugin again.
   Bluetooth device that is switched off, sleeps, or errors out vanishes from
   pactl while the EQ stays the default sink, and a live `pactl move` pins
   nothing, so WirePlumber is free to relink the stream again — a vanished target
-  is replaced by a device that still exists (or kept when nothing else is live,
-  so the device's return can still be aimed at), and a drifted aim is moved back
+  is first given a short grace period (`OMARCHY_EQ_VANISH_GRACE`, 5 s — a Bluetooth
+  profile switch re-creates its sink, and a sibling profile sink is adopted at
+  once), then replaced by the sink the stream is already on (or a live one; kept
+  when nothing else is live, so the device's return can still be aimed at), and a drifted aim is moved back
   onto the remembered target. A later disable still restores the device the user
   actually chose.
 - The panel is QML (`Panel.qml`, `ResponseCurve.qml`, the slider and switch

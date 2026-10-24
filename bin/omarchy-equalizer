@@ -841,8 +841,12 @@ live_ramp_bands() {
   done
 }
 
+sink_exists() {
+  pactl list sinks short 2>/dev/null | awk '{print $2}' | grep -Fx -- "$1" >/dev/null
+}
+
 sink_present() {
-  pactl list sinks short 2>/dev/null | awk '{print $2}' | grep -Fx "$sink_name" >/dev/null
+  sink_exists "$sink_name"
 }
 
 # The physical output the equalizer should play into.
@@ -924,8 +928,8 @@ eq_output_input_id() {
 # the fragment both name what they chose. The remembered target is therefore the
 # authority and the actual sink must be read back instead of assumed.
 eq_output_aim() {
-  local want aim
-  want="$(eq_output_input_id)"
+  local want="${1:-}" aim
+  [[ -n $want ]] || want="$(eq_output_input_id)"
   [[ -n $want ]] || return 0
   aim="$(pactl list sink-inputs 2>/dev/null | awk -v want="$want" '
     /^Sink Input #/  {cur = substr($3, 2)}
@@ -1043,7 +1047,7 @@ cmd_disable() {
 
   service_stop
 
-  if [[ -n $restore ]] && pactl list sinks short 2>/dev/null | awk '{print $2}' | grep -Fx "$restore" >/dev/null; then
+  if [[ -n $restore ]] && sink_exists "$restore"; then
     pactl set-default-sink "$restore" >/dev/null 2>&1
     move_apps_to "$restore"
   elif [[ -n $fallback ]]; then
@@ -1061,7 +1065,10 @@ cmd_disable() {
 # Re-aim the EQ at the new device (live stream move, no restart) and take the
 # default back.
 cmd_retarget() {
-  local state default target id live
+  local state default target id live aim now gone since sibling
+  local grace="${OMARCHY_EQ_VANISH_GRACE:-5}"
+  retarget_pending=0
+  converge_moved=0
   state="$(state_read)"
   [[ $(jq -r '.enabled' <<<"$state") == true ]] || return 0
   sink_present || return 0
@@ -1081,16 +1088,54 @@ cmd_retarget() {
   if [[ $default == "$sink_name" ]]; then
     target="$(jq -r '.targetSink // empty' <<<"$state")"
     [[ -n $target ]] || return 0
-    if pactl list sinks short 2>/dev/null | awk '{print $2}' | grep -Fx "$target" >/dev/null; then
-      :
+    if sink_exists "$target"; then
+      # Back (or never gone): forget any vanish in progress.
+      if [[ -n $(jq -r '.vanishedTargetSink // empty' <<<"$state") ]]; then
+        state="$(jq -c 'del(.vanishedTargetSink, .targetMissingSince)' <<<"$state")"
+        state_write "$state"
+      fi
     else
-      live="$(first_output_sink)"
+      # A Bluetooth profile switch (A2DP <-> HFP) or a short sleep drops the sink
+      # and re-creates it a moment later, sometimes under a new profile suffix
+      # (bluez_output.MAC.1 -> .2). The first pass only notes the vanish; a
+      # sibling of the same device is adopted at once, and anything else waits
+      # out a grace period before the fallback overwrites the target.
+      now="$(date +%s)"
+      gone="$(jq -r '.vanishedTargetSink // empty' <<<"$state")"
+      since="$(jq -r '.targetMissingSince // 0' <<<"$state")"
+      if [[ $gone != "$target" ]]; then
+        since="$now"
+        state="$(jq -c --arg g "$target" --argjson t "$now" '.vanishedTargetSink = $g | .targetMissingSince = $t' <<<"$state")"
+        state_write "$state"
+      fi
+      sibling=""
+      if [[ $target == bluez_output.*.* ]]; then
+        sibling="$(pactl list sinks short 2>/dev/null | awk -v p="${target%.*}." 'index($2, p) == 1 {print $2; exit}')"
+      fi
+      if [[ -n $sibling ]]; then
+        need_sink_name "$sibling"
+        state="$(jq -c --arg tgt "$sibling" '.targetSink = $tgt | del(.vanishedTargetSink, .targetMissingSince)' <<<"$state")"
+        state_write "$state"
+        write_fragment "$state" "$sibling"
+        target="$sibling"
+      elif ((now - since < grace)); then
+        retarget_pending=1
+        return 0
+      else
+      # Adopt where WirePlumber already put the stream: a live sink that
+      # reflects priority and availability, unlike listing order (creation
+      # order -- on an Asahi Mac the raw hardware sink precedes the J313
+      # tuning sink, so first_output_sink routes around the tuning).
+      live="$(eq_output_aim)"
+      [[ $live != "$sink_name" ]] || live=""
+      [[ -n $live ]] || live="$(first_output_sink)"
       [[ -n $live ]] || return 0
       need_sink_name "$live"
-      state="$(jq -c --arg tgt "$live" '.targetSink = $tgt' <<<"$state")"
+      state="$(jq -c --arg tgt "$live" '.targetSink = $tgt | del(.vanishedTargetSink, .targetMissingSince)' <<<"$state")"
       state_write "$state"
       write_fragment "$state" "$live"
       target="$live"
+      fi
     fi
     # And whatever the target is now, the stream itself has to be on it: a live
     # move pins nothing, so WirePlumber relinks the stream on its own afterwards
@@ -1101,7 +1146,10 @@ cmd_retarget() {
     [[ -n $id ]] || return 0
     aim="$(eq_output_aim "$id")"
     if [[ $aim != "$target" ]]; then
-      pactl move-sink-input "$id" "$target" >/dev/null 2>&1
+      converge_moved=1
+      echo "omarchy-equalizer: stream $id was aimed at ${aim:-?}, moving it to $target" >&2
+      pactl move-sink-input "$id" "$target" >/dev/null 2>&1 ||
+        echo "omarchy-equalizer: moving stream $id to $target failed" >&2
     fi
     return 0
   fi
@@ -1112,9 +1160,11 @@ cmd_retarget() {
   state="$(jq -c --arg prev "$default" --arg tgt "$target" '.previousDefaultSink = $prev | .targetSink = $tgt' <<<"$state")"
   state_write "$state"
   write_fragment "$state" "$target"
+  # Default first: the relink it triggers lands before the move, so the move is
+  # the last word and pins the stream on the pick (issue #2).
+  pactl set-default-sink "$sink_name" >/dev/null 2>&1
   id="$(eq_output_input_id)"
   [[ -n $id ]] && pactl move-sink-input "$id" "$target" >/dev/null 2>&1
-  pactl set-default-sink "$sink_name" >/dev/null 2>&1
   move_apps_to "$sink_name"
 }
 
@@ -1123,17 +1173,44 @@ cmd_retarget() {
 # Drift (the one-shot aim of issue #2: the EQ stream can be relinked by
 # WirePlumber a second after every move) is corrected by the same retarget pass;
 # change events on the streams and sinks fuel that. Bursts are drained first.
+follow_event_wanted() {
+  case "$1" in
+    *" on server"* | *"'new' on sink #"* | *"'remove' on sink #"* | \
+    *"'change' on sink #"* | *"'change' on sink-input #"*) return 0 ;;
+  esac
+  return 1
+}
+
 cmd_follow() {
   need pactl
-  cmd_retarget
+  local streak=0
+  follow_pass() {
+    cmd_retarget
+    # A vanished target waits out its grace period; no event will announce the
+    # end of it, so look again once it has run.
+    if ((retarget_pending)); then
+      sleep "${OMARCHY_EQ_VANISH_GRACE:-5}"
+      cmd_retarget
+    fi
+    # A move that does not stick (WirePlumber relinking it straight back) would
+    # otherwise spin on its own change events: back off after a run of them.
+    if ((converge_moved)); then
+      streak=$((streak + 1))
+      if ((streak >= 5)); then
+        echo "omarchy-equalizer: the output stream keeps drifting; backing off" >&2
+        sleep 2
+        streak=0
+      fi
+    else
+      streak=0
+    fi
+  }
+  follow_pass
   pactl subscribe 2>/dev/null | while IFS= read -r line; do
-    case "$line" in
-      *" on server"* | *"'new' on sink #"* | *"'remove' on sink #"* | \
-      *"'change' on sink #"* | *"'change' on sink-input #"*)
-        while IFS= read -r -t 0.4 _; do :; done
-        cmd_retarget
-        ;;
-    esac
+    if follow_event_wanted "$line"; then
+      while IFS= read -r -t 0.4 _; do :; done
+      follow_pass
+    fi
   done
 }
 

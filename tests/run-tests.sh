@@ -29,6 +29,10 @@ export PWCLI_LOG="$T/pw-cli.log"
 # collapsing the ramp to one write keeps them fast and free of sleeps. The ramp
 # section unsets this so it can count the steps.
 export OMARCHY_EQ_NO_RAMP=1
+# A vanished output target is normally given a grace period before the fallback
+# replaces it; the routing tests exercise the replacement itself, and the grace
+# section turns it back on.
+export OMARCHY_EQ_VANISH_GRACE=0
 mkdir -p "$T"
 rm -rf "$T/config" "$T/state"
 : >"$SYSTEMCTL_LOG"; : >"$CURL_LOG"; : >"$PWCLI_LOG"
@@ -417,6 +421,83 @@ check "the replacement names the live device in the fragment" "1" \
   "$(grep -c 'target.object = "alsa_output.pci-0000_00_1f.3.analog-stereo"' "$frag")"
 run disable >/dev/null
 unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG
+
+echo "== follow: a move that does not stick backs off =="
+run disable >/dev/null
+export PACTL_DEVICE_SINK=bluez_output.12_34_56_78_9A.BC
+export PACTL_DEFAULT_SINK=$PACTL_DEVICE_SINK
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+export PACTL_LOG="$T/pactl-follow.log"; : >"$PACTL_LOG"
+export PACTL_EQ_AIM=drifted PACTL_EQ_AIM_SINK_ID=1   # the stream never stays put
+export PACTL_SUBSCRIBE_COUNT=6
+out="$(run follow)"
+# Start + 4 events = 5 passes, then the backoff; the 2 events that arrive during
+# it are drained as one pass.
+check "events during the backoff coalesce into one pass" "6" \
+  "$(grep -c 'move-sink-input 99 bluez_output.12_34_56_78_9A.BC' "$PACTL_LOG")"
+check "a stream that keeps drifting is logged" "1" "$(grep -c 'keeps drifting; backing off' <<<"$out")"
+check "each convergence move is logged" "6" "$(grep -c 'moving it to bluez_output' <<<"$out")"
+run disable >/dev/null
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG PACTL_SUBSCRIBE_COUNT
+
+echo "== routing: a vanished target adopts the sink WirePlumber chose, not listing order =="
+run disable >/dev/null
+unset PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID
+export PACTL_DEVICE_SINK=alsa_output.platform-sound.HiFi__Headphones__sink
+export PACTL_DEVICE_SINK2=audio_effect.j313-convolver
+export PACTL_DEFAULT_SINK=bluez_output.12_34_56_78_9A.BC
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+export PACTL_LOG="$T/pactl-adopt.log"; : >"$PACTL_LOG"
+export PACTL_EQ_AIM=1 PACTL_EQ_AIM_SINK_ID=3
+run retarget >/dev/null
+check "a vanished target adopts the stream's live aim" "audio_effect.j313-convolver" \
+  "$(jq -r '.targetSink' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+check "adopting the aim moves nothing" "0" "$(grep -c 'move-sink-input' "$PACTL_LOG")"
+check "the fragment names the adopted sink" "1" \
+  "$(grep -c 'target.object = "audio_effect.j313-convolver"' "$frag")"
+run disable >/dev/null
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK PACTL_DEVICE_SINK2 PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG
+
+echo "== follow: which subscribe events wake the retarget pass =="
+eval "$(sed -n '/^follow_event_wanted()/,/^}/p' "$E")"
+for ev in "Event 'change' on sink #5" "Event 'change' on sink-input #7" "Event 'new' on sink #2" \
+  "Event 'remove' on sink #2" "Event 'change' on server #0"; do
+  follow_event_wanted "$ev" && r=wake || r=ignore
+  check "wakes on: $ev" wake "$r"
+done
+follow_event_wanted "Event 'change' on client #3" && r=wake || r=ignore
+check "ignores client events" ignore "$r"
+
+echo "== routing: a vanished target gets a grace period =="
+run disable >/dev/null
+export PACTL_DEVICE_SINK=bluez_output.12_34_56_78_9A.BC.1
+export PACTL_DEFAULT_SINK=$PACTL_DEVICE_SINK
+run enable >/dev/null
+st="$XDG_STATE_HOME/omarchy-equalizer/state.json"
+export PACTL_DEVICE_SINK=alsa_output.pci-0000_00_1f.3.analog-stereo
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+export OMARCHY_EQ_VANISH_GRACE=5
+run retarget >/dev/null
+check "within the grace period the target is kept" "bluez_output.12_34_56_78_9A.BC.1" "$(jq -r '.targetSink' "$st")"
+check "the vanished target is remembered" "bluez_output.12_34_56_78_9A.BC.1" "$(jq -r '.vanishedTargetSink' "$st")"
+# The same device back under a new profile suffix is adopted without waiting.
+export PACTL_DEVICE_SINK=bluez_output.12_34_56_78_9A.BC.2
+run retarget >/dev/null
+check "a sibling profile sink is adopted at once" "bluez_output.12_34_56_78_9A.BC.2" "$(jq -r '.targetSink' "$st")"
+check "adopting it clears the vanish record" "null" "$(jq -r '.vanishedTargetSink // "null"' "$st")"
+# An unrelated device only replaces the target once the grace has run out.
+export PACTL_DEVICE_SINK=alsa_output.pci-0000_00_1f.3.analog-stereo
+run retarget >/dev/null
+check "a fresh vanish is still inside its grace" "bluez_output.12_34_56_78_9A.BC.2" "$(jq -r '.targetSink' "$st")"
+jq -c '.targetMissingSince = 1' "$st" >"$st.x" && mv "$st.x" "$st"
+run retarget >/dev/null
+check "after the grace the fallback replaces the target" "alsa_output.pci-0000_00_1f.3.analog-stereo" "$(jq -r '.targetSink' "$st")"
+check "the fallback clears the vanish record" "null" "$(jq -r '.vanishedTargetSink // "null"' "$st")"
+export OMARCHY_EQ_VANISH_GRACE=0
+run disable >/dev/null
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
 
 echo "== preset delete =="
 run save-preset ScratchPreset >/dev/null
