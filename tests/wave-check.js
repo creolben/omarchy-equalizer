@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Checks the meter's pure functions in Model.js, the numbers LevelWave.qml
-// draws: the spectrum line parser, the band-to-bar spread, the fallback bar
-// series, and the fallback beat follower. No Qt runtime needed.
+// draws: the spectrum line parser, the Lottie bar motion, and the fallback
+// beat follower. No Qt runtime needed.
 //
 // Run: node tests/wave-check.js
 
@@ -36,35 +36,27 @@ check('parse: negative or fractional is not a frame', model.parseSpectrumLine('0
 f = model.parseSpectrumLine('0 250 3');
 check('parse: values above 100 are clamped', f && f.bands[0] === 1);
 
-// spectrumBars
-const bands = [];
-for (let i = 0; i < 24; i++) bands.push(i / 23);
-for (const mirrored of [false, true]) {
-  for (const n of [1, 7, 60]) {
-    const bars = model.spectrumBars(bands, n, mirrored);
-    check('bars: count ' + n + (mirrored ? ' mirrored' : ''), bars.length === n);
-    check('bars: bounded ' + n + (mirrored ? ' mirrored' : ''), inRange(bars, 0, 1));
-  }
+// lottieBars
+const f0 = model.lottieBars(0);
+check('lottie: 34 bars', f0.length === 34);
+let allIn = true, maxSeen = 0;
+for (let fr = -50; fr < 300; fr += 0.37) {
+  const v = model.lottieBars(fr);
+  for (const x of v) { if (x < 0 || x > 1 + EPS) allIn = false; maxSeen = Math.max(maxSeen, x); }
 }
-check('bars: silence is silence', model.spectrumBars(new Array(24).fill(0), 40, false).every(v => v === 0));
-check('bars: no spectrum is silence', model.spectrumBars([], 40, true).every(v => v === 0));
-let bars = model.spectrumBars(bands, 60, false);
-check('bars: unmirrored puts bass on the left', bars[2] < bars[30] && bars[30] < bars[50]);
-bars = model.spectrumBars(bands, 60, true);
-check('bars: mirrored is symmetric', bars.every((v, i) => Math.abs(v - bars[59 - i]) < EPS));
-check('bars: mirrored puts bass in the centre', bars[30] < bars[5]);
-check('bars: count is clamped', model.spectrumBars(bands, 0, false).length === 1 &&
-  model.spectrumBars(bands, 9999, false).length === 512);
-
-// barSeries (fallback)
-for (const peak of [0, 0.3, 1]) {
-  const s = model.barSeries(peak, 1.7, 40);
-  check('fallback: bounded by peak ' + peak, inRange(s, 0, peak));
+check('lottie: heights stay in 0..1', allIn);
+check('lottie: the tallest bar reaches full height', maxSeen > 0.99, String(maxSeen));
+const p0 = model.lottieBars(17.3), p1 = model.lottieBars(17.3 + 125);
+check('lottie: loops every 125 frames', p0.every((v, i) => Math.abs(v - p1[i]) < EPS));
+let maxStep = 0;
+for (let fr = 0; fr < 125; fr += 0.05) {
+  const x = model.lottieBars(fr), y = model.lottieBars(fr + 0.05);
+  for (let i = 0; i < 34; i++) maxStep = Math.max(maxStep, Math.abs(x[i] - y[i]));
 }
-check('fallback: silent at zero', model.barSeries(0, 3, 30).every(v => v === 0));
-const a = model.barSeries(1, 0, 30), b = model.barSeries(1, 10, 30);
-check('fallback: the wrap at 10 is seamless', a.every((v, i) => Math.abs(v - b[i]) < EPS));
-check('fallback: phase moves the bars', model.barSeries(1, 0.2, 30).some((v, i) => Math.abs(v - a[i]) > 1e-3));
+check('lottie: no jumps anywhere, including the wrap', maxStep < 0.03, String(maxStep));
+// Bar 17 has scale 100 and start 0: at frame 10 it sits on key 2 (264.333).
+check('lottie: matches the source keys', Math.abs(model.lottieBars(10)[17] - 1) < EPS);
+check('lottie: bars are out of step with each other', f0.some((v, i) => i > 0 && Math.abs(v - f0[i - 1]) > 0.05));
 
 // beatStep (fallback)
 let st = [0.2, 0];

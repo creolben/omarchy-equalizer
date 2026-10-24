@@ -55,59 +55,40 @@ function parseSpectrumLine(line) {
   return { beat: nums[0], bands: nums.slice(1) }
 }
 
-// Spread a spectrum across `count` bars. Bands are interpolated with a cosine
-// ease so neighbouring bars never form a kink. Unmirrored, bass is on the left;
-// mirrored, bass is in the centre and the row is symmetric. A mild taper keeps
-// the ends a little shorter so the row has a rounded silhouette.
-function spectrumBars(bands, count, mirrored) {
-  var n = Math.round(Number(count))
-  if (!(n >= 1)) n = 1
-  if (n > 512) n = 512
-  var b = bands || []
-  var out = []
-  for (var i = 0; i < n; i++) {
-    if (b.length === 0) { out.push(0); continue }
-    var u = (i + 0.5) / n
-    var x = mirrored ? Math.abs(2 * u - 1) : u
-    var pos = x * (b.length - 1)
-    var k = Math.min(b.length - 1, Math.floor(pos)), f = pos - k
-    var a0 = clamp(Number(b[k]) || 0, 0, 1)
-    var a1 = clamp(Number(b[Math.min(b.length - 1, k + 1)]) || 0, 0, 1)
-    var v = a0 + (a1 - a0) * (1 - Math.cos(Math.PI * f)) / 2
-    var edge = mirrored ? x : Math.abs(2 * u - 1)
-    out.push(v * (1 - 0.25 * edge * edge))
-  }
-  return out
-}
+// The meter's motion, taken from the "sound wave" Lottie animation: 34 pill
+// bars, evenly spaced, that all play one 25-key height sequence (a key every 5
+// frames at 20 fps). Each bar has its own fixed height scale and its own start
+// offset, which is what makes the row look irregular rather than a travelling
+// sine. Keys are interpolated linearly, as in the source (its bezier handles
+// sit on the diagonal). The source holds its last key and jumps at its 90-frame
+// loop; here the sequence wraps from the last key back to the first over one
+// more key, so the loop is seamless.
+var LOTTIE_SEQ = [100, 237, 264.333, 247.667, 197, 29, 26, 158.5, 217, 250, 125,
+                  163.5, 100, 37, 52, 92, 50, 154, 115, 157, 98, 168, 39, 73, 27]
+var LOTTIE_SCALE = [76, 18, 55, 37, 28, 18, 27, 47, 76, 30, 57, 57, 18, 46, 32, 45, 75,
+                    100, 44, 45, 55, 78, 37, 28, 18, 27, 47, 76, 30, 57, 57, 18, 46, 32]
+var LOTTIE_START = [-32, -32, -23, -19, -21, -35, -30, -46, -32, -40, -29, -23, -32, -14,
+                    -9, -13, -5, 0, -3, -6, -23, -5, -19, -21, -35, -30, -46, -32, -40,
+                    -29, -23, -32, -14, -9]
+var LOTTIE_BARS = 34
+var LOTTIE_FPS = 20
+var LOTTIE_PERIOD = 125              // 25 keys x 5 frames, wrapping
+var LOTTIE_MAX = 264.333
+// Bar width as a share of the bar pitch: 6 px bars on a 14.735 px pitch.
+var LOTTIE_FILL = 6 / 14.735
 
-// Fallback bar heights, for when no spectrum arrives (the helper is missing or
-// failed): a row of bars that all play one height sequence, each a little later
-// than its neighbour, scaled by the peak monitor. Heights are 0..peak.
-//
-// BAR_KEYS is that sequence (relative heights, 25 keys) and is interpolated
-// with a cosine ease so a bar never jumps between keys. `phase` runs 0..10;
-// five keys per phase unit makes ten units a whole 50 keys, two full laps, so
-// a wrap at 10 is seamless. A window shortens the outer bars.
-var BAR_KEYS = [100, 237, 264, 248, 197, 29, 26, 158, 217, 250, 125, 163, 100,
-                37, 52, 92, 50, 154, 115, 157, 98, 168, 39, 73, 27]
-function barSeries(peak, phase, count) {
-  var n = Math.round(Number(count))
-  if (!(n >= 1)) n = 1
-  if (n > 256) n = 256
-  var p = clamp(Number(peak) || 0, 0, 1)
-  var pos0 = (Number(phase) || 0) * 5
-  var len = BAR_KEYS.length
+// Heights 0..1 for every bar at animation frame `frame` (any real number).
+function lottieBars(frame) {
+  var f = Number(frame) || 0
   var out = []
-  for (var i = 0; i < n; i++) {
-    var pos = pos0 + i * 1.3
-    pos = ((pos % len) + len) % len
-    var k = Math.floor(pos)
-    var f = pos - k
-    var e = (1 - Math.cos(Math.PI * f)) / 2
-    var a = BAR_KEYS[k], b = BAR_KEYS[(k + 1) % len]
-    var u = n > 1 ? i / (n - 1) : 0.5
-    var window = 1 - 0.5 * Math.pow(2 * u - 1, 2)
-    out.push((a + (b - a) * e) / 264 * window * p)
+  for (var i = 0; i < LOTTIE_BARS; i++) {
+    var local = (f - LOTTIE_START[i]) % LOTTIE_PERIOD
+    if (local < 0) local += LOTTIE_PERIOD
+    var pos = local / 5
+    var k = Math.floor(pos), t = pos - k
+    var a = LOTTIE_SEQ[k % LOTTIE_SEQ.length]
+    var b = LOTTIE_SEQ[(k + 1) % LOTTIE_SEQ.length]
+    out.push((a + (b - a) * t) / LOTTIE_MAX * LOTTIE_SCALE[i] / 100)
   }
   return out
 }
