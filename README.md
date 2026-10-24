@@ -41,7 +41,13 @@ omarchy plugin enable io.github.creolben.equalizer
 ### Requirements
 
 - Omarchy (quickshell) with a systemd user session
-- PipeWire and `pactl` (pipewire-pulse), `jq`, `awk`, coreutils
+- PipeWire and `pactl`/`parec` (pipewire-pulse, libpulse), `jq`, `awk`,
+  coreutils and `flock` (util-linux)
+- `python3` for the panel's level meter (`bin/omarchy-equalizer-spectrum`). It
+  reads the equalizer sink's monitor -- the audio being played -- through `parec`,
+  turns it into 24 band levels in memory and prints them to the panel; it writes
+  no files, uses no network, and runs only while the panel is open and the
+  equalizer is on.
 - `curl` for AutoEq import; `node` to run the test suite
 - Optional: `lsp-plugins-lv2` for the output stage. Without it the equalizer runs
   as a pure EQ and the limiter/boost controls report the stage as inactive.
