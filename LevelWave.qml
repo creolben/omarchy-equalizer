@@ -8,12 +8,19 @@ import "Model.js" as Model
 // (Model.lottieBars). That irregular stagger is the whole look; there are no
 // caps, gradients or glows.
 //
-// The music drives it rather than a fixed loop. Loudness, from the spectrum
-// helper (`bands`, 0..1 on a decibel scale) or from the peak monitor when the
-// helper is not running, sets how tall the bars swing and how fast the
-// sequence plays. A beat (`beatIn` from the helper's bass-flux detector, or
-// Model.beatStep() on the peak) kicks the bars taller and jumps the sequence
-// ahead, so the row visibly hits with the music.
+// The music drives it rather than a fixed loop, the way a professional
+// visualiser would:
+//  - Loudness (the spectrum helper's `bands`, or the peak monitor without it)
+//    sets how large the shape plays and, gently, how fast.
+//  - Each bar also follows its own part of the spectrum (Model.barEnergy): the
+//    row is mirrored, bass in the centre and treble at the edges, so a kick
+//    lifts the middle and hi-hats flicker the ends.
+//  - Every bar moves on a damped spring (Model.springStep), so changes pop with
+//    a slight overshoot and settle instead of snapping.
+//  - A beat (`beatIn`, from the helper's bass-flux detector, or
+//    Model.beatStep() on the peak) is an impulse that radiates out from the
+//    centre: the middle bars kick first and hardest, the edges a beat later and
+//    softer. Taller bars are drawn brighter, so the hit also reads as light.
 //
 // Silent: a flat dashed baseline and the frame loop stops.
 //
@@ -47,9 +54,15 @@ Item {
   // frame so the bar bindings see the change.
   property real frame: 0
   property var heights: []
-  // Smoothed loudness 0..1 and the visible beat pulse 0..1.
+  // Smoothed loudness 0..1 and a beat pulse 0..1 (for the debug overlay).
   property real loud: 0
   property real beat: 0
+  // Spring state per bar, recent beat impulses still travelling outward, and a
+  // running clock for them. Plain arrays; only `heights` is bound to.
+  property var springX: []
+  property var springV: []
+  property var hits: []
+  property real clock: 0
   // Peak fallback state.
   property real level: 0
   property real avg: 0
@@ -64,8 +77,9 @@ Item {
 
   function kick(strength) {
     beat = Math.max(beat, strength)
-    // Jump the sequence ahead a little, so a hit changes the shape at once.
-    frame += 2 + 3 * strength
+    var h = hits.slice()
+    h.push({ t: clock, s: strength })
+    hits = h
     beats++
   }
 
@@ -100,7 +114,8 @@ Item {
 
   onActiveChanged: {
     if (!active) {
-      heights = []; frame = 0; loud = 0; beat = 0; level = 0; avg = 0
+      heights = []; springX = []; springV = []; hits = []; clock = 0
+      frame = 0; loud = 0; beat = 0; level = 0; avg = 0
       live = false; settling = false
     }
   }
@@ -124,20 +139,54 @@ Item {
       root.beat *= Math.exp(-dt / 0.16)
       if (root.beat < 0.01) root.beat = 0
 
-      // The source plays at 20 fps; quiet music slows it, loud music and
-      // beats speed it up.
-      root.frame = (root.frame + dt * Model.LOTTIE_FPS * (0.55 + 0.6 * root.loud + 0.8 * root.beat))
-                   % Model.LOTTIE_PERIOD
-
+      // The shape plays at the source's 20 fps, a little slower when quiet and
+      // a little faster when loud. Beats do not touch the speed: they arrive
+      // as impulses below, so the motion never jumps.
+      root.frame = (root.frame + dt * Model.LOTTIE_FPS * (0.7 + 0.5 * root.loud)) % Model.LOTTIE_PERIOD
       var shape = Model.lottieBars(root.frame)
+      var n = shape.length
+
       // Any audible music plays the shape at most of its size, as in the
-      // source; loudness and beats push it the rest of the way.
-      var gain = root.loud > 0 ? Math.min(1, (0.45 + 0.55 * root.loud) * (1 + 0.4 * root.beat)) : 0
-      gain *= Math.min(1, root.loud / 0.08)   // fade in and out at the edges of silence
-      var hs = []
-      for (var i = 0; i < shape.length; i++) hs.push(shape[i] * gain)
-      root.heights = hs
-      root.settling = root.loud > 0.005
+      // source; loudness pushes it the rest of the way. Fades in and out at
+      // the edges of silence.
+      var gain = root.loud > 0 ? (0.45 + 0.55 * root.loud) * Math.min(1, root.loud / 0.08) : 0
+
+      var xs = root.springX.length === n ? root.springX.slice() : []
+      var vs = root.springV.length === n ? root.springV.slice() : []
+      if (xs.length !== n) { xs = []; vs = []; for (var z = 0; z < n; z++) { xs.push(0); vs.push(0) } }
+
+      var prev = root.clock
+      root.clock += dt
+      var hs = root.hits
+      var keep = []
+      var moving = root.loud > 0.005
+      var out = []
+      for (var i = 0; i < n; i++) {
+        var d = Math.abs((i / (n - 1)) * 2 - 1)        // 0 centre .. 1 edges
+        var e = Math.min(1, Model.barEnergy(root.bands, i, n) * 1.4)
+        var target = Math.min(1, shape[i] * gain * (0.75 + 0.55 * e))
+
+        // Beat impulses reach bar i after a delay that grows with its distance
+        // from the centre, and are weaker at the edges.
+        var delay = 0.14 * d
+        for (var k = 0; k < hs.length; k++) {
+          var age0 = prev - hs[k].t, age1 = root.clock - hs[k].t
+          if (age0 < delay && age1 >= delay)
+            vs[i] += hs[k].s * 16 * (1 - 0.55 * d) * (0.5 + 0.5 * root.loud)
+        }
+
+        var sv = Model.springStep(xs[i], vs[i], target, dt, 4.5, 0.5)
+        xs[i] = sv[0]; vs[i] = sv[1]
+        out.push(Math.max(0, Math.min(1, xs[i])))
+        if (Math.abs(xs[i]) > 0.003 || Math.abs(vs[i]) > 0.02) moving = true
+      }
+      for (var q = 0; q < hs.length; q++)
+        if (root.clock - hs[q].t < 0.2) keep.push(hs[q])
+      root.hits = keep
+      root.springX = xs
+      root.springV = vs
+      root.heights = out
+      root.settling = moving
     }
   }
 
@@ -175,6 +224,8 @@ Item {
     model: (root.live || root.settling) ? root.barCount : 0
     Rectangle {
       readonly property real level: index < root.heights.length ? root.heights[index] : 0
+      // Taller bars glow brighter, so a hit reads as light as well as height.
+      opacity: 0.6 + 0.4 * Math.min(1, level * 1.8)
       x: index * root.pitch + (root.pitch - width) / 2
       width: root.barWidth
       height: Math.max(width, level * root.height)

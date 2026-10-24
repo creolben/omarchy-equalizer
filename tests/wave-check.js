@@ -58,6 +58,27 @@ check('lottie: no jumps anywhere, including the wrap', maxStep < 0.03, String(ma
 check('lottie: matches the source keys', Math.abs(model.lottieBars(10)[17] - 1) < EPS);
 check('lottie: bars are out of step with each other', f0.some((v, i) => i > 0 && Math.abs(v - f0[i - 1]) > 0.05));
 
+// springStep
+let x = 0, v = 0, over = 0;
+for (let k = 0; k < 120; k++) { [x, v] = model.springStep(x, v, 1, 1 / 60, 5, 0.55); over = Math.max(over, x); }
+check('spring: settles on the target', Math.abs(x - 1) < 0.01, String(x));
+check('spring: overshoots a little, not wildly', over > 1.02 && over < 1.25, String(over));
+[x, v] = [0, 0];
+for (let k = 0; k < 10; k++) [x, v] = model.springStep(x, v, 1, 0.1, 5, 0.55);
+check('spring: stable with long frames', Math.abs(x - 1) < 0.05 && Math.abs(v) < 1, x + ' ' + v);
+[x, v] = [0.5, 0];
+[x, v] = model.springStep(x, v, 0.5, 1 / 60, 5, 0.55);
+check('spring: at rest stays at rest', x === 0.5 && v === 0);
+
+// barEnergy
+const spec = []; for (let i = 0; i < 24; i++) spec.push(i < 4 ? 1 : 0);
+check('energy: centre bars follow the bass', model.barEnergy(spec, 17, 34) > 0.9 && model.barEnergy(spec, 16, 34) > 0.9);
+check('energy: edge bars follow the treble', model.barEnergy(spec, 0, 34) === 0 && model.barEnergy(spec, 33, 34) === 0);
+check('energy: neutral without a spectrum', model.barEnergy([], 5, 34) === 0.5);
+let sym = true; for (let i = 0; i < 34; i++) if (Math.abs(model.barEnergy(bands24(), i, 34) - model.barEnergy(bands24(), 33 - i, 34)) > EPS) sym = false;
+function bands24() { const b = []; for (let i = 0; i < 24; i++) b.push(i / 23); return b; }
+check('energy: the row is mirrored', sym);
+
 // beatStep (fallback)
 let st = [0.2, 0];
 const onsets = [];

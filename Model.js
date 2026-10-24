@@ -93,6 +93,35 @@ function lottieBars(frame) {
   return out
 }
 
+// One step of a damped spring pulling `x` toward `target`, for the bars'
+// motion: a hit pops with a small overshoot and settles instead of snapping.
+// `freq` is the natural frequency in Hz, `zeta` the damping ratio (1 = no
+// overshoot). Sub-stepped, so a long frame stays stable. Returns [x, v].
+function springStep(x, v, target, dt, freq, zeta) {
+  var w = 2 * Math.PI * freq
+  var steps = Math.max(1, Math.ceil(dt / 0.004))
+  var h = dt / steps
+  for (var s = 0; s < steps; s++) {
+    v += (w * w * (target - x) - 2 * zeta * w * v) * h
+    x += v * h
+  }
+  return [x, v]
+}
+
+// Energy for bar `i` of `count`, from a spectrum laid out bass-first: the row is
+// mirrored, so the centre bars follow the bass and the outer bars the treble.
+// Returns 0..1, or 0.5 (neutral) when there is no spectrum.
+function barEnergy(bands, i, count) {
+  var b = bands || []
+  if (b.length === 0 || count < 1) return 0.5
+  var d = count > 1 ? Math.abs((i / (count - 1)) * 2 - 1) : 0
+  var pos = d * (b.length - 1)
+  var k = Math.min(b.length - 1, Math.floor(pos)), f = pos - k
+  var a0 = clamp(Number(b[k]) || 0, 0, 1)
+  var a1 = clamp(Number(b[Math.min(b.length - 1, k + 1)]) || 0, 0, 1)
+  return a0 + (a1 - a0) * f
+}
+
 // Fallback beat follower, on the peak monitor alone (the spectrum helper does
 // its own, better detection). An onset is a peak that rises clearly above its
 // own slow average *since the previous call*, judged on the rise rather than
