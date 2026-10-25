@@ -26,5 +26,5 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      - name: Run the backend, JS and offscreen QML tests
+      - name: Run the test suite
         run: bash tests/run-tests.sh
