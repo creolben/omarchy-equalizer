@@ -253,6 +253,10 @@ keys control its level, which is applied before the bands.
 bash tests/run-tests.sh     # 346 assertions, no real sink touched
 ```
 
+The same suite runs in GitHub Actions on every push to `main` and every pull
+request (`.github/workflows/tests.yml`). Its `tests` check is required to merge
+into `main` by the branch ruleset, which also blocks force-pushes and deletion.
+
 The suite also runs `tests/curve-check.js` (the response maths against
 PipeWire's own biquads) and the other `tests/*.js` checks.
 

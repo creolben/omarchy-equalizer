@@ -19,7 +19,10 @@ tmp_root="${TMPDIR:-/tmp}"
 export TMPDIR="$tmp_root"
 T="$tmp_root/omarchy-equalizer-tests.$$"
 E="$here/../bin/omarchy-equalizer"
-export PATH="$here/bin:/usr/bin:/bin"
+# Pin PATH so the stubs win, but keep the directory node lives in: a CI runner
+# installs it under the toolcache (actions/setup-node) rather than /usr/bin.
+node_bin="$(command -v node || true)"
+export PATH="$here/bin:/usr/bin:/bin${node_bin:+:$(dirname "$node_bin")}"
 export XDG_CONFIG_HOME="$T/config"
 export XDG_STATE_HOME="$T/state"
 export SYSTEMCTL_LOG="$T/systemctl.log"

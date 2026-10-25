@@ -1,0 +1,30 @@
+name: Tests
+
+# The whole suite runs against stubs on PATH and a throwaway XDG root, so it needs
+# nothing from the runner beyond bash, jq, awk, python3, flock and node.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    # This is the context the branch ruleset requires. Renaming it breaks merging.
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Run the backend, JS and offscreen QML tests
+        run: bash tests/run-tests.sh
