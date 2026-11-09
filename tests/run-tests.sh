@@ -1580,6 +1580,19 @@ check "the preset name and AutoEq query are KeyFields" "2" "$(grep -c 'KeyField 
 check "the frequency and Q fields are KeyFields" "2" "$(grep -c 'KeyField {' "$here/../ParametricBandRow.qml")"
 check "the band row needs no Qt Quick Controls" "0" "$(grep -c '^import QtQuick.Controls' "$here/../ParametricBandRow.qml")"
 
+echo "== the real graph, measured (tests/dsp-check.sh) =="
+# A private PipeWire runs the generated graph with the real plugins and the result
+# is measured against Model.js. It needs the real pw-* tools, so it runs on a PATH
+# without this suite's stubs (it brings its own systemctl and pactl stubs). A
+# machine without PipeWire, like the CI runner, SKIPs it.
+dsp_out="$(PATH="/usr/bin:/bin${node_bin:+:$(dirname "$node_bin")}" bash "$here/dsp-check.sh" 2>&1)"; rc=$?
+if grep -q '^SKIP  dsp-check' <<<"$dsp_out"; then
+  grep '^SKIP' <<<"$dsp_out"
+else
+  grep -E '^(FAIL|SKIP)|^dsp-check:' <<<"$dsp_out" | sed 's/^/      /'
+  check "the real graph measures as Model.js draws it" "0" "$rc"
+fi
+
 echo "== offscreen QML tests (key fields, response curve) =="
 qmltestrunner=""
 [[ -x /usr/lib/qt6/bin/qmltestrunner ]] && qmltestrunner=/usr/lib/qt6/bin/qmltestrunner

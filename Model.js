@@ -186,6 +186,9 @@ function formatGain(db) {
   return (n > 0 ? "+" : "") + n.toFixed(1);
 }
 
+// The steepest pass filter: four cascaded stages, 48 dB/octave.
+var MAX_SLOPE = 4;
+
 // The type names the backend understands, paired with what to show.
 var bandTypes = [
   { value: "peaking", label: "Peaking" },
@@ -207,6 +210,42 @@ function typeHasGain(type) {
     && t !== "notch" && t !== "allpass";
 }
 
+// The band row's type picker: every type once, and the two pass filters once per
+// slope, so a steeper corner is one pick rather than a second control. The value
+// is "type" or "type:slope".
+var bandTypeOptions = (function () {
+  var out = []
+  for (var i = 0; i < bandTypes.length; i++) {
+    var t = bandTypes[i]
+    if (typeHasSlope(t.value)) {
+      for (var n = 1; n <= MAX_SLOPE; n++)
+        out.push({ value: n === 1 ? t.value : t.value + ":" + n, label: t.label + " " + (12 * n) })
+    } else {
+      out.push(t)
+    }
+  }
+  return out
+})();
+
+function typeOptionValue(type, slope) {
+  var t = String(type || "peaking")
+  var n = typeHasSlope(t) ? Math.max(1, Math.min(MAX_SLOPE, Math.round(Number(slope) || 1))) : 1
+  return n === 1 ? t : t + ":" + n
+}
+
+function parseTypeOption(value) {
+  var parts = String(value || "peaking").split(":")
+  var n = parts.length > 1 ? Math.round(Number(parts[1]) || 1) : 1
+  return { type: parts[0], slope: typeHasSlope(parts[0]) ? Math.max(1, Math.min(MAX_SLOPE, n)) : 1 }
+}
+
+// The balance as it reads on a mixer: centre, or how far toward one side.
+function formatBalance(b) {
+  var n = Math.round((Number(b) || 0) * 100)
+  if (n === 0) return "C"
+  return (n < 0 ? "L " : "R ") + Math.abs(n)
+}
+
 function typeLabel(type) {
   for (var i = 0; i < bandTypes.length; i++)
     if (bandTypes[i].value === String(type)) return bandTypes[i].label;
@@ -226,8 +265,7 @@ function bandEnabled(b) {
 }
 
 // The slope a band is run at: 1..4, i.e. 12..48 dB/octave for a pass filter, and
-// always 1 for every other type.
-var MAX_SLOPE = 4;
+// always 1 for every other type (MAX_SLOPE is defined with the type list).
 function bandSlope(b) {
   if (!b || !typeHasSlope(b.type)) return 1;
   var n = Math.round(Number(b.slope) || 1);

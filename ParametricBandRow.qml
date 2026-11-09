@@ -9,7 +9,10 @@ import "Model.js" as Model
 //
 // The row is a card: a numbered badge, then type, gain, frequency, Q, then the
 // removal. The number matches the band's handle on the response curve, which is
-// what ties the list to the drawing.
+// what ties the list to the drawing. The badge is also the band's switch: a
+// click bypasses the band (it keeps its values and shapes nothing), a right-click
+// solos it -- one band alone, to hear what it does -- so the row needs no extra
+// width for either.
 //
 // The text fields commit on Enter or on focus loss, never per keystroke: each
 // commit crosses a process boundary into the backend, and a rebuild of the
@@ -23,6 +26,9 @@ Item {
   property real bandFreq: 1000
   property real bandQ: 1.0
   property string bandType: "peaking"
+  property bool bandEnabled: true
+  property int bandSlope: 1
+  property bool soloed: false
 
   property QtObject bar: null
   // Wheel scroll passthrough for this row's gain slider, injected by the panel.
@@ -37,7 +43,10 @@ Item {
   signal gainCommitted(real gain)
   signal freqCommitted(real freq)
   signal qCommitted(real q)
+  // The picker's value: a type, or "type:slope" for a steeper pass filter.
   signal typeChanged(string type)
+  signal enabledToggled(bool enabled)
+  signal soloToggled()
   signal removeRequested()
 
   // The row's own copy of the gain, so the readout tracks the slider during a
@@ -50,6 +59,9 @@ Item {
 
   implicitHeight: Math.max(root.fieldHeight, removeButton.implicitHeight) + Style.space(10)
   opacity: enabled ? 1.0 : 0.6
+  // A bypassed band's controls stay usable (that is how it is tuned before it is
+  // switched back on) but read as out of the chain.
+  readonly property real controlsOpacity: bandEnabled ? 1.0 : 0.45
 
   function rgba(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
@@ -93,13 +105,15 @@ Item {
     acceptedButtons: Qt.NoButton
   }
 
-  // ---- index badge ----
+  // ---- index badge: click bypasses, right-click solos ----
   BorderSurface {
     id: badge
     width: root.badgeSize
     height: root.badgeSize
     radius: root.badgeSize / 2
-    color: root.rgba(root.foreground, 0.10)
+    color: root.soloed ? root.accent
+      : root.bandEnabled ? root.rgba(root.foreground, badgeMouse.containsMouse ? 0.22 : 0.10)
+      : "transparent"
     borderSpec: Border.controlSpec("normal", root.foreground, root.accent)
     anchors.left: parent.left
     anchors.leftMargin: Style.space(10)
@@ -108,12 +122,34 @@ Item {
     Text {
       textFormat: Text.PlainText
       text: String(root.bandIndex + 1)
-      color: root.foreground
-      opacity: 0.85
+      color: root.soloed ? root.background : root.foreground
+      opacity: root.bandEnabled ? 0.85 : 0.4
       font.family: root.bar ? root.bar.fontFamily : Style.font.family
       font.pixelSize: Style.font.caption
       font.bold: true
+      font.strikeout: !root.bandEnabled
       anchors.centerIn: parent
+    }
+
+    MouseArea {
+      id: badgeMouse
+      anchors.fill: parent
+      anchors.margins: -Style.space(3)
+      hoverEnabled: true
+      acceptedButtons: Qt.LeftButton | Qt.RightButton
+      cursorShape: Qt.PointingHandCursor
+      onClicked: function(mouse) {
+        if (mouse.button === Qt.RightButton) root.soloToggled()
+        else root.enabledToggled(!root.bandEnabled)
+      }
+    }
+
+    PanelToolTip {
+      visible: badgeMouse.containsMouse
+      text: (root.bandEnabled ? "Click to bypass band " : "Click to switch band ") + (root.bandIndex + 1)
+        + (root.bandEnabled ? "" : " back on")
+        + (root.soloed ? " \u00b7 right-click to stop soloing" : " \u00b7 right-click to hear it alone")
+      fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
     }
   }
 
@@ -122,8 +158,9 @@ Item {
     id: typeDropdown
     width: Style.space(114)
     showLabel: false
-    value: root.bandType
-    options: Model.bandTypes
+    opacity: root.controlsOpacity
+    value: Model.typeOptionValue(root.bandType, root.bandSlope)
+    options: Model.bandTypeOptions
     foreground: root.foreground
     background: root.background
     anchors.left: badge.right
@@ -151,7 +188,7 @@ Item {
       maximum: 12
       step: 0.5
       value: root.bandGain
-      opacity: root.showGain ? 1.0 : 0.3
+      opacity: (root.showGain ? 1.0 : 0.3) * root.controlsOpacity
       enabled: root.showGain
       scrollBy: root.scrollBy
       onMoved: function(v) { root.liveGain = v; root.gainChanged(v) }

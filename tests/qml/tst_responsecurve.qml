@@ -117,6 +117,24 @@ Item {
       compare(curve.dragIndex, -1)
     }
 
+    function test_bypassedBandHasNoHandle() {
+      // A bypassed band shapes nothing, so it has nothing to grab or select.
+      var saved = curve.bands
+      var bands = []
+      for (var i = 0; i < saved.length; i++) {
+        var b = {}
+        for (var k in saved[i]) b[k] = saved[i][k]
+        if (i === 3) b.enabled = false
+        bands.push(b)
+      }
+      curve.bands = bands
+      verify(curve.hasHandle(2), "an enabled band keeps its handle")
+      verify(!curve.hasHandle(3), "a bypassed band has none")
+      compare(curve.nearestBand(curve.handleXFor(3), curve.handleYFor(3)) === 3, false,
+        "a press on where it would be picks another band or none")
+      curve.bands = saved
+    }
+
     function test_keyboardSelectsNudgesAndResets() {
       // A press on empty plot focuses the curve and selects the first handle.
       mouseClick(curve, curve.xFor(700), curve.yFor(-15))

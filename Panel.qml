@@ -71,6 +71,29 @@ Panel {
   readonly property string limiter: status ? String(status.limiter || "on") : "on"
   readonly property string boost: status ? String(status.boost || "off") : "off"
   readonly property bool outputStage: status ? status.outputStage === true : false
+  readonly property string leveler: status ? String(status.leveler || "off") : "off"
+  // Channel handling ahead of the bands, and the balance (-1 left .. 1 right).
+  readonly property string channels: status ? String(status.channels || "stereo") : "stereo"
+  readonly property real balance: status ? (Number(status.balance) || 0) : 0
+  // Automatic headroom cuts the whole signal by the curve's peak at full volume;
+  // below full volume the backend gives that cut back as far as the volume
+  // allows (the relief). The bands are heard under preamp + relief.
+  readonly property real relief: status ? (Number(status.relief) || 0) : 0
+  readonly property real appliedPreamp: preamp + relief
+  // The A/B (Flat at the curve's loudness) or a solo, while one is in force.
+  readonly property var listen: status ? (status.listen || null) : null
+  readonly property bool comparing: !!listen && listen.mode === "flat"
+  readonly property int soloIndex: (!!listen && listen.mode === "solo") ? Number(listen.band) : -1
+  // The pool's 16 filter slots: a steeper pass filter takes one per 12 dB/oct.
+  readonly property int slotsUsed: status ? Number(status.slots || 0) : 0
+  readonly property int maxSlots: status ? Number(status.maxSlots || 16) : 16
+  // Each output device keeps its own curve.
+  readonly property bool deviceMemory: status ? status.deviceMemory !== "off" : true
+  readonly property string deviceLabel: status ? String(status.deviceLabel || status.targetSink || "") : ""
+  readonly property var rememberedDevices: status ? (status.devices || []) : []
+  // Apps playing now, and the ones kept off the equalizer.
+  readonly property var apps: status ? (status.apps || []) : []
+  readonly property var excludedApps: status ? (status.excludedApps || []) : []
   // The rate the graph instantiates the biquads with, reported by the backend:
   // the curve's frequency axis depends on it.
   readonly property int sampleRate: status ? Number(status.sampleRate || 48000) : 48000
@@ -96,16 +119,24 @@ Panel {
   // which is what a preamp stacked above the curve's own headroom looks like.
   readonly property real limiterWarnDb: 2
   readonly property real limiterDucking: Math.max(0, postPreampPeak + 1)
+  // How loud the curve plays against Flat at the same volume: its level (the
+  // pink/A-weighted blend the presets are level-matched on) under the preamp it
+  // is heard with. A big boost reads as what it costs everything else.
+  readonly property real levelVsFlat: metrics.levelDb + appliedPreamp
   readonly property string peakSummary: {
     if (!status) return ""
     if (!enabled) return "BYPASSED"
+    if (comparing) return "A/B \u00b7 FLAT AT THE CURVE'S LOUDNESS"
+    if (soloIndex >= 0) return "SOLO \u00b7 BAND " + (soloIndex + 1)
     var peak = metrics
     var text
     // The preamp has its own row now, so the header reports the curve's shape
     // and the limiter warning only: the line has to share width with the mode
     // control.
     if (peak.peakDb <= 0.05) text = "NO BOOST"
-    else text = "+" + peak.peakDb.toFixed(1) + " dB PEAK AT " + Model.formatFreq(peak.peakFreq) + " HZ"
+    else text = "+" + peak.peakDb.toFixed(1) + " dB AT " + Model.formatFreq(peak.peakFreq) + " HZ"
+    if (Math.abs(levelVsFlat) >= 0.05)
+      text += " \u00b7 " + Model.formatGain(levelVsFlat) + " dB VS FLAT"
     if (limiter === "on" && limiterDucking >= limiterWarnDb)
       text += " \u00b7 LIMITER \u2212" + limiterDucking.toFixed(1) + " dB"
     return text
@@ -169,6 +200,8 @@ Panel {
   readonly property string summary: {
     if (!status) return "READING STATE"
     if (!enabled) return "BYPASSED"
+    if (comparing) return "A/B \u00b7 HEARING FLAT"
+    if (soloIndex >= 0) return "SOLO \u00b7 BAND " + (soloIndex + 1)
     // Mode lives once, on the response console's top line. The hero says what
     // is being shaped and how much, not which control chose the band set.
     var shaped = metrics.shapedCount
@@ -289,6 +322,7 @@ Panel {
     var name = String(args[0] || "")
     if (name === "set-gain" || name === "set-preamp")
       return name + ":" + String(args[1] || "")
+    if (name === "set-balance") return name
     // A band's freq and its Q are different edits: only the same property of
     // the same band may replace a queued one.
     if (name === "set-band")
@@ -375,6 +409,74 @@ Panel {
   }
   function setLimiter(value) { withStatus({ limiter: value }); run(["set-limiter", value]) }
   function setBoost(value) { withStatus({ boost: value }); run(["set-boost", value]) }
+  function setLeveler(value) { withStatus({ leveler: value }); run(["set-leveler", value]) }
+  function setChannels(value) { withStatus({ channels: value }); run(["set-channels", value]) }
+  // The balance is a drag: echo every step, let the queue keep only the last.
+  function setBalance(value) {
+    var v = Math.round(Model.clamp(value, -1, 1) * 20) / 20
+    withStatus({ balance: v })
+    run(["set-balance", String(v)])
+  }
+  function setDeviceMemory(on) { withStatus({ deviceMemory: on ? "on" : "off" }); run(["set-device-memory", on ? "on" : "off"]) }
+  function setAppExcluded(name, excluded) { run([excluded ? "exclude-app" : "include-app", String(name)]) }
+  function appRows() {
+    var rows = [], seen = {}
+    for (var i = 0; i < apps.length; i++) {
+      var a = apps[i]
+      if (!a || !a.name) continue
+      seen[String(a.name).toLowerCase()] = true
+      if (a.binary) seen[String(a.binary).toLowerCase()] = true
+      rows.push({ name: String(a.name), excluded: a.excluded === true, playing: true })
+    }
+    for (var k = 0; k < excludedApps.length; k++) {
+      var n = String(excludedApps[k])
+      if (seen[n.toLowerCase()]) continue
+      rows.push({ name: n, excluded: true, playing: false })
+    }
+    return rows
+  }
+
+  // The A/B: Flat at the curve's own loudness, so the comparison is the tone
+  // and not the volume (the louder side always sounds better).
+  function toggleCompare() {
+    var on = !comparing
+    withStatus({ listen: on ? { mode: "flat" } : null })
+    run(["compare", on ? "on" : "off"])
+  }
+  function toggleSolo(index) {
+    var off = soloIndex === index
+    withStatus({ listen: off ? null : { mode: "solo", band: index } })
+    run(["solo", off ? "off" : String(index)])
+  }
+
+  // A band's bypass and slope. The echo keeps every other field of the band, so
+  // the curve redraws without the band (or with its new slope) at once.
+  function setBandField(index, key, value) {
+    var next = bands.slice()
+    if (next[index]) {
+      var b = {}
+      for (var k in next[index]) b[k] = next[index][k]
+      b[key] = value
+      next[index] = b
+      withStatus({ bands: next })
+    }
+  }
+  function setBandEnabled(index, on) {
+    setBandField(index, "enabled", on)
+    run(["set-band", String(index), "enabled", on ? "on" : "off"])
+  }
+  function setBandType(index, value) {
+    var parsed = Model.parseTypeOption(value)
+    var band = bands[index] || {}
+    if (String(band.type || "peaking") !== parsed.type) {
+      setBandField(index, "type", parsed.type)
+      run(["set-band", String(index), "type", parsed.type])
+    }
+    if (Model.typeHasSlope(parsed.type) && Model.bandSlope(band) !== parsed.slope) {
+      setBandField(index, "slope", parsed.slope)
+      run(["set-band", String(index), "slope", String(parsed.slope)])
+    }
+  }
 
   function searchAutoEq() {
     var query = String(autoeqQuery || "").trim()
@@ -469,12 +571,10 @@ Panel {
     // broken on a fast drag.
     var next = bands.slice()
     if (next[index]) {
-      next[index] = {
-        type: next[index].type,
-        freq: next[index].freq,
-        q: next[index].q,
-        gain: Model.clamp(gain, -12, 12)
-      }
+      var echo = {}
+      for (var k in next[index]) echo[k] = next[index][k]
+      echo.gain = Model.clamp(gain, -12, 12)
+      next[index] = echo
     }
     withStatus({ bands: next })
     run(["set-gain", String(index), String(Model.clamp(gain, -12, 12))])
@@ -789,6 +889,7 @@ Panel {
         if (t === "e" || t === "E") root.toggleEnabled()
         else if (t === "m" || t === "M") root.setMode(root.mode === "graphic" ? "parametric" : "graphic")
         else if (t === "r" || t === "R") root.resetBands()
+        else if (t === "a" || t === "A") root.toggleCompare()
       }
       // The card is a fixed band and a tabbed one. The fixed band (hero,
       // meter, presets) never moves; the pages -- response console, band
@@ -1144,9 +1245,28 @@ Panel {
                   font.bold: true
                   elide: Text.ElideRight
                   anchors.left: parent.left
-                  anchors.right: modeGroup.left
-                  anchors.rightMargin: Style.space(10)
+                  anchors.right: compareButton.left
+                  anchors.rightMargin: Style.space(8)
                   anchors.verticalCenter: parent.verticalCenter
+                }
+
+                // The A/B: the bands out, at the curve's own loudness, so what is
+                // compared is the tone -- the louder side always sounds better.
+                Button {
+                  id: compareButton
+                  text: "A/B"
+                  bordered: true
+                  selected: root.comparing
+                  foreground: root.comparing ? Color.accent : root.barForeground
+                  enabled: root.enabled && !root.busy
+                  height: modeGroup.height
+                  anchors.right: modeGroup.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  tooltipText: root.comparing
+                    ? "Hearing Flat at the curve's loudness \u00b7 click (a) to hear the curve"
+                    : "Compare with Flat at the same loudness (a)"
+                  onClicked: root.toggleCompare()
                 }
 
                 // The caption that used to sit under the control is the
@@ -1256,7 +1376,7 @@ Panel {
                 Text {
                   id: preampValue
                   textFormat: Text.PlainText
-                  text: (root.preamp > 0 ? "+" : "") + Number(root.preamp).toFixed(1) + " dB"
+                  text: (root.appliedPreamp > 0 ? "+" : "") + Number(root.appliedPreamp).toFixed(1) + " dB"
                   color: root.barForeground
                   font.family: root.barFontFamily
                   font.pixelSize: Style.font.caption
@@ -1289,6 +1409,18 @@ Panel {
               // The one line the old three-line caption keeps, and only when it
               // matters: a manual preamp no longer follows the curve, which is
               // easy to miss after a drag switched automatic headroom off.
+              Text {
+                visible: root.headroom === "auto" && root.relief >= 0.05
+                width: parent.width
+                textFormat: Text.PlainText
+                text: Number(root.preamp).toFixed(1) + " dB at full volume \u00b7 "
+                  + Number(root.relief).toFixed(1) + " dB of it given back at this volume, so the boost plays as a boost."
+                color: Qt.darker(root.barForeground, 1.6)
+                font.family: root.barFontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+
               Text {
                 visible: root.headroom === "manual"
                 width: parent.width
@@ -1330,6 +1462,9 @@ Panel {
                   bandFreq: band ? (Number(band.freq) || 1000) : 1000
                   bandQ: band ? (Number(band.q) || 1.0) : 1.0
                   bandType: band ? String(band.type || "peaking") : "peaking"
+                  bandEnabled: band ? band.enabled !== false : true
+                  bandSlope: band ? Model.bandSlope(band) : 1
+                  soloed: root.soloIndex === index
                   bandIndex: index
                   foreground: root.barForeground
                   bar: root.bar
@@ -1339,44 +1474,191 @@ Panel {
                   onGainCommitted: function(g) { root.sendBandNow(index, g); }
                   onFreqCommitted: function(f) { root.setBandProperty(index, "freq", f); }
                   onQCommitted: function(q) { root.setBandProperty(index, "q", q); }
-                  onTypeChanged: function(t) { root.setBandProperty(index, "type", t); }
+                  onTypeChanged: function(t) { root.setBandType(index, t); }
+                  onEnabledToggled: function(on) { root.setBandEnabled(index, on); }
+                  onSoloToggled: root.toggleSolo(index)
                   onRemoveRequested: root.removeBand(index)
                 }
               }
 
-              Button {
-                text: "Add band"
-                iconText: "󰐕"
-                bordered: true
-                selected: true
-                foreground: root.barForeground
-                onClicked: root.addBand()
+              // The pool's slot budget, next to the control that spends it: a
+              // steeper pass filter takes one slot per 12 dB/octave.
+              Item {
+                width: parent.width
+                implicitHeight: addBandButton.implicitHeight
+
+                Button {
+                  id: addBandButton
+                  text: "Add band"
+                  iconText: "󰐕"
+                  bordered: true
+                  selected: true
+                  foreground: root.barForeground
+                  enabled: root.slotsUsed < root.maxSlots
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  onClicked: root.addBand()
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.slotsUsed + " of " + root.maxSlots + " filter slots"
+                  color: Qt.darker(root.barForeground, 1.6)
+                  font.family: root.barFontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                }
               }
             }
 
 
             // ---------- Output ----------
-            // The output stage, set-and-forget: a brickwall limiter last in
-            // the chain so nothing after it can clip, and Magic Boost, a
-            // compressor with makeup gain for quiet material. Both always sit
-            // in the graph and are switched by their enabled controls, so
-            // neither ever restarts the chain. Dimmed rather than hidden when
+            // Everything after the bands, set and forget. The stage (limiter,
+            // dynamics, leveler) is LSP's and is dimmed rather than hidden when
             // LSP is missing: the state is real even when the plugins are not
-            // there to act on it.
+            // there to act on it. Channels, device curves and app exclusions
+            // work either way. Every one of them is a live write -- nothing on
+            // this page restarts the chain.
             Column {
               visible: root.activeTab === "output"
               width: parent.width
               spacing: Style.space(8)
-              opacity: root.outputStage ? (root.enabled ? 1.0 : 0.5) : 0.4
+              opacity: root.enabled ? 1.0 : 0.6
+
+              Column {
+                width: parent.width
+                spacing: Style.space(8)
+                opacity: root.outputStage ? 1.0 : 0.5
+
+                Item {
+                  width: parent.width
+                  implicitHeight: Math.max(limiterLabel.implicitHeight, limiterSwitch.implicitHeight)
+
+                  Text {
+                    id: limiterLabel
+                    textFormat: Text.PlainText
+                    text: "Limiter · −1 dB ceiling, both channels together"
+                    color: root.barForeground
+                    font.family: root.barFontFamily
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                    anchors.left: parent.left
+                    anchors.right: limiterSwitch.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  PowerSwitch {
+                    id: limiterSwitch
+                    checked: root.limiter === "on"
+                    busy: root.busy
+                    foreground: root.barForeground
+                    accent: Color.accent
+                    background: root.bar ? root.bar.background : Color.background
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    onToggled: root.setLimiter(root.limiter === "on" ? "off" : "on")
+
+                    PanelToolTip {
+                      visible: limiterSwitch.containsMouse
+                      text: root.limiter === "on" ? "Turn the output limiter off" : "Catch peaks before they clip"
+                      fontFamily: root.barFontFamily
+                    }
+                  }
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "Dynamics"
+                  color: root.barForeground
+                  font.family: root.barFontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                // Three strengths of a music boost, and two characters.
+                SegmentedControl {
+                  id: boostGroup
+                  width: parent.width
+                  fontSize: Style.font.caption
+                  cellWidthOverride: (panel.contentWidth - panel.padding * 2 - boostGroup.padding * 2) / 6
+                  options: [
+                    { value: "off", label: "Off" },
+                    { value: "low", label: "Low" },
+                    { value: "medium", label: "Med" },
+                    { value: "high", label: "High" },
+                    { value: "night", label: "Night" },
+                    { value: "voice", label: "Voice" }
+                  ]
+                  value: root.boost
+                  foreground: root.barForeground
+                  accent: Color.accent
+                  background: root.bar ? root.bar.background : Color.background
+                  onChanged: function(v) { root.setBoost(v) }
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: !root.outputStage ? "LSP plugins are not installed; the output stage is inactive."
+                    : root.boost === "night" ? "For film and TV at a low volume: quiet dialogue comes up, explosions are held down."
+                    : root.boost === "voice" ? "For speech and calls: the voice is levelled, the bass is left alone so rumble cannot pump it."
+                    : root.boost === "off" ? "Off: the bands, and nothing else, shape the sound."
+                    : "Lifts quiet passages and holds loud ones, in three bands so the bass cannot pump the rest."
+                  color: Qt.darker(root.barForeground, 1.6)
+                  font.family: root.barFontFamily
+                  font.pixelSize: Style.font.caption
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                }
+
+                Item {
+                  width: parent.width
+                  implicitHeight: Math.max(levelerLabel.implicitHeight, levelerSwitch.implicitHeight)
+
+                  Text {
+                    id: levelerLabel
+                    textFormat: Text.PlainText
+                    text: "Leveler · one loudness for every source"
+                    color: root.barForeground
+                    font.family: root.barFontFamily
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                    anchors.left: parent.left
+                    anchors.right: levelerSwitch.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  PowerSwitch {
+                    id: levelerSwitch
+                    checked: root.leveler === "on"
+                    busy: root.busy
+                    foreground: root.barForeground
+                    accent: Color.accent
+                    background: root.bar ? root.bar.background : Color.background
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    onToggled: root.setLeveler(root.leveler === "on" ? "off" : "on")
+
+                    PanelToolTip {
+                      visible: levelerSwitch.containsMouse
+                      text: "A quiet podcast up, a loud master down, before the volume: the volume sets how loud normal is"
+                      fontFamily: root.barFontFamily
+                    }
+                  }
+                }
+              }
+
+              PanelSeparator { foreground: root.barForeground }
 
               Item {
                 width: parent.width
-                implicitHeight: Math.max(limiterLabel.implicitHeight, limiterSwitch.implicitHeight)
+                implicitHeight: Math.max(channelsLabel.implicitHeight, channelsGroup.implicitHeight)
 
                 Text {
-                  id: limiterLabel
+                  id: channelsLabel
                   textFormat: Text.PlainText
-                  text: "Limiter \u00b7 \u22121 dB ceiling"
+                  text: "Channels"
                   color: root.barForeground
                   font.family: root.barFontFamily
                   font.pixelSize: Style.font.body
@@ -1384,20 +1666,117 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
                 }
 
+                // Mono plays the whole mix in each ear -- one earbud, or one ear
+                // that hears less; swap fixes a pair worn the wrong way round.
+                SegmentedControl {
+                  id: channelsGroup
+                  fontSize: Style.font.caption
+                  options: [
+                    { value: "stereo", label: "Stereo" },
+                    { value: "mono", label: "Mono" },
+                    { value: "swap", label: "Swap L/R" }
+                  ]
+                  value: root.channels
+                  foreground: root.barForeground
+                  accent: Color.accent
+                  background: root.bar ? root.bar.background : Color.background
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  onChanged: function(v) { root.setChannels(v) }
+                }
+              }
+
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(balanceLabel.implicitHeight, balanceSlider.implicitHeight, balanceValue.implicitHeight)
+
+                Text {
+                  id: balanceLabel
+                  textFormat: Text.PlainText
+                  text: "BALANCE"
+                  color: Qt.darker(root.barForeground, 1.4)
+                  font.family: root.barFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                // The far side is turned down, never the near one up, so the
+                // balance can add no gain the headroom did not plan for.
+                HorizontalGainSlider {
+                  id: balanceSlider
+                  anchors.left: balanceLabel.right
+                  anchors.leftMargin: Style.space(8)
+                  anchors.right: balanceValue.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  bar: root.bar
+                  accent: Color.accent
+                  minimum: -1
+                  maximum: 1
+                  step: 0.05
+                  value: root.balance
+                  scrollBy: function(dy) { root.scrollByDelta(dy) }
+                  onMoved: function(v) { balanceValue.text = Model.formatBalance(v) }
+                  onReleased: function(v) { root.setBalance(v) }
+                  onRightClicked: root.setBalance(0)
+                }
+
+                Text {
+                  id: balanceValue
+                  textFormat: Text.PlainText
+                  text: Model.formatBalance(root.balance)
+                  width: Style.space(36)
+                  horizontalAlignment: Text.AlignRight
+                  color: root.barForeground
+                  font.family: root.barFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+              }
+
+              PanelSeparator { foreground: root.barForeground }
+
+              // Each output device keeps its own curve: an AutoEq correction for
+              // a pair of earbuds stays with the earbuds, and the speakers get
+              // their own back when the earbuds go in their case.
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(deviceLabelText.implicitHeight, deviceSwitch.implicitHeight)
+
+                Text {
+                  id: deviceLabelText
+                  textFormat: Text.PlainText
+                  text: "A curve per output device"
+                  color: root.barForeground
+                  font.family: root.barFontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                  anchors.left: parent.left
+                  anchors.right: deviceSwitch.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
                 PowerSwitch {
-                  id: limiterSwitch
-                  checked: root.limiter === "on"
+                  id: deviceSwitch
+                  checked: root.deviceMemory
                   busy: root.busy
                   foreground: root.barForeground
                   accent: Color.accent
                   background: root.bar ? root.bar.background : Color.background
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
-                  onToggled: root.setLimiter(root.limiter === "on" ? "off" : "on")
+                  onToggled: root.setDeviceMemory(!root.deviceMemory)
 
                   PanelToolTip {
-                    visible: limiterSwitch.containsMouse
-                    text: root.limiter === "on" ? "Turn the output limiter off" : "Catch peaks before they clip"
+                    visible: deviceSwitch.containsMouse
+                    text: root.deviceMemory
+                      ? "Every output remembers the curve it last played; switching outputs switches curves"
+                      : "One curve for every output"
                     fontFamily: root.barFontFamily
                   }
                 }
@@ -1405,32 +1784,36 @@ Panel {
 
               Text {
                 textFormat: Text.PlainText
-                text: "Magic Boost"
+                visible: root.deviceLabel !== ""
+                text: "Playing into " + root.deviceLabel
+                  + (root.deviceMemory && root.rememberedDevices.length > 0
+                     ? " · " + root.rememberedDevices.length + " other output"
+                       + (root.rememberedDevices.length === 1 ? "" : "s") + " remembered"
+                     : "")
+                color: Qt.darker(root.barForeground, 1.6)
+                font.family: root.barFontFamily
+                font.pixelSize: Style.font.caption
+                width: parent.width
+                elide: Text.ElideRight
+              }
+
+              PanelSeparator { foreground: root.barForeground }
+
+              // Apps that should not be equalized -- a call, a DAW, a game with
+              // its own EQ -- play straight to the device.
+              Text {
+                textFormat: Text.PlainText
+                text: "Apps"
                 color: root.barForeground
                 font.family: root.barFontFamily
                 font.pixelSize: Style.font.body
               }
 
-              SegmentedControl {
-                id: boostGroup
-                options: [
-                  { value: "off", label: "Off" },
-                  { value: "low", label: "Low" },
-                  { value: "medium", label: "Medium" },
-                  { value: "high", label: "High" }
-                ]
-                value: root.boost
-                foreground: root.barForeground
-                accent: Color.accent
-                background: root.bar ? root.bar.background : Color.background
-                onChanged: function(v) { root.setBoost(v) }
-              }
-
               Text {
                 textFormat: Text.PlainText
-                text: root.outputStage
-                  ? "Boost compresses and adds makeup gain so quiet audio gets louder; the limiter keeps the peaks clean."
-                  : "LSP plugins are not installed; the output stage is inactive."
+                text: root.apps.length === 0 && root.excludedApps.length === 0
+                  ? "Nothing is playing. Apps show up here while they play; switch one off to keep it off the equalizer."
+                  : "Switch an app off to play it straight to the device, without the equalizer."
                 color: Qt.darker(root.barForeground, 1.6)
                 font.family: root.barFontFamily
                 font.pixelSize: Style.font.caption
@@ -1438,6 +1821,41 @@ Panel {
                 wrapMode: Text.WordWrap
               }
 
+              Repeater {
+                model: root.appRows()
+
+                Item {
+                  required property var modelData
+                  width: parent ? parent.width : 0
+                  implicitHeight: Math.max(appName.implicitHeight, appSwitch.implicitHeight)
+
+                  Text {
+                    id: appName
+                    textFormat: Text.PlainText
+                    text: modelData.name + (modelData.playing ? "" : "  ·  not playing")
+                    color: modelData.excluded ? Qt.darker(root.barForeground, 1.4) : root.barForeground
+                    font.family: root.barFontFamily
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                    anchors.left: parent.left
+                    anchors.right: appSwitch.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  PowerSwitch {
+                    id: appSwitch
+                    checked: !modelData.excluded
+                    busy: root.busy
+                    foreground: root.barForeground
+                    accent: Color.accent
+                    background: root.bar ? root.bar.background : Color.background
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    onToggled: root.setAppExcluded(modelData.name, !modelData.excluded)
+                  }
+                }
+              }
             }
 
             // ---------- AutoEq ----------

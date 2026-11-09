@@ -141,9 +141,10 @@ Item {
   }
 
   // Pass filters have no gain, so they have no handle.
+  // A bypassed band shapes nothing, so it has nothing to drag either.
   function hasHandle(index) {
     var b = bands[index]
-    return !!b && (b.type === undefined || Model.typeHasGain(b.type))
+    return !!b && b.enabled !== false && (b.type === undefined || Model.typeHasGain(b.type))
   }
 
   // The grab radius: 18 px, but never more than half the gap between the two
@@ -550,7 +551,7 @@ Item {
     var numberSize = Math.max(8, Style.font.caption - 1)
     for (var i = 0; i < bands.length; i++) {
       var b = bands[i]
-      if (!b) continue
+      if (!b || b.enabled === false) continue
       if (b.type !== undefined && !Model.typeHasGain(b.type)) continue
       var x = handleXFor(i)
       var y = handleYFor(i)
