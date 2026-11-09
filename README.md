@@ -65,9 +65,12 @@ omarchy plugin enable io.github.creolben.equalizer
 
 Enabling makes the equalizer the default sink and moves application streams onto
 it (an excluded app goes straight to the device instead); disabling restores the
-output you had selected. While it is on, the volume keys control its level,
-which is applied inside the graph after the bands and the dynamics and before
-the limiter (see [Gain staging](#gain-staging)).
+output you had selected. The equalizer's own volume (its sink in pavucontrol,
+or `wpctl`/`pactl` on it) is applied inside the graph after the bands and the
+dynamics and before the limiter (see [Gain staging](#gain-staging)). Omarchy's
+volume keys resolve through the equalizer to the device it plays into and move
+that device's volume instead, so with them the equalizer's own volume stays at
+100%.
 
 ### Uninstall
 
@@ -284,7 +287,11 @@ application name or process binary, without case.
   limiter catches the moment between a fast volume change and the follower's
   pass. That makes the limiter its safety net: with the limiter off, or without
   LSP, the full cut stands at every volume, as it always did. Manual headroom
-  takes no relief.
+  takes no relief. The relief reads the equalizer's own volume, not the
+  device's: a device's volume may be in its hardware (Bluetooth headphones),
+  where the signal reaching it must stay under full scale whatever the volume.
+  Omarchy's volume keys move the device's volume, so with them the relief stays
+  at zero.
 - **The volume is in the graph**, after the bands and the dynamics and before the
   limiter (`capture.volumes`): the leveler and the boost always see the program
   at its own level (a leveler in front of the volume would undo every volume

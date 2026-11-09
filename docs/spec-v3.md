@@ -108,7 +108,26 @@ An independent review of the branch found these, each now covered by a test:
 - Smaller: an app excluded by its binary could not be put back by the name the
   panel shows; a manual device pick moved excluded apps onto the EQ for a moment.
 
-## 6. Live-verified, and not
+## 6. Installed on the live session (2026-11-09, 16:32)
+
+The plugin clone was switched to this branch and rebuilt once (`set-mode
+graphic`): both units restarted cleanly with no control warnings, the running
+node carries the v3 controls (mixers, the stereo pool, leveler, linked boost,
+relief, in-graph volume, linked limiter), the EQ output feeds the J313 speakers,
+and the shell hot-reloaded the plugin with no QML errors.
+
+One finding: Omarchy's volume keys (`omarchy-audio-output-volume`) resolve
+through DSP sinks, the equalizer included, to the device behind it, so the
+equalizer's own volume stays at 100% and the relief stays at zero with them. The
+relief cannot simply read the device's volume instead: a device's volume can be
+in hardware (Bluetooth), where the signal must stay under full scale. Making the
+relief work with the keys would need the device's volume to be known to be
+software (the J313 DSP sink's is) and the relief to sit after the limiter --
+a design for a later round, measured first. What does apply with the keys is the
+cleaner, linked limiter: with boost High and the equalizer at full level, it was
+limiting constantly.
+
+## 7. Live-verified, and not
 
 Verified read-only on the live session: `parec --monitor-stream` records the
 EQ's output stream (the meter now shows what is heard, after the EQ).
