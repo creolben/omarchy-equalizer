@@ -399,7 +399,7 @@ Panel {
   // One click: preamp = minus the curve's peak boost (see Model.autoPreampDb).
   readonly property real autoPreamp: metrics.autoPreamp
   // Auto headroom: the backend recomputes the preamp from the curve's peak on
-  // every edit (eqMac's peak limiter, done on the real response). Dragging the
+  // every edit (a peak limiter done on the real response). Dragging the
   // preamp hands control back to the user.
   function setHeadroom(value) {
     var echo = { headroom: value }
@@ -1438,7 +1438,7 @@ Panel {
             // Graphic: the ten faders are part of the response console, so
             // this page exists for parametric mode only -- a row per band,
             // because a band's type, frequency and Q are as much of the sound
-            // as its gain (the same four Audio Hijack's Parametric EQ block
+            // as its gain (the four controls any parametric equalizer
             // exposes).
             Column {
               id: parametricColumn
@@ -1717,16 +1717,18 @@ Panel {
                   maximum: 1
                   step: 0.05
                   value: root.balance
+                  // The readout follows the knob during a drag, then the state.
+                  property real draft: NaN
                   scrollBy: function(dy) { root.scrollByDelta(dy) }
-                  onMoved: function(v) { balanceValue.text = Model.formatBalance(v) }
-                  onReleased: function(v) { root.setBalance(v) }
-                  onRightClicked: root.setBalance(0)
+                  onMoved: function(v) { draft = v }
+                  onReleased: function(v) { draft = NaN; root.setBalance(v) }
+                  onRightClicked: { draft = NaN; root.setBalance(0) }
                 }
 
                 Text {
                   id: balanceValue
                   textFormat: Text.PlainText
-                  text: Model.formatBalance(root.balance)
+                  text: Model.formatBalance(isNaN(balanceSlider.draft) ? root.balance : balanceSlider.draft)
                   width: Style.space(36)
                   horizontalAlignment: Text.AlignRight
                   color: root.barForeground

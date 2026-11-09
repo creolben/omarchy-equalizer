@@ -202,8 +202,8 @@ var bandTypes = [
 ];
 
 // A filter without a gain control says so on the face, rather than showing a
-// slider that moves nothing -- the same courtesy Audio Hijack's block faces pay
-// when a parameter does not apply to the chosen type.
+// slider that moves nothing, when a parameter does not apply to the chosen
+// type.
 function typeHasGain(type) {
   var t = String(type || "peaking");
   return t !== "lowpass" && t !== "highpass" && t !== "bandpass"

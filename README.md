@@ -1,9 +1,12 @@
 # Equalizer
 
 An Omarchy shell plugin that puts a system-wide equalizer in front of any PipeWire
-output: a 10-band graphic EQ, up to 16 parametric bands, level-matched presets,
-AutoEq headphone import, automatic headroom, and an output stage (brickwall
-limiter plus a multiband "Magic Boost" compressor).
+output: a 10-band graphic EQ, up to 16 parametric bands (with bypass, solo and
+12–48 dB/oct pass filters), level-matched presets with a level-matched A/B,
+AutoEq headphone import, automatic headroom that gives its cut back below full
+volume, a curve per output device, and a stereo output stage (a linked brickwall
+limiter, a multiband boost with night and voice characters, and a loudness
+leveler), plus mono/swap/balance and per-app exclusions.
 
 <p align="center">
   <img src="docs/panel.png" width="430" alt="The equalizer panel: power switch and level meter, the preset picker, and the Response tab with the curve, ten faders and the preamp">
@@ -12,8 +15,8 @@ limiter plus a multiband "Magic Boost" compressor).
 The panel keeps the power switch, the level meter and the preset picker fixed at
 the top; below them a tab bar switches between **Response** (the curve, the
 10-band faders or the parametric handles, the mode switch and the preamp),
-**Bands** (one row per band, parametric mode only), **Output** (limiter and
-Magic Boost) and **AutoEq**.
+**Bands** (one row per band, parametric mode only), **Output** (limiter,
+dynamics, leveler, channels, device curves and apps) and **AutoEq**.
 
 Everything is driven from the panel; the same operations are available from the
 command line.
@@ -44,22 +47,27 @@ omarchy plugin enable io.github.creolben.equalizer
 - PipeWire and `pactl`/`parec` (pipewire-pulse, libpulse), `jq`, `awk`,
   coreutils and `flock` (util-linux)
 - `python3` for the panel's level meter (`bin/omarchy-equalizer-spectrum`). It
-  reads the equalizer sink's monitor -- the audio being played -- through `parec`,
-  turns it into 24 band levels in memory and prints them to the panel; it writes
-  no files, uses no network, and runs only while the panel is open and the
-  equalizer is on.
+  reads the equalizer's own output stream -- what you hear, after every band and
+  the output stage -- through `parec --monitor-stream`, turns it into 24 band
+  levels in memory and prints them to the panel; it writes no files, uses no
+  network, and runs only while the panel is open and the equalizer is on.
 - `curl` for AutoEq import; `node` to run the test suite
-- Optional: `lsp-plugins-lv2` for the output stage. Without it the equalizer runs
-  as a pure EQ and the limiter/boost controls report the stage as inactive.
+- Optional: `lsp-plugins-lv2` for the output stage (its stereo
+  `para_equalizer_x16`, `mb_compressor`, `limiter` and `autogain` builds). Without
+  it the equalizer runs as a pure EQ on PipeWire's builtin biquads and the
+  limiter, dynamics and leveler controls report the stage as inactive; channels,
+  device curves and app exclusions still work.
 - Optional but recommended: with `lsp-plugins-lv2`, both modes run on a resident
   16-slot LSP equalizer, so every edit -- a preset of either mode, a mode switch,
-  a band's type, adding/removing bands, an AutoEq import -- is a live `pw-cli`
-  write rather than a filter-chain restart. Without it, a shape change still
-  restarts the chain (players may pause for it).
+  a band's type, slope or bypass, adding/removing bands, an AutoEq import -- is a
+  live `pw-cli` write rather than a filter-chain restart. Without it, a shape
+  change still restarts the chain (players may pause for it).
 
 Enabling makes the equalizer the default sink and moves application streams onto
-it; disabling restores the output you had selected. While it is on, the volume
-keys control its level, which is applied before the bands.
+it (an excluded app goes straight to the device instead); disabling restores the
+output you had selected. While it is on, the volume keys control its level,
+which is applied inside the graph after the bands and the dynamics and before
+the limiter (see [Gain staging](#gain-staging)).
 
 ### Uninstall
 
@@ -100,25 +108,38 @@ it if you plan to install the plugin again.
   rather than `pipewire.conf.d`, which would need a `pipewire.service` restart —
   that drops every PulseAudio client connection.
 - The graph itself is regenerated at
-  `~/.config/pipewire/omarchy-equalizer.conf.d/90-eq.conf` when the mode changes
+  `~/.config/pipewire/omarchy-equalizer.conf.d/90-eq.conf` when its shape changes
   and on enable/retarget, and is kept in step (values only) after a live edit.
+  It is one stereo layout for both band paths:
+
+  ```
+  preamp → channels (stereo/mono/swap, balance) → bands → leveler → boost
+         → relief → volume → limiter
+  ```
+
   With `lsp-plugins-lv2` the band set of either mode runs on one resident
-  16-slot `para_equalizer_x16_mono` node, so gain, frequency, Q, type, band count
-  and the mode itself are all values, written with one `pw-cli set-param`.
-  Without LSP each band is a builtin biquad: values are still live (a graphic
-  preset crossfades), but a shape change (type, count, mode) rebuilds and
-  restarts the unit, and the app streams are parked on the output device for
-  the moment that takes so players keep playing. Whether a write can be live is
-  decided from the graph actually running (the fragment it was built from), so
-  the first command after installing or removing LSP rebuilds once.
+  16-slot `para_equalizer_x16_stereo` node, so gain, frequency, Q, type, slope,
+  bypass, band count and the mode itself are all values, written with one
+  `pw-cli set-param`. Without LSP each filter stage is a pair of builtin biquads:
+  values are still live (a graphic preset crossfades), but a shape change (type,
+  slope, bypass, count, mode) rebuilds and restarts the unit, and the app streams
+  are parked on the output device for the moment that takes so players keep
+  playing. The fragment names its layout (`# Layout: v3 …`), and whether a write
+  can be live is decided from the layout the running graph was started with, so
+  the first command after an upgrade, or after installing or removing LSP,
+  rebuilds once.
 - State lives outside the plugin, in
-  `${XDG_STATE_HOME:-~/.local/state}/omarchy-equalizer/`: `state.json`,
-  `presets.json` for user presets, and a cached AutoEq index.
+  `${XDG_STATE_HOME:-~/.local/state}/omarchy-equalizer/`: `state.json` (versioned;
+  keys a version does not know pass through every edit untouched),
+  `presets.json` for user presets, the layout of the running graph, and a cached
+  AutoEq index.
 - Two user units: `omarchy-equalizer.service` (the filter-chain) and
   `omarchy-equalizer-follow.service`, which re-aims the equalizer when the output
   device changes — plugging in headphones otherwise leaves the equalizer playing
   into the old device while apps bypass it. Each pass re-validates the
-  remembered target and the aim of the EQ's own output stream against it: a
+  remembered target and the aim of the EQ's own output stream against it (and,
+  once routed, brings the device's own curve back, the volume relief up to date,
+  and excluded apps off the equalizer): a
   Bluetooth device that is switched off, sleeps, or errors out vanishes from
   pactl while the EQ stays the default sink, and a live `pactl move` pins
   nothing, so WirePlumber is free to relink the stream again — a vanished target
@@ -153,11 +174,12 @@ that goes quiet when the signal does), and the
 preset picker with its reset/delete actions. Below it a tab bar picks one page:
 **Response** (the curve, the faders in 10-band mode, the mode control and the
 preamp row directly under them), **Bands** (one row per band, parametric mode
-only), **Output** (limiter and Magic Boost) and **AutoEq**. Every open starts on
+only), **Output** (limiter, dynamics, leveler, channels, device curves and
+apps) and **AutoEq**. Every open starts on
 Response. A page only scrolls when it is taller than the card can fit -- the
 Response page on a short (768 px) screen, or a long parametric band list.
 Errors and AutoEq feedback appear in a one-line status strip pinned at the
-bottom, which clears 8 s after the last message. The `e`, `m` and `r` shortcuts
+bottom, which clears 8 s after the last message. The `e`, `m`, `r` and `a` shortcuts
 are named in the tooltips of the power switch, the mode control and the preset
 reset.
 
@@ -172,6 +194,14 @@ a deliberate edit. The curve ignores the wheel too. Click the curve (or Tab to
 it) and the keyboard drives it: ←/→ pick a band, ↑/↓ move it 0.5 dB, `0`
 flattens it.
 
+**A/B** on the response console (or `a`) plays Flat at the curve's own loudness
+-- the bands out, the preamp set to the curve's level against Flat -- so what you
+compare is the tone, not the volume (the louder side always sounds better). The
+console's top line reads the curve's level against Flat (`−1.4 dB VS FLAT`). In
+the Bands tab, a click on a band's number bypasses it (it keeps its values and
+shapes nothing) and a right-click solos it; the type picker offers the pass
+filters at 12, 24, 36 and 48 dB/octave, and the slot budget sits beside Add band.
+
 ## Command line
 
 ```
@@ -182,27 +212,50 @@ retarget                        Re-aim the EQ at the current output device, repl
 follow                          Watch for output changes (run by systemd)
 set-mode <graphic|parametric>   Choose which band set is processed
 set-gain <index> <dB>           Set one band's gain (live, no restart)
-set-band <index> <gain|freq|q|type> <value>
-                                Set one parametric/graphic band property
-add-band                        Append a parametric band (16 max)
+set-band <index> <gain|freq|q|type|enabled|slope> <value>
+                                Set one band property; enabled on|off bypasses a
+                                band, slope 1-4 is 12-48 dB/oct (pass filters)
+add-band                        Append a parametric band (16 filter slots)
 remove-band <index>             Drop a parametric band
+compare [on|off|toggle]         A/B: hear Flat at the curve's own loudness
+solo <index|off>                Hear one band alone
 apply-preset <name>             Load a preset
 save-preset <name>              Save the current bands as a preset
 delete-preset <name>            Delete a user preset
+export-preset <name> [file]     Write a preset to a file (or stdout)
+import-preset <file> [name]     Save a preset file as a user preset
 reset                           Flatten the current mode's gains
 presets                         List preset names
 set-preamp <dB>                 Whole-chain preamp (clamped to the curve's ceiling)
 set-headroom <auto|manual>      Auto-track the preamp to the band peaks
 set-limiter <on|off>            Brickwall output limiter (live, no restart)
-set-boost <off|low|medium|high> Magic Boost compressor (live, no restart)
+set-boost <off|low|medium|high|night|voice>
+                                Dynamics: a boost strength, or a character
+set-leveler <on|off>            Bring every source to one loudness
+set-channels <stereo|mono|swap> Channel handling ahead of the bands
+set-balance <-1..1>             Left/right balance
+set-device-memory <on|off>      Give every output device its own curve
+devices                         Devices that remember a curve
+forget-device <device>          Drop a device's remembered curve
+exclude-app <name>              Keep an app off the equalizer
+include-app <name>              Put an excluded app back on it
+excluded-apps                   List the excluded apps
 autoeq-search [--json] <name>   Search AutoEq headphone profiles
 import-autoeq <name|file> [index-path]
                                 Import an AutoEq profile, saved as a preset
 ```
 
-Enabling makes the equalizer the default sink and moves application streams onto
-it; disabling restores the output you had selected. While it is on, the volume
-keys control its level, which is applied before the bands.
+Every output device keeps its own curve: leaving a device remembers the curve it
+was playing, and arriving at one brings its curve back, so an AutoEq correction
+for a pair of earbuds stays with the earbuds -- the laptop speakers get their own
+curve back the moment the earbuds go in their case, and the correction returns
+when they come out (a Bluetooth device counts as one device across its
+profiles). A device seen for the first time keeps what was playing.
+`set-device-memory off` makes it one curve everywhere.
+
+An excluded app (`exclude-app zoom`, or its switch in the Output tab) plays
+straight to the device the equalizer plays into; it is matched on its
+application name or process binary, without case.
 
 ## Gain staging
 
@@ -213,7 +266,22 @@ keys control its level, which is applied before the bands.
   the chain into an amplifier. A refused command leaves the state as it was.
 - **Automatic headroom** (`headroom: auto`) recomputes the preamp from the peak of
   the whole curve on every band, mode, preset or import change, so a boost cannot
-  clip. Moving the preamp by hand switches it to `manual`.
+  clip at full volume. Moving the preamp by hand switches it to `manual`.
+- **Volume relief.** Below full volume the volume control is already that much
+  quieter than full scale, and a full cut would only make the curve play quieter
+  than it should -- a +6 dB bass curve at half volume lost 6 dB of everything
+  else for nothing, which reads as thin and less clear. So automatic headroom
+  gives its cut back as far as the volume allows: `relief = min(cut, −volume)`,
+  floored to 0.1 dB. The loudest point of the curve still lands at full scale at
+  most, and a boost plays as a boost at every volume below the point where it
+  would clip. The relief is its own gain stage after the dynamics, so the boost
+  and the leveler see the same level at every volume; the follower keeps it in
+  step with the volume keys, and the limiter catches the moment between a fast
+  volume change and the follower's pass. Manual headroom takes no relief.
+- **The volume is in the graph**, after the bands and the dynamics and before the
+  limiter (`capture.volumes`): the leveler and the boost always see the program
+  at its own level (a leveler in front of the volume would undo every volume
+  change), and the limiter only works when what leaves the graph would clip.
 - **The ceiling** — manual headroom is not a volume control: the preamp may cut
   below the curve's own peak but never go past it, so the most gain it can hold is
   the value `auto` would have picked. The backend clamps there (with a line on
@@ -230,28 +298,64 @@ keys control its level, which is applied before the bands.
   `omarchy-audio-output-sink` do) would silently drop that correction; on an Asahi
   laptop the J313 speaker tuning is the largest single part of how the speakers
   sound.
-- **Limiter** — last node in the graph, true-peak, −1 dBFS ceiling. Switched by its
-  `enabled` control, so it never restarts the chain.
-- **Magic Boost** — `mb_compressor_mono` split into bass / mid / treble at 200 Hz
-  and 4 kHz, Off / Low / Medium / High. Compresses and adds makeup gain. A
-  single-band compressor would duck the whole spectrum on every bass hit.
+- **Limiter** — last node in the graph, true-peak, −1 dBFS ceiling, stereo-linked
+  (a peak on one side lowers both, so the image stays put). Its envelope is
+  LSP's Herm Thin with a 20 ms lookahead and attack, measured on the test rig:
+  holding a sine 3 dB over the ceiling, the old 5 ms lookahead made 13.9 % THD
+  at 30 Hz and 9.7 % at 50 Hz -- the gain moved inside every bass cycle -- where
+  20 ms makes 0.85 % and 1.1 %, with nothing measurable above 200 Hz. It costs
+  about 15 ms more latency (the graph adds 22 ms over the PipeWire quantum, which
+  players are told about, so lip-sync holds). Switched by its `enabled` control,
+  so it never restarts the chain.
+- **Dynamics** — `mb_compressor_stereo` split into bass / mid / treble at 200 Hz
+  and 4 kHz, both channels detected together from the louder. Low / Medium /
+  High boost music (compress and add makeup gain; a single-band compressor would
+  duck the whole spectrum on every bass hit); **Night** is for film and TV at a
+  low volume (quiet dialogue up, explosions held down: a 30 dB step comes out
+  12.5 dB); **Voice** levels speech and leaves the bass band nearly alone. The
+  bass band's slower attack keeps its gain from moving inside a cycle.
+- **Leveler** — `autogain_stereo`: K-weighted loudness over 2 s toward −18 LUFS,
+  at most +12 dB of lift, rising slowly and falling fast, so a quiet podcast and a
+  loud master play at one loudness and the volume sets how loud that is.
+- **Channels** — two builtin mixers ahead of the bands: stereo, mono (the whole
+  mix in each ear -- one earbud, or one ear that hears less) or swap, and a
+  balance that turns the far side down, never the near one up.
 - **Bands are resident with LSP.** With `lsp-plugins-lv2` the bands of either
-  mode run through one `para_equalizer_x16_mono` node whose 16 slots are always
-  in the graph; unused slots are `Off`. Every edit — gain, frequency, Q, type,
-  add and remove, a preset, a mode switch — is therefore a control write, sent
-  as one `pw-cli set-param` call and never a restart, and the band count is capped
-  at 16. The node runs the plugin's `APO (DR)` mode at slope x1, whose bell, shelf
-  and pass shapes and `Q` meaning match the RBJ biquads `Model.js` draws and the
-  backend's automatic headroom assumes.
-- Both output nodes — and the band pool when LSP is installed — stay in the
+  mode run through one `para_equalizer_x16_stereo` node whose 16 slots are always
+  in the graph; unused (and bypassed) slots are `Off`. Every edit — gain,
+  frequency, Q, type, slope, bypass, add and remove, a preset, a mode switch — is
+  therefore a control write, sent as one `pw-cli set-param` call and never a
+  restart, and the set is capped at 16 filter slots. The node runs the plugin's
+  `APO (DR)` mode at slope x1, whose bell, shelf and pass shapes and `Q` meaning
+  match the RBJ biquads `Model.js` draws and the backend's automatic headroom
+  assumes -- measured, every type within 0.1 dB. That mode ignores the plugin's
+  own slope control (measured: ×2 and ×4 respond like ×1), so a steeper pass
+  filter is a cascade of slots with Butterworth stage Qs, scaled by the band's Q:
+  slope 2 at the default Q is a true 24 dB/octave Butterworth, −3 dB at the
+  corner.
+- Every output node — and the band pool when LSP is installed — stays in the
   graph permanently; only their controls move, because a graph-shape change is a
   unit restart and an audible dropout (a browser pauses its media for it).
 
 ## Tests
 
 ```sh
-bash tests/run-tests.sh     # 346 assertions, no real sink touched
+bash tests/run-tests.sh     # 472 assertions, no real sink touched
+bash tests/dsp-check.sh     # the real graph, measured (about two minutes)
 ```
+
+`tests/dsp-check.sh` (also run by the suite when PipeWire is installed) plays
+signals through the graph the backend generates, on a private headless PipeWire
+daemon with the real plugins, and measures what comes out against `Model.js`: a
+null test, every filter type and slope, bypass, a preset, the A/B, solo, the
+volume relief under the in-graph volume, mono/swap/balance, the limiter's ceiling,
+its stereo link and its bass THD, the dynamics characters, the leveler and the
+latency -- on the LSP pool and on the builtin biquads. Its daemon has no devices
+and no session manager, it uses the stub `systemctl` and `pactl`, and it refuses
+to run if the daemon it reaches shows a real device, so nothing of the running
+session is touched. Without PipeWire (the CI runner) it SKIPs. It is the test
+that found LSP's slope control does nothing in the pool's mode, so slopes are
+cascaded slots instead.
 
 The same suite runs in GitHub Actions on every push to `main` and every pull
 request (`.github/workflows/tests.yml`). Its `tests` check is required to merge
@@ -329,7 +433,9 @@ built:
   lands within about 2 dB of Flat (the old set ran 3.2–7.2 dB below it, and
   differed from *each other* by 4 dB, which made the list a loudness comparison
   instead of a tone one).
-- Anything that genuinely needs to be louder is what **Magic Boost** is for.
+- Anything that genuinely needs to be louder is what the **boost** (Output tab,
+  Dynamics) is for. Below full volume the relief gives the headroom cut back, so
+  the levels above are the full-volume worst case.
 - `tests/preset-levels.js` measures each preset's applied curve with the plugin's
   own model, at more than one graph rate, and fails if a preset drifts more than
   2.5 dB from Flat, if the set spreads more than the same, if a curve runs over
