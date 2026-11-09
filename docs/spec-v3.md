@@ -37,8 +37,10 @@ Three things, in order of how much they mattered:
   (stereo/mono/swap, balance) → bands → leveler → boost → relief → volume →
   limiter, with explicit inputs/outputs and the LSP stereo builds.
 - **Volume relief**: `relief = min(cut, −volume)`, a gain stage after the
-  dynamics. The follower keeps it in step; the limiter covers the moment between
-  a fast volume change and the next pass.
+  dynamics. The follower keeps it in step (draining an event burst for at most
+  0.5 s, so a held volume key still gets passes); the limiter covers the moment
+  between a fast volume change and the next pass, so there is no relief while
+  the limiter is off or LSP is missing.
 - **The volume in the graph** (`capture.volumes` on `vol_l/vol_r`): measured, it
   is applied after the bands and dynamics and before the limiter, and mute still
   silences.
@@ -82,7 +84,31 @@ plugins in a process of its own.
   while playing, so latency is measured instead: one recording holds the graph's
   output and its input side by side.
 
-## 5. Live-verified, and not
+## 5. Fixed in review
+
+An independent review of the branch found these, each now covered by a test:
+
+- A rebuild the follower starts restarts the follower with it (`PartOf`), so
+  streams parked on the device during it were never returned. The parked ids
+  are now written to `parked-streams` before the restart, and the next
+  follower's first pass returns them.
+- Solo computed its own headroom but played under the curve's; it now plays
+  under the smaller of the two, and a bypassed band can be soloed.
+- A preamp or headroom change during an A/B ended it in the state but left Flat
+  playing; it now writes the bands back. The fragment carries the override, so a
+  restart keeps sound and state in agreement.
+- The relief could clip without a limiter to catch a fast volume change; it now
+  needs the limiter.
+- A curve picked while the equalizer was off was filed under the old device and
+  replaced at enable by the new device's remembered curve; it is now the curve
+  the next enable plays.
+- A type change kept the old slope, which came back the next time the band was
+  a pass filter again (and could overflow the slots); a type change now resets
+  it.
+- Smaller: an app excluded by its binary could not be put back by the name the
+  panel shows; a manual device pick moved excluded apps onto the EQ for a moment.
+
+## 6. Live-verified, and not
 
 Verified read-only on the live session: `parec --monitor-stream` records the
 EQ's output stream (the meter now shows what is heard, after the EQ).

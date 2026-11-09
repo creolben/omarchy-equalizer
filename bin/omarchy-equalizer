@@ -50,6 +50,10 @@ script_path="$(readlink -f "$0")"
 sink_name=omarchy_equalizer
 state_file="$state_root/state.json"
 running_layout_file="$state_root/running-layout"
+# App streams a restart parked on the device, as a JSON array of sink-input ids.
+# A file of its own, not a state field: a command holding the state in memory
+# and writing it after the restart must not be able to drop the record.
+parked_file="$state_root/parked-streams"
 user_presets="$state_root/presets.json"
 builtin_presets="$plugin_dir/presets"
 
@@ -530,7 +534,9 @@ apply_headroom() {
   # The headroom maths below reads every band, so a bad value has to stop here,
   # before awk turns it into a silent zero or an empty state.
   need_valid_state "$state"
-  state="$(jq -c 'del(.listen)' <<<"$state")"
+  # An edit while the EQ is off is the curve wanted on whatever it plays into at
+  # the next enable -- not a curve for the device it played into last.
+  state="$(jq -c 'del(.listen) | if .enabled == true then . else .curveEditedOff = true end' <<<"$state")"
   headroom="$(jq -r '.headroom // "auto"' <<<"$state")"
   if [[ $headroom == auto ]]; then
     state="$(jq -c --argjson p "$(auto_preamp_db "$(active_bands "$state")")" '.preamp = $p' <<<"$state")"
@@ -558,6 +564,9 @@ apply_headroom() {
 #
 # so the loudest point of the curve still lands at full scale at most, and a
 # boost plays as a boost at every volume below the point where it would clip.
+# The relief lags a fast volume change by up to a follower pass, and the limiter
+# is what keeps that moment from clipping -- so there is no relief while the
+# limiter is off or LSP (and with it the limiter) is missing.
 # It is a separate gain after the dynamics (relief_l/relief_r), not a change to
 # the preamp, so the boost and the leveler see the same level at every volume.
 # Manual headroom gets none: manual means the preamp stays where it was left.
@@ -578,8 +587,8 @@ sink_volume_db() {
 relief_db() {
   local state="$1" vol="${2-}"
   [[ -n $vol ]] || vol="$(sink_volume_db)"
-  jq -r --arg v "${vol:-0}" '
-    if (.headroom // "auto") == "manual" then 0
+  jq -r --arg v "${vol:-0}" --argjson lsp "$(lsp_available && echo true || echo false)" '
+    if (.headroom // "auto") == "manual" or (.limiter // "on") == "off" or ($lsp | not) then 0
     else ((.preamp // 0) | if . < 0 then -. else 0 end) as $cut
       | ($v | tonumber? // 0) as $vol
       | ([$cut, ([0, -$vol] | max)] | min) | (. * 10 | floor) / 10
@@ -841,7 +850,7 @@ desired_layout() {
   if using_para_pool; then
     printf 'pool\n'
   else
-    printf 'biquad:%s\n' "$(stages_tsv "$(active_bands "$1")" | cut -f1 |
+    printf 'biquad:%s\n' "$(stages_tsv "$(listen_bands "$1")" | cut -f1 |
       while IFS= read -r t; do filter_label "$t"; printf ','; done)"
   fi
 }
@@ -959,9 +968,10 @@ write_fragment() {
   need_mode "$mode"
   need_sink_name "$target"
   need_valid_state "$state"
-  # The fragment always carries the curve itself, never an A/B or solo
-  # override: those are transient, and a restart must come up on the real thing.
-  bands="$(active_bands "$state")"
+  # The fragment carries what is playing, an A/B or solo included, so a restart
+  # -- one systemd makes on its own too -- comes up on the same sound the state
+  # describes. Enable clears the override, and every curve edit ends it.
+  bands="$(listen_bands "$state")"
   need_numeric_bands "$bands"
   count="$(jq 'length' <<<"$bands")"
   layout="$(desired_layout "$state")"
@@ -973,7 +983,7 @@ write_fragment() {
   local channels balance preamp relief cur_l cur_r
   channels="$(jq -r '.channels // "stereo"' <<<"$state")"
   balance="$(jq -r '.balance // 0' <<<"$state")"
-  preamp="$(jq -r '.preamp // 0' <<<"$state")"
+  preamp="$(listen_preamp "$state")"
   relief="$(jq -r '.relief // 0' <<<"$state")"
 
   {
@@ -1249,7 +1259,7 @@ listen_bands() {
     elif $l.mode == "flat" then
       (if $pool then map(.enabled = false) else map(.gain = 0) end)
     elif $l.mode == "solo" then
-      (to_entries | map(if .key == ($l.band // -1) then .value
+      (to_entries | map(if .key == ($l.band // -1) then .value + { enabled: true }
         elif $pool then .value + { enabled: false } else .value + { gain: 0 } end))
     else . end' <<<"$bands"
 }
@@ -1257,7 +1267,7 @@ listen_bands() {
 # The preamp under the override: the A/B plays Flat at the curve's loudness, so it
 # carries the level the backend computed when it was switched on.
 listen_preamp() {
-  jq -r 'if (.listen.mode // "") == "flat" then (.listen.preamp // 0) else (.preamp // 0) end' <<<"$1"
+  jq -r 'if (.listen.preamp // null) != null then .listen.preamp else (.preamp // 0) end' <<<"$1"
 }
 
 sink_exists() {
@@ -1504,6 +1514,10 @@ service_restart() {
     for id in "${parked[@]}"; do
       pactl move-sink-input "$id" "$target" >/dev/null 2>&1 || true
     done
+    # On disk before the restart: a restart the follower starts takes the
+    # follower down with it (it is PartOf the unit), so this process may never
+    # get to return them -- the next follower's first pass does instead.
+    ((${#parked[@]})) && remember_parked "${parked[@]}"
   fi
   systemctl --user restart "$unit_name" >/dev/null 2>&1
   note_running_layout
@@ -1522,18 +1536,35 @@ service_restart() {
   fi
   for _ in $(seq 1 $((${OMARCHY_EQ_RESTART_TIMEOUT:-10} * 4))); do sink_present && break; sleep 0.25; done
   if ! sink_present; then
-    # The sink did not come back in time. Remember the parked streams, so the
-    # follower's next pass returns them once systemd brings the sink up again;
-    # otherwise they would play unequalized on the device for good.
-    if ((${#parked[@]})); then
-      state="$(state_read)"
-      state="$(jq -c --argjson ids "$(printf '%s\n' "${parked[@]}" | jq -R 'tonumber? // empty' | jq -sc '.')" \
-        '.parkedStreams = ((.parkedStreams // []) + $ids | unique)' <<<"$state")"
-      state_write "$state"
-    fi
+    # The sink did not come back in time. The parked streams stay on record, so
+    # the follower's next pass returns them once systemd brings the sink up
+    # again; otherwise they would play unequalized on the device for good.
     return 1
   fi
-  ((${#parked[@]})) && return_parked_streams "${parked[@]}"
+  return_parked_file
+  return 0
+}
+
+remember_parked() { # ids...
+  local ids
+  state_dir_ensure
+  ids="$(printf '%s\n' "$@" | jq -R 'tonumber? // empty' | jq -sc '.')"
+  jq -c -n --argjson old "$(jq -c 'if type == "array" then . else [] end' "$parked_file" 2>/dev/null || echo '[]')" \
+    --argjson new "$ids" '($old + $new) | unique' >"$parked_file.tmp" && mv "$parked_file.tmp" "$parked_file"
+}
+
+# Return every stream on record, and drop the record. A 2.0 state kept them in
+# state.json; those are returned too.
+return_parked_file() {
+  local ids=() state
+  [[ -s $parked_file ]] && mapfile -t ids < <(jq -r 'if type == "array" then .[] else empty end' "$parked_file" 2>/dev/null)
+  state="$(state_read)"
+  if [[ $(jq '.parkedStreams // [] | length' <<<"$state") -gt 0 ]]; then
+    mapfile -t -O "${#ids[@]}" ids < <(jq -r '.parkedStreams[]' <<<"$state")
+    state_write "$(jq -c 'del(.parkedStreams)' <<<"$state")"
+  fi
+  ((${#ids[@]})) && return_parked_streams "${ids[@]}"
+  rm -f "$parked_file"
   return 0
 }
 
@@ -1626,13 +1657,12 @@ retarget_routing() {
   state="$(state_read)"
   [[ $(jq -r '.enabled' <<<"$state") == true ]] || return 0
   sink_present || return 0
-  # Streams a failed restart parked on the device come home once the sink is
-  # back (systemd's Restart= brings it up after service_restart gave up).
-  if [[ $(jq '.parkedStreams // [] | length' <<<"$state") -gt 0 ]]; then
-    mapfile -t parked < <(jq -r '.parkedStreams[]' <<<"$state")
-    return_parked_streams "${parked[@]}"
-    state="$(jq -c 'del(.parkedStreams)' <<<"$state")"
-    state_write "$state"
+  # Streams a restart parked on the device come home once the sink is back:
+  # systemd's Restart= brought it up after service_restart gave up, or the
+  # restart took down the follower that started it.
+  if [[ -s $parked_file || $(jq '.parkedStreams // [] | length' <<<"$state") -gt 0 ]]; then
+    return_parked_file
+    state="$(state_read)"
   fi
   default="$(current_default_sink)"
   [[ -n $default ]] || return 0
@@ -1777,7 +1807,7 @@ retarget_routing() {
   pactl set-default-sink "$sink_name" >/dev/null 2>&1
   id="$(eq_output_input_id)"
   [[ -n $id ]] && pactl move-sink-input "$id" "$target" >/dev/null 2>&1
-  move_apps_to "$sink_name"
+  move_apps_to "$sink_name" "$target"
 }
 
 # One follower pass, or a hand-run retarget: route first (where the EQ plays and
@@ -1820,9 +1850,14 @@ device_memory_pass() {
   [[ -n $target ]] || return 0
   key="$(device_key "$target")"
   active="$(jq -r '.activeDevice // ""' <<<"$state")"
-  [[ $key != "$active" ]] || return 0
-  if [[ $(jq -r '.deviceMemory // "on"' <<<"$state") == off ]]; then
-    state_write "$(jq -c --arg k "$key" '.activeDevice = $k' <<<"$state")"
+  # A curve picked while the EQ was off is what the user wants to hear now, on
+  # this device: it is neither filed under the device played before nor replaced
+  # by this one's remembered curve.
+  if [[ $key == "$active" || $(jq -r '.deviceMemory // "on"' <<<"$state") == off ||
+        $(jq -r '.curveEditedOff // false' <<<"$state") == true ]]; then
+    if [[ $key != "$active" || $(jq -r '.curveEditedOff // false' <<<"$state") == true ]]; then
+      state_write "$(jq -c --arg k "$key" '.activeDevice = $k | del(.curveEditedOff)' <<<"$state")"
+    fi
     return 0
   fi
   if [[ -n $active ]]; then
@@ -1913,7 +1948,13 @@ cmd_follow() {
   follow_pass
   pactl subscribe 2>/dev/null | while IFS= read -r line; do
     if follow_event_wanted "$line"; then
-      while IFS= read -r -t 0.4 _; do :; done
+      # Drain the burst, but for at most half a second: a held volume key is one
+      # long burst, and the relief has to keep up with it.
+      # EPOCHREALTIME in microseconds, whatever the locale's decimal mark.
+      local start="${EPOCHREALTIME//[!0-9]/}"
+      while IFS= read -r -t 0.4 _; do
+        (( ${EPOCHREALTIME//[!0-9]/} - start > 500000 )) && break
+      done
       follow_pass
     fi
   done
@@ -1958,7 +1999,9 @@ cmd_set_band() {
     gain) need_number "$value"; state="$(jq -c --arg m "$mode" --argjson i "$index" --argjson v "$value" '.[$m][$i].gain = $v' <<<"$state")" ;;
     freq) need_number "$value"; state="$(jq -c --arg m "$mode" --argjson i "$index" --argjson v "$value" '.[$m][$i].freq = $v' <<<"$state")" ;;
     q)    need_number "$value"; state="$(jq -c --arg m "$mode" --argjson i "$index" --argjson v "$value" '.[$m][$i].q = $v' <<<"$state")" ;;
-    type) state="$(jq -c --arg m "$mode" --argjson i "$index" --arg v "$value" '.[$m][$i].type = $v' <<<"$state")" ;;
+    # A new type starts at slope 1: a slope kept from a pass filter would come
+    # back unasked the next time the band became one again.
+    type) state="$(jq -c --arg m "$mode" --argjson i "$index" --arg v "$value" '.[$m][$i].type = $v | del(.[$m][$i].slope)' <<<"$state")" ;;
     # A bypassed band stays in the list, keeps its slots and its values, and
     # shapes nothing until it is switched back on.
     enabled)
@@ -2227,9 +2270,7 @@ cmd_compare() {
     printf 'Playing the curve.\n'
   fi
   state_write "$state"
-  if sink_present; then
-    if layout_live "$state"; then live_apply_bands "$state" || true; else live_apply_active "" "$state"; fi
-  fi
+  if sink_present; then live_apply_active "" "$state"; fi
 }
 
 # One band alone, to hear what it does: every other band is out (Off in the
@@ -2253,9 +2294,7 @@ cmd_solo() {
     printf 'Soloing band %s.\n' "$((value + 1))"
   fi
   state_write "$state"
-  if sink_present; then
-    if layout_live "$state"; then live_apply_bands "$state" || true; else live_apply_active "" "$state"; fi
-  fi
+  if sink_present; then live_apply_active "" "$state"; fi
 }
 
 # ---------------------------------------------------------------- preamp
@@ -2267,20 +2306,27 @@ cmd_solo() {
 # is clamped to the curve's own headroom (see apply_headroom) and the command says
 # so on stderr instead of silently storing something else.
 cmd_set_preamp() {
-  local db="${1:-0}" state ceiling
+  local db="${1:-0}" state ceiling had_listen
   need_number "$db"
   state="$(state_read)"
+  had_listen="$(jq -r '.listen != null' <<<"$state")"
   ceiling="$(preamp_ceiling_db "$(active_bands "$state")")"
   if [[ $(jq -n --argjson v "$db" --argjson c "$ceiling" '$v > $c') == true ]]; then
     clamp_warn "$db" "$ceiling"
     db="$ceiling"
   fi
   # Manual headroom takes no volume relief: the preamp is exactly what was set.
-  state="$(jq -c --argjson v "$db" '.preamp = $v | .headroom = "manual" | .relief = 0 | del(.listen)' <<<"$state")"
+  state="$(jq -c --argjson v "$db" '.preamp = $v | .headroom = "manual" | .relief = 0 | del(.listen)
+    | if .enabled == true then . else .curveEditedOff = true end' <<<"$state")"
   state_write "$state"
   # The preamp is live-only, so the fragment on disk would otherwise keep the
   # value from the last rebuild and a later restart would come up on a different
-  # chain than the one that was tuned.
+  # chain than the one that was tuned. An A/B or solo this ended needs the bands
+  # written back as well, not just the preamp.
+  if [[ $had_listen == true ]]; then
+    if sink_present; then live_apply_active "" "$state"; else sync_fragment "$state"; fi
+    return 0
+  fi
   sync_fragment "$state"
   if sink_present && ((!graph_rebuilt)); then live_apply_preamp "$state" || true; fi
 }
@@ -2289,15 +2335,20 @@ cmd_set_preamp() {
 # multiplier live; manual only stores the label and enforces the ceiling, because
 # the preamp does not move on its own.
 cmd_set_headroom() {
-  local value="${1:-}" state
+  local value="${1:-}" state had_listen
   case "$value" in
     auto | manual) ;;
     *) die "Headroom must be auto or manual." ;;
   esac
   state="$(state_read)"
+  had_listen="$(jq -r '.listen != null' <<<"$state")"
   state="$(jq -c --arg v "$value" '.headroom = $v' <<<"$state")"
   state="$(apply_headroom "$state")" || exit 1
   state_write "$state"
+  if [[ $had_listen == true ]]; then
+    if sink_present; then live_apply_active "" "$state"; else sync_fragment "$state"; fi
+    return 0
+  fi
   sync_fragment "$state"
   if sink_present && ((!graph_rebuilt)); then live_apply_preamp "$state" || true; fi
 }
@@ -2321,9 +2372,15 @@ lsp_inactive_warn() {
 
 # Store one output-stage setting and send its controls live.
 set_stage_value() { # key value params
-  local key="$1" value="$2" params="$3" state
+  local key="$1" value="$2" params="$3" state relief
   state="$(state_read)"
+  relief="$(jq -r '.relief // 0' <<<"$state")"
   state="$(jq -c --arg k "$key" --arg v "$value" '.[$k] = $v' <<<"$state")"
+  # The limiter is the relief's safety net, so switching it moves the relief.
+  state="$(with_relief "$state")"
+  if [[ $(jq -r '.relief // 0' <<<"$state") != "$relief" ]]; then
+    params+=" $(relief_params "$(jq -r '.relief // 0' <<<"$state")")"
+  fi
   state_write "$state"
   # Like the preamp, the toggle is live-only: rewrite the fragment so a restart
   # does not resurrect the value from the last graph rebuild.
@@ -2428,9 +2485,16 @@ cmd_include_app() {
   local name="${1:-}" state target
   [[ -n $name ]] || die "Name the app to put back on the equalizer."
   state="$(state_read)"
-  [[ $(jq -r --arg n "$name" '(.excludedApps // []) | map(ascii_downcase) | index($n | ascii_downcase) != null' <<<"$state") == true ]] ||
+  # The entries to drop: the name itself, or -- for an app playing now under
+  # that name -- the binary it was excluded by.
+  local drop
+  drop="$(app_stream_table | jq -R -s -c --arg n "$name" '
+    [ $n ] + [ split("\n")[] | select(length > 0) | split("\t")
+               | select((.[2] // "" | ascii_downcase) == ($n | ascii_downcase)) | .[3] // empty ]
+    | map(ascii_downcase) | unique')"
+  [[ $(jq -r --argjson d "$drop" '[(.excludedApps // [])[] | ascii_downcase | select(. as $e | $d | index($e))] | length > 0' <<<"$state") == true ]] ||
     die "'$name' is not excluded."
-  state="$(jq -c --arg n "$name" '.excludedApps = [ (.excludedApps // [])[] | select(ascii_downcase != ($n | ascii_downcase)) ]' <<<"$state")"
+  state="$(jq -c --argjson d "$drop" '.excludedApps = [ (.excludedApps // [])[] | select((ascii_downcase) as $e | ($d | index($e)) == null) ]' <<<"$state")"
   state_write "$state"
   # Its streams come back to the equalizer now, not at their next start.
   if [[ $(jq -r '.enabled' <<<"$state") == true ]] && sink_present; then

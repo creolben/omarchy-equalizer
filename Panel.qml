@@ -468,11 +468,16 @@ Panel {
   function setBandType(index, value) {
     var parsed = Model.parseTypeOption(value)
     var band = bands[index] || {}
-    if (String(band.type || "peaking") !== parsed.type) {
+    // A new type starts at slope 1 in the backend, so the slope to compare with
+    // is that one, not whatever the band held as its old type.
+    var typeChanged = String(band.type || "peaking") !== parsed.type
+    if (typeChanged) {
       setBandField(index, "type", parsed.type)
+      setBandField(index, "slope", 1)
       run(["set-band", String(index), "type", parsed.type])
     }
-    if (Model.typeHasSlope(parsed.type) && Model.bandSlope(band) !== parsed.slope) {
+    var current = typeChanged ? 1 : Model.bandSlope(band)
+    if (Model.typeHasSlope(parsed.type) && current !== parsed.slope) {
       setBandField(index, "slope", parsed.slope)
       run(["set-band", String(index), "slope", String(parsed.slope)])
     }

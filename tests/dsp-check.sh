@@ -256,6 +256,8 @@ if $have_lsp; then
   eq solo off >/dev/null
 
   echo "== volume and relief =="
+  # The relief needs the limiter as its safety net, so it is on for this part.
+  eq set-limiter on >/dev/null
   set_bands graphic "$(jq -cn '[31,62,125,250,500,1000,2000,4000,8000,16000] | map({ type: "peaking", freq: ., q: 1.41, gain: (if . == 1000 then 6 else 0 end) })')"
   timeout 5 pw-cli set-param "$eq_node" Props '{ channelVolumes = [ 0.25, 0.25 ] }' >/dev/null
   PACTL_SINK_VOLUME_DB=-12.04 eq retarget >/dev/null
@@ -265,6 +267,8 @@ if $have_lsp; then
   timeout 5 pw-cli set-param "$eq_node" Props '{ channelVolumes = [ 1.0, 1.0 ] }' >/dev/null
   PACTL_SINK_VOLUME_DB=0 eq retarget >/dev/null
   check "at full volume the whole cut stands" "-6" "$(applied)"
+  PACTL_SINK_VOLUME_DB=-12.04 eq set-limiter off >/dev/null
+  check "with the limiter off the cut stands at any volume" "-6" "$(applied)"
 
   echo "== channels =="
   set_bands graphic "$(jq -cn '[31,62,125,250,500,1000,2000,4000,8000,16000] | map({ type: "peaking", freq: ., q: 1.41, gain: 0 })')"

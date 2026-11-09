@@ -196,7 +196,10 @@ flattens it.
 
 **A/B** on the response console (or `a`) plays Flat at the curve's own loudness
 -- the bands out, the preamp set to the curve's level against Flat -- so what you
-compare is the tone, not the volume (the louder side always sounds better). The
+compare is the tone, not the volume (the louder side always sounds better). An
+A/B or a solo lasts until the next edit of the curve (a preamp change included)
+or the next enable; a restart in between keeps it, because the fragment carries
+what is playing. The
 console's top line reads the curve's level against Flat (`−1.4 dB VS FLAT`). In
 the Bands tab, a click on a band's number bypasses it (it keeps its values and
 shapes nothing) and a right-click solos it; the type picker offers the pass
@@ -250,8 +253,9 @@ was playing, and arriving at one brings its curve back, so an AutoEq correction
 for a pair of earbuds stays with the earbuds -- the laptop speakers get their own
 curve back the moment the earbuds go in their case, and the correction returns
 when they come out (a Bluetooth device counts as one device across its
-profiles). A device seen for the first time keeps what was playing.
-`set-device-memory off` makes it one curve everywhere.
+profiles). A device seen for the first time keeps what was playing, and a
+curve picked while the equalizer is off is the one the next enable plays,
+wherever that is. `set-device-memory off` makes it one curve everywhere.
 
 An excluded app (`exclude-app zoom`, or its switch in the Output tab) plays
 straight to the device the equalizer plays into; it is matched on its
@@ -276,8 +280,11 @@ application name or process binary, without case.
   most, and a boost plays as a boost at every volume below the point where it
   would clip. The relief is its own gain stage after the dynamics, so the boost
   and the leveler see the same level at every volume; the follower keeps it in
-  step with the volume keys, and the limiter catches the moment between a fast
-  volume change and the follower's pass. Manual headroom takes no relief.
+  step with the volume keys (twice a second while a key is held), and the
+  limiter catches the moment between a fast volume change and the follower's
+  pass. That makes the limiter its safety net: with the limiter off, or without
+  LSP, the full cut stands at every volume, as it always did. Manual headroom
+  takes no relief.
 - **The volume is in the graph**, after the bands and the dynamics and before the
   limiter (`capture.volumes`): the leveler and the boost always see the program
   at its own level (a leveler in front of the volume would undo every volume
@@ -340,7 +347,7 @@ application name or process binary, without case.
 ## Tests
 
 ```sh
-bash tests/run-tests.sh     # 472 assertions, no real sink touched
+bash tests/run-tests.sh     # 491 assertions (490 where PipeWire is missing), no real sink touched
 bash tests/dsp-check.sh     # the real graph, measured (about two minutes)
 ```
 

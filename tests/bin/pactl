@@ -34,10 +34,11 @@ fi
 case "$1" in
   list)
     if [[ ${2:-} == sink-inputs && -n ${PACTL_APP_STREAMS:-} ]]; then
-      # PACTL_APP_STREAMS="id:sink:name:binary ..." lists several app streams, for
-      # the exclusion tests; the EQ's own output stream (id 99) comes along when
-      # PACTL_EQ_AIM is set too.
-      for entry in $PACTL_APP_STREAMS; do
+      # PACTL_APP_STREAMS="id:sink:name:binary,..." lists several app streams
+      # (comma-separated, so a name may hold spaces), for the exclusion tests; the
+      # EQ's own output stream (id 99) comes along when PACTL_EQ_AIM is set too.
+      IFS=',' read -ra entries <<<"$PACTL_APP_STREAMS"
+      for entry in "${entries[@]}"; do
         IFS=: read -r sid ssink sname sbin <<<"$entry"
         printf 'Sink Input #%s\n\tSink: %s\n\tProperties:\n\t\tapplication.name = "%s"\n\t\tapplication.process.binary = "%s"\n' \
           "$sid" "$ssink" "$sname" "$sbin"

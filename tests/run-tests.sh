@@ -403,8 +403,16 @@ run enable >/dev/null
 export PACTL_DEFAULT_SINK=omarchy_equalizer
 run set-mode graphic >/dev/null
 export PACTL_APP_STREAM=1 PACTL_LOG="$T/pactl-park.log"; : >"$PACTL_LOG"; : >"$SYSTEMCTL_LOG"
+export SYSTEMCTL_PARKED_SNAPSHOT="$T/parked-at-restart"
 run apply-preset "Small Speakers" >/dev/null
+unset SYSTEMCTL_PARKED_SNAPSHOT
 check "the mode-changing preset still restarts the chain" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
+# A restart the follower starts takes the follower down with it (it is PartOf the
+# unit), so the parked streams have to be on disk before the restart, for the
+# next follower to return.
+check "the parked streams are on record before the restart begins" "[42]" "$(cat "$T/parked-at-restart")"
+check "and the record is dropped once they are back" "gone" \
+  "$([[ -e $XDG_STATE_HOME/omarchy-equalizer/parked-streams ]] && echo kept || echo gone)"
 check "the app stream is parked on the device, then returned to the EQ" \
   "move-sink-input 42 bluez_output.12_34_56_78_9A.BC|set-default-sink omarchy_equalizer|move-sink-input 42 omarchy_equalizer" \
   "$(grep -E '^(move-sink-input|set-default-sink)' "$PACTL_LOG" | paste -sd'|')"
@@ -432,14 +440,20 @@ check "the stream was parked on the device" "1" \
   "$(grep -c '^move-sink-input 42 bluez_output.12_34_56_78_9A.BC$' "$PACTL_LOG")"
 check "nothing is moved back onto a sink that is not there" "0" \
   "$(grep -c '^move-sink-input 42 omarchy_equalizer$' "$PACTL_LOG")"
-check "the parked stream is remembered" "[42]" "$(jq -c '.parkedStreams' "$st")"
+check "the parked stream is remembered" "[42]" "$(cat "$XDG_STATE_HOME/omarchy-equalizer/parked-streams")"
 # systemd brings the sink back; the follower's pass returns the stream.
 rm -f "$T/eq-gone"; unset SYSTEMCTL_RESTART_FAILS; : >"$PACTL_LOG"
 run retarget >/dev/null
 check "the follower returns the parked stream" "1" \
   "$(grep -c '^move-sink-input 42 omarchy_equalizer$' "$PACTL_LOG")"
 check "and takes the default back" "1" "$(grep -c '^set-default-sink omarchy_equalizer$' "$PACTL_LOG")"
-check "the parked record is cleared" "null" "$(jq -c '.parkedStreams // null' "$st")"
+check "the parked record is cleared" "gone" \
+  "$([[ -e $XDG_STATE_HOME/omarchy-equalizer/parked-streams ]] && echo kept || echo gone)"
+# A 2.0 state kept them in state.json; the follower returns those too.
+jq -c '.parkedStreams = [77]' "$st" >"$st.x" && mv "$st.x" "$st"; : >"$PACTL_LOG"
+run retarget >/dev/null
+check "streams parked by 2.0 come back too" "1|null" \
+  "$(grep -c '^move-sink-input 77 omarchy_equalizer$' "$PACTL_LOG")|$(jq -c '.parkedStreams // null' "$st")"
 unset PACTL_APP_STREAM PACTL_LOG OMARCHY_EQ_RESTART_TIMEOUT PACTL_NO_EQ_SINK
 run set-mode graphic >/dev/null
 unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
@@ -1251,6 +1265,11 @@ check "the stage Qs are Model.js bandStages, to 1e-9" "$model_qs" "$stage_qs"
 check "and are a 4th-order Butterworth" "0.541196100,1.306562965," "$stage_qs"
 out="$(run set-band 0 slope 5)"; rc=$?
 check "a slope past 4 is refused" "1" "$rc"
+# A slope belongs to the pass filter it was set on: another type starts at 1.
+run set-band 0 type peaking >/dev/null
+run set-band 0 type highpass >/dev/null
+check "a type change resets the slope" "8|null" "$(run status | jq -r '"\(.slots)|\(.bands[0].slope // "null")"')"
+run set-band 0 slope 2 >/dev/null
 # The slot budget: 8 default bands + 3 more for a slope of 4 = 11; fill the rest.
 run set-band 0 slope 4 >/dev/null
 while [[ $(run status | jq -r '.slots') -lt 16 ]]; do run add-band >/dev/null; done
@@ -1296,9 +1315,20 @@ check "the backend's level is Model.curveLevelDb's" "$model_level" "$(printf '%.
 want_mult="$(LC_ALL=C awk -v d="$(run status | jq -r '.listen.preamp')" 'BEGIN { printf "%.6f", 10 ^ (d / 20) }')"
 check "Flat plays under the matched preamp" "yes" \
   "$(grep -q "\"pre_l:Mult\" $want_mult" "$PWCLI_LOG" && echo yes || echo no)"
-check "the fragment keeps the real curve" "1" "$(grep -c '"ft_9" = 1' "$frag")"
+# The fragment carries what is playing, so a restart (one systemd makes on its
+# own too) comes up on the same sound the state describes.
+check "the fragment follows the comparison" "0" "$(grep -c '"ft_9" = 1' "$frag")"
 run compare off >/dev/null
 check "compare off plays the curve again" "null" "$(run status | jq -r '.listen')"
+check "and the fragment carries the curve again" "1" "$(grep -c '"ft_9" = 1' "$frag")"
+# A preamp change ends the comparison, and the curve has to come back with it --
+# not only the preamp.
+run compare on >/dev/null
+: >"$PWCLI_LOG"
+run set-preamp -4 >/dev/null
+check "a preamp change during the A/B ends it" "null" "$(run status | jq -r '.listen')"
+check "and writes the bands back, not just the preamp" "10" "$(grep -oE '"para:ft_[0-9]+" 1' "$PWCLI_LOG" | wc -l | tr -d ' ')"
+run set-headroom auto >/dev/null
 run compare toggle >/dev/null
 run set-gain 0 1 >/dev/null
 check "an edit ends the comparison" "null" "$(run status | jq -r '.listen')"
@@ -1313,6 +1343,23 @@ check "only that band's slot is on" "15" "$(grep -oE '"para:ft_[0-9]+" 0' "$PWCL
 check "the soloed band is the one left" "yes" "$(grep -q '"para:ft_0" 1 "para:fm_0" 6 "para:s_0" 0 "para:f_0" 500' "$PWCLI_LOG" && echo yes || echo no)"
 run solo off >/dev/null
 check "solo off plays every band" "null" "$(run status | jq -r '.listen')"
+# A band alone may need more headroom than the curve: two bands that cancel.
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-mode parametric >/dev/null
+st="$XDG_STATE_HOME/omarchy-equalizer/state.json"
+jq -c '.parametric = [{"type":"peaking","freq":100,"q":1,"gain":10},{"type":"peaking","freq":100,"q":1,"gain":-8},{"type":"peaking","freq":2000,"q":1,"gain":4,"enabled":false}]' "$st" >"$st.x" && mv "$st.x" "$st"
+run set-mode parametric >/dev/null
+: >"$PWCLI_LOG"
+run solo 0 >/dev/null
+check "a soloed band plays under its own headroom, not the curve's" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"pre_l:Mult" 0.316228 ' && echo yes || echo no)"
+run solo 2 >/dev/null
+check "a bypassed band can be soloed" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"para:ft_0" 1 "para:fm_0" 6 "para:s_0" 0 "para:f_0" 2000' && echo yes || echo no)"
+run solo off >/dev/null
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-mode graphic >/dev/null
+run apply-preset Rock >/dev/null
 out="$(run solo 40)"; rc=$?
 check "solo refuses a band that does not exist" "1|Band 40 does not exist." "$rc|$out"
 
@@ -1351,6 +1398,20 @@ check "manual headroom takes no relief" "0" "$(run status | jq -r '.relief')"
 run set-headroom auto >/dev/null
 check "auto headroom takes it back" "6" "$(run status | jq -r '.relief')"
 check "status reports the volume it read" "-12" "$(run status | jq -r '.volumeDb')"
+# The relief lags a fast volume change by a follower pass, and the limiter is
+# what keeps that moment clean: no limiter, no relief.
+: >"$PWCLI_LOG"
+run set-limiter off >/dev/null
+check "with the limiter off there is no relief" "0" "$(run status | jq -r '.relief')"
+check "and it is taken back in the same write as the limiter" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"limit:enabled" 0 .*"relief_l:Mult" 1.000000' && echo yes || echo no)"
+run set-limiter on >/dev/null
+check "the limiter back on brings the relief back" "6" "$(run status | jq -r '.relief')"
+export OMARCHY_EQ_LV2_DIR="$T/lv2-missing"
+run set-gain 5 6 >/dev/null
+check "without LSP (and so no limiter) there is no relief" "0" "$(run status | jq -r '.relief')"
+export OMARCHY_EQ_LV2_DIR="$T/lv2"
+run set-gain 5 6 >/dev/null
 unset PACTL_DEVICE_SINK PACTL_DEFAULT_SINK
 unset PACTL_SINK_VOLUME_DB
 run disable >/dev/null
@@ -1437,13 +1498,13 @@ run disable >/dev/null
 export PACTL_DEVICE_SINK=alsa_output.stub PACTL_DEFAULT_SINK=alsa_output.stub
 run exclude-app zoom >/dev/null
 check "an excluded app is stored" '["zoom"]' "$(run status | jq -c '.excludedApps')"
-export PACTL_APP_STREAMS="42:2:Chromium:chromium 43:2:ZOOM:zoom" PACTL_LOG="$T/pactl-excl.log"; : >"$PACTL_LOG"
+export PACTL_APP_STREAMS="42:2:Chromium:chromium,43:2:ZOOM:zoom" PACTL_LOG="$T/pactl-excl.log"; : >"$PACTL_LOG"
 run enable >/dev/null
 check "enable moves the other apps onto the equalizer" "1" "$(grep -c '^move-sink-input 42 omarchy_equalizer$' "$PACTL_LOG")"
 check "and the excluded app to the device, matched without case" "1" "$(grep -c '^move-sink-input 43 alsa_output.stub$' "$PACTL_LOG")"
 export PACTL_DEFAULT_SINK=omarchy_equalizer
 # WirePlumber puts a new stream of it on the default sink -- the equalizer.
-export PACTL_APP_STREAMS="42:1:Chromium:chromium 44:1:zoom:zoom"; : >"$PACTL_LOG"
+export PACTL_APP_STREAMS="42:1:Chromium:chromium,44:1:zoom:zoom"; : >"$PACTL_LOG"
 run retarget >/dev/null
 check "the follower moves an excluded stream off the equalizer" "1" "$(grep -c '^move-sink-input 44 alsa_output.stub$' "$PACTL_LOG")"
 check "and leaves the rest alone" "0" "$(grep -c '^move-sink-input 42 ' "$PACTL_LOG")"
@@ -1455,6 +1516,19 @@ check "include-app puts it back on the equalizer now" "1" "$(grep -c '^move-sink
 check "and drops it from the list" "[]" "$(run status | jq -c '.excludedApps')"
 out="$(run include-app zoom)"; rc=$?
 check "including an app that is not excluded is refused" "1|'zoom' is not excluded." "$rc|$out"
+# Excluded by its binary, put back by the name the panel shows.
+run exclude-app zoom >/dev/null
+export PACTL_APP_STREAMS="42:1:Chromium:chromium,45:1:Zoom Meeting:zoom"
+out="$(run include-app "Zoom Meeting")"; rc=$?
+check "an app excluded by binary is put back by its name" "0|[]" "$rc|$(run status | jq -c '.excludedApps')"
+# A device the user picks moves the apps onto the EQ -- the excluded ones to the device.
+run exclude-app zoom >/dev/null
+export PACTL_DEFAULT_SINK=alsa_output.stub; : >"$PACTL_LOG"
+run retarget >/dev/null
+check "a manual device pick sends an excluded app to the device, never to the EQ" "yes|0" \
+  "$( (( $(grep -c '^move-sink-input 45 alsa_output.stub$' "$PACTL_LOG") >= 1 )) && echo yes || echo no)|$(grep -c '^move-sink-input 45 omarchy_equalizer$' "$PACTL_LOG")"
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+run include-app zoom >/dev/null
 check "the follower wakes for a new stream" "wake" "$(follow_event_wanted "Event 'new' on sink-input #12" && echo wake || echo ignore)"
 unset PACTL_APP_STREAMS PACTL_LOG PACTL_DEVICE_SINK PACTL_DEFAULT_SINK
 run disable >/dev/null
@@ -1502,6 +1576,18 @@ unset PACTL_DEVICE_SINK2 PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID
 run set-device-memory on >/dev/null
 check "status names the device and its description" "audio_effect.stub-dsp|Stub audio_effect.stub-dsp" \
   "$(run status | jq -r '"\(.deviceKey)|\(.deviceLabel)"')"
+# A curve picked while the EQ is off is for the device it plays into next: not
+# filed under the one it played into before, and not replaced by the next one's.
+jq -c '.deviceCurves = { "audio_effect.stub-dsp": { mode: "graphic", preset: "Jazz", graphic: .graphic, parametric: .parametric, preamp: 0, headroom: "auto" } }
+  | .activeDevice = "bluez_output.AA_BB_CC_DD_EE_FF"' "$st" >"$st.x" && mv "$st.x" "$st"
+run disable >/dev/null
+run apply-preset Pop >/dev/null
+export PACTL_DEFAULT_SINK=audio_effect.stub-dsp
+run enable >/dev/null
+check "a curve picked while off plays at the next enable" "Pop" "$(jq -r '.preset' "$st")"
+check "the device's own remembered curve is left as it was" "Jazz" "$(jq -r '.deviceCurves["audio_effect.stub-dsp"].preset' "$st")"
+check "the previous device does not inherit the pick" "null" "$(jq -r '.deviceCurves["bluez_output.AA_BB_CC_DD_EE_FF"].preset // "null"' "$st")"
+check "and the pick is no longer pending" "null" "$(jq -r '.curveEditedOff // "null"' "$st")"
 run disable >/dev/null
 unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
 
