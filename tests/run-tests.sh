@@ -40,13 +40,15 @@ mkdir -p "$T"
 rm -rf "$T/config" "$T/state"
 : >"$SYSTEMCTL_LOG"; : >"$CURL_LOG"; : >"$PWCLI_LOG"
 
-# The output stage checks for the two LSP mono plugins under this root. Empty
-# TTLs are enough -- lsp_available only needs the files to exist -- and the
-# missing-plugin section swaps in a root without them.
+# The output stage and the band pool check for the LSP stereo plugins under this
+# root. Empty TTLs are enough -- lsp_available only needs the files to exist --
+# and the missing-plugin section swaps in a root without them. (tests/dsp-check.sh
+# runs the real plugins.)
 export OMARCHY_EQ_LV2_DIR="$T/lv2"
 mkdir -p "$OMARCHY_EQ_LV2_DIR/lsp-plugins.lv2"
-: >"$OMARCHY_EQ_LV2_DIR/lsp-plugins.lv2/mb_compressor_mono.ttl"
-: >"$OMARCHY_EQ_LV2_DIR/lsp-plugins.lv2/limiter_mono.ttl"
+for p in para_equalizer_x16_stereo mb_compressor_stereo limiter_stereo autogain_stereo; do
+  : >"$OMARCHY_EQ_LV2_DIR/lsp-plugins.lv2/$p.ttl"
+done
 
 pass=0; fail=0
 ok()  { printf 'PASS  %s\n' "$1"; pass=$((pass+1)); }
@@ -207,7 +209,7 @@ for i in $(seq 1 8); do run remove-band 0 >/dev/null; done
 check "every parametric band can be removed" "0" "$(run status | jq -r '.bands | length')"
 frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
 check "the fragment has no link to a missing node" "0" "$(grep -c 'g0:In' "$frag")"
-check "the fragment still hosts the preamp" "1" "$(grep -c 'name = pre' "$frag")"
+check "the fragment still hosts the preamp, one per channel" "2" "$(grep -c 'name = pre_[lr] label = linear' "$frag")"
 out="$(run remove-band 0)"; rc=$?
 check "removing from an empty set is refused" "1|Band 0 does not exist." "$rc|$out"
 run add-band >/dev/null
@@ -228,12 +230,12 @@ out="$(run set-preamp 10 2>&1)"
 check "set-preamp above the ceiling says so" "1" "$(grep -c 'above the headroom ceiling' <<<"$out")"
 check "the ceiling is stored instead of the value asked for" "-6.0" "$(run status | jq -r '.preamp')"
 check "the ceiling reaches the running graph" "yes" \
-  "$(tail -n1 "$PWCLI_LOG" | grep -q '"pre:Mult" 0.501187' && echo yes || echo no)"
-check "the fragment follows the live preamp" "1" "$(grep -c '"Mult" = 0.501187' "$frag")"
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"pre_l:Mult" 0.501187 "pre_r:Mult" 0.501187' && echo yes || echo no)"
+check "the fragment follows the live preamp" "2" "$(grep -c 'name = pre_[lr] label = linear control = { "Mult" = 0.501187' "$frag")"
 out="$(run set-preamp -8 2>&1)"
 check "a preamp below the ceiling is left alone" "0" "$(grep -c 'above the headroom ceiling' <<<"$out")"
 check "and is what the graph and the state hold" "-8" "$(run status | jq -r '.preamp')"
-check "and is what the fragment holds" "1" "$(grep -c '"Mult" = 0.398107' "$frag")"
+check "and is what the fragment holds" "2" "$(grep -c 'name = pre_[lr] label = linear control = { "Mult" = 0.398107' "$frag")"
 
 echo "== built-in presets carry their own headroom =="
 # A preset's preamp has to be exactly what the backend computes for its own curve.
@@ -899,7 +901,7 @@ check "a shape-compatible preset does not restart the unit" "0" "$(grep -c resta
 check "a shape-compatible preset writes the graph more than once" "yes" \
   "$( (( $(wc -l <"$PWCLI_LOG") > 1)) && echo yes || echo no )"
 check "the last ramp step carries the preset's final gains" "yes" \
-  "$(tail -n1 "$PWCLI_LOG" | grep -q '"g9:Gain" -5.5' && echo yes || echo no)"
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"g9_l:Gain" -5.5.*"g9_r:Gain" -5.5' && echo yes || echo no)"
 : >"$SYSTEMCTL_LOG"
 run apply-preset "Speech Clarity" >/dev/null
 check "a parametric preset rebuilds the graph" "yes" \
@@ -924,9 +926,11 @@ echo "== output stage in the fragment =="
 # With LSP the graphic set runs in the pool too, so the bands are one node.
 run set-mode graphic >/dev/null
 frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
-check "the fragment hosts the multiband compressor" "1" "$(grep -c 'lv2/mb_compressor_mono' "$frag")"
+check "the fragment hosts the stereo multiband compressor" "1" "$(grep -c 'lv2/mb_compressor_stereo' "$frag")"
 check "the fragment no longer hosts the single-band compressor" "0" "$(grep -c 'lv2/compressor_mono' "$frag")"
-check "the fragment hosts the limiter" "1" "$(grep -c 'limiter_mono' "$frag")"
+check "the fragment hosts the stereo limiter" "1" "$(grep -c 'lv2/limiter_stereo' "$frag")"
+check "the fragment hosts the stereo leveler" "1" "$(grep -c 'lv2/autogain_stereo' "$frag")"
+check "no mono build is left to process a channel on its own" "0" "$(grep -c '_mono"' "$frag")"
 check "the compressor splits the bass from the mid at 200 Hz" "1" "$(grep -c '"sf_1" = 200' "$frag")"
 check "the compressor splits the mid from the treble at 4 kHz" "1" "$(grep -c '"sf_2" = 4000' "$frag")"
 check "no control is written that the plugin reports as an output" "0" \
@@ -939,19 +943,25 @@ check "the treble band's split is switched on" "1" "$(grep -c '"cbe_2" = 1' "$fr
 check "the fourth band's split stays off" "1" "$(grep -c '"cbe_3" = 0' "$frag")"
 check "the limiter oversamples to catch true peaks" "1" \
   "$(grep 'name = limit' "$frag" | grep -c '"ovs" = 12')"
-check "the band pool feeds the compressor" "1" \
-  "$(grep -c 'para:out" input = "boost:in"' "$frag")"
-check "the compressor feeds the limiter" "1" \
-  "$(grep -c 'boost:out" input = "limit:in"' "$frag")"
-check "the limiter is the graph output" "0" "$(grep -c 'limit:out' "$frag")"
+check "the band pool feeds the leveler" "1" \
+  "$(grep -c 'para:out_l" input = "level:in_l"' "$frag")"
+check "the leveler feeds the compressor" "1" \
+  "$(grep -c 'level:out_r" input = "boost:in_r"' "$frag")"
+check "the compressor feeds the relief, the relief the volume" "2" \
+  "$(grep -cE 'boost:out_l" input = "relief_l:In"|relief_l:Out" input = "vol_l:In"' "$frag")"
+check "the volume feeds the limiter" "1" "$(grep -c 'vol_r:Out" input = "limit:in_r"' "$frag")"
+check "the limiter is the graph output" "1" "$(grep -c 'outputs = \[ "limit:out_l" "limit:out_r" \]' "$frag")"
+check "nothing links out of the limiter" "0" "$(grep -c 'output = "limit:out' "$frag")"
+check "the sink volume drives the in-graph volume nodes" "2" \
+  "$(grep -cE '\{ control = "vol_[lr]:Mult" \}' "$frag")"
 # With no bands the preamp is the whole head of the chain and feeds the pool,
 # which then feeds the stage.
 run set-mode parametric >/dev/null
 while [[ $(run status | jq -r '.bands | length') -gt 0 ]]; do run remove-band 0 >/dev/null; done
-check "with no bands the preamp feeds the pool" "1" \
-  "$(grep -c 'pre:Out" input = "para:in"' "$frag")"
-check "with no bands the pool feeds the compressor" "1" \
-  "$(grep -c 'para:out" input = "boost:in"' "$frag")"
+check "with no bands the channel stage feeds the pool" "1" \
+  "$(grep -c 'mix_l:Out" input = "para:in_l"' "$frag")"
+check "with no bands the pool feeds the leveler" "1" \
+  "$(grep -c 'para:out_l" input = "level:in_l"' "$frag")"
 check "with no bands there is still no g0 link" "0" "$(grep -c 'g0:In' "$frag")"
 
 echo "== output stage live control =="
@@ -998,7 +1008,7 @@ echo "== output stage validation =="
 out="$(run set-limiter maybe)"; rc=$?
 check "set-limiter rejects anything else" "1|Limiter must be on or off." "$rc|$out"
 out="$(run set-boost loud)"; rc=$?
-check "set-boost rejects anything else" "1|Boost must be off, low, medium or high." "$rc|$out"
+check "set-boost rejects anything else" "1|Boost must be off, low, medium, high, night or voice." "$rc|$out"
 check "a rejected value is not stored" "on" "$(run status | jq -r '.limiter')"
 
 echo "== output stage on a state written before the fields =="
@@ -1025,8 +1035,8 @@ run set-mode parametric >/dev/null
 : >"$SYSTEMCTL_LOG"
 run add-band >/dev/null
 check "a live pool edit does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
-check "the synced fragment keeps the compressor" "1" "$(grep -c 'lv2/mb_compressor_mono' "$frag")"
-check "the synced fragment keeps the limiter" "1" "$(grep -c 'limiter_mono' "$frag")"
+check "the synced fragment keeps the compressor" "1" "$(grep -c 'lv2/mb_compressor_stereo' "$frag")"
+check "the synced fragment keeps the limiter" "1" "$(grep -c 'lv2/limiter_stereo' "$frag")"
 
 echo "== parametric pool fragment =="
 # The type map, APO (DR) mode and Off unused slots are the contract the panel's
@@ -1034,7 +1044,7 @@ echo "== parametric pool fragment =="
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 run set-mode parametric >/dev/null
 frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
-check "the fragment hosts the 16-slot pool" "1" "$(grep -c 'lv2/para_equalizer_x16_mono' "$frag")"
+check "the fragment hosts the 16-slot stereo pool" "1" "$(grep -c 'lv2/para_equalizer_x16_stereo' "$frag")"
 check "the pool runs APO (DR)" "1" "$(grep -c '"fm_0" = 6' "$frag")"
 check "the pool runs slope x1" "1" "$(grep -c '"s_0" = 0' "$frag")"
 check "a low shelf maps to Lo-shelf (ft 5)" "1" "$(grep -c '"ft_0" = 5' "$frag")"
@@ -1046,10 +1056,11 @@ check "the pool keeps linear gain" "1" "$(grep -c '"g_0" = 1.000000' "$frag")"
 check "the pool pins g_in/g_out" "yes" \
   "$(grep -q '"g_in" = 1.*"g_out" = 1' "$frag" && echo yes || echo no)"
 check "the pool turns the FFT displays off" "yes" \
-  "$(grep -q '"ife" = 0.*"ofe" = 0' "$frag" && echo yes || echo no)"
-check "the preamp feeds the pool" "1" "$(grep -c 'pre:Out" input = "para:in"' "$frag")"
-check "the pool feeds the compressor" "1" "$(grep -c 'para:out" input = "boost:in"' "$frag")"
-check "the compressor still feeds the limiter" "1" "$(grep -c 'boost:out" input = "limit:in"' "$frag")"
+  "$(grep -q '"ife_l" = 0 "ife_r" = 0 "ofe_l" = 0 "ofe_r" = 0' "$frag" && echo yes || echo no)"
+check "each preamp feeds both channel mixers" "4" "$(grep -cE 'pre_[lr]:Out" input = "mix_[lr]:In [12]"' "$frag")"
+check "the channel mixers feed the pool" "2" "$(grep -cE 'mix_[lr]:Out" input = "para:in_[lr]"' "$frag")"
+check "the pool feeds the leveler" "1" "$(grep -c 'para:out_r" input = "level:in_r"' "$frag")"
+check "the volume still feeds the limiter" "1" "$(grep -c 'vol_l:Out" input = "limit:in_l"' "$frag")"
 check "no biquad band nodes remain in parametric mode" "0" \
   "$(grep -c 'type = builtin name = g' "$frag")"
 
@@ -1155,6 +1166,390 @@ check "without LSP a parametric type change writes no live param" "0" "$(wc -l <
 run add-band >/dev/null
 check "without LSP add-band restarts" "1" "$(grep -c restart "$SYSTEMCTL_LOG")"
 export OMARCHY_EQ_LV2_DIR="$T/lv2"
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+
+echo "== layout: the fragment names its shape, and an old graph is rebuilt once =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json" "$XDG_STATE_HOME/omarchy-equalizer/running-layout"
+# The sections below need an equalizer that is on, so it needs a device to play into.
+export PACTL_DEVICE_SINK=alsa_output.stub PACTL_DEFAULT_SINK=alsa_output.stub
+run disable >/dev/null
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
+check "the fragment names its layout" "1" "$(grep -c '^# Layout: v3 pool$' "$frag")"
+check "enable records the layout the graph runs" "pool" "$(cat "$XDG_STATE_HOME/omarchy-equalizer/running-layout")"
+# A graph from before the layout line: the first live command rebuilds it once.
+printf '' >"$XDG_STATE_HOME/omarchy-equalizer/running-layout"
+: >"$SYSTEMCTL_LOG"
+run set-gain 2 1 >/dev/null
+check "a graph of an older layout is rebuilt on the first edit" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
+check "and the rebuild records the new layout" "pool" "$(cat "$XDG_STATE_HOME/omarchy-equalizer/running-layout")"
+: >"$SYSTEMCTL_LOG"
+run set-gain 2 0 >/dev/null
+check "after that edits are live again" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+# A values-only rewrite of an outdated graph (a preamp) must not leave a fragment
+# of another shape on disk under it: it rebuilds too.
+printf '' >"$XDG_STATE_HOME/omarchy-equalizer/running-layout"
+: >"$SYSTEMCTL_LOG"
+run set-limiter on >/dev/null
+check "a stage toggle on an outdated graph rebuilds it" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
+
+unset PACTL_DEVICE_SINK PACTL_DEFAULT_SINK
+
+echo "== band bypass =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-mode parametric >/dev/null
+run set-gain 2 6 >/dev/null
+check "a boosted band takes headroom" "-6.0" "$(run status | jq -r '.preamp')"
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run set-band 2 enabled off >/dev/null
+check "bypassing a band does not restart the pool" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "bypassing is one live write" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+check "the bypassed band is stored, values intact" "false|6" "$(run status | jq -r '"\(.bands[2].enabled)|\(.bands[2].gain)"')"
+check "a bypassed band takes no headroom" "0" "$(run status | jq -r '.preamp')"
+check "the running pool plays seven bands" "7" "$(grep -oE '"para:ft_[0-9]+" [1-9]' "$PWCLI_LOG" | wc -l | tr -d ' ')"
+check "and none of them is the bypassed one" "0" "$(grep -c '"para:f_[0-9]*" 250 ' "$PWCLI_LOG")"
+check "the fragment leaves it out too" "0" "$(grep -c '"f_[0-9]*" = 250 ' "$frag")"
+run set-band 2 enabled on >/dev/null
+check "switching it back on restores its headroom" "-6.0" "$(run status | jq -r '.preamp')"
+out="$(run set-band 2 enabled maybe)"; rc=$?
+check "enabled takes on or off only" "1|Enabled must be on or off, not 'maybe'." "$rc|$out"
+# A band written with its defaults is the band without them: not an edit.
+run apply-preset "Warm Speakers" >/dev/null
+run set-band 0 enabled off >/dev/null
+run set-band 0 enabled on >/dev/null
+check "bypassing and restoring a band leaves the preset unedited" "false" "$(run status | jq -r '.presetDirty')"
+# Without LSP the biquad chain changes shape when a band drops out: a rebuild.
+export OMARCHY_EQ_LV2_DIR="$T/lv2-missing"
+run set-mode graphic >/dev/null
+: >"$SYSTEMCTL_LOG"
+run set-band 3 enabled off >/dev/null
+check "on the biquad chain a bypass rebuilds" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
+check "the bypassed biquad band is left out of the chain" "9" "$(grep -c 'name = g[0-9]*_l label' "$frag")"
+run set-band 3 enabled on >/dev/null
+export OMARCHY_EQ_LV2_DIR="$T/lv2"
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+
+echo "== slopes: a steeper pass filter is a cascade of Butterworth stages =="
+run set-mode parametric >/dev/null
+run set-band 0 type highpass >/dev/null
+run set-band 0 freq 80 >/dev/null
+run set-band 0 q 0.7071067811865476 >/dev/null
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run set-band 0 slope 2 >/dev/null
+check "a slope change in the pool is live" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "slope 2 takes two slots" "9" "$(run status | jq -r '.slots')"
+check "both stages are Hi-pass slots" "yes" \
+  "$(grep -q '"para:ft_0" 2 .*"para:ft_1" 2 ' "$PWCLI_LOG" && echo yes || echo no)"
+stage_qs="$(grep -oE '"q_[01]" = [0-9.]+' "$frag" | awk '{ printf "%.9f,", $3 }')"
+model_qs="$(node -e '
+  const fs = require("fs"), vm = require("vm"), m = {}; vm.createContext(m);
+  vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), m);
+  process.stdout.write(m.bandStages({ type: "highpass", freq: 80, q: Math.SQRT1_2, gain: 0, slope: 2 })
+    .map(s => s.q.toFixed(9) + ",").join(""));' "$here/../Model.js")"
+check "the stage Qs are Model.js bandStages, to 1e-9" "$model_qs" "$stage_qs"
+check "and are a 4th-order Butterworth" "0.541196100,1.306562965," "$stage_qs"
+out="$(run set-band 0 slope 5)"; rc=$?
+check "a slope past 4 is refused" "1" "$rc"
+# The slot budget: 8 default bands + 3 more for a slope of 4 = 11; fill the rest.
+run set-band 0 slope 4 >/dev/null
+while [[ $(run status | jq -r '.slots') -lt 16 ]]; do run add-band >/dev/null; done
+out="$(run add-band)"; rc=$?
+check "a full slot budget refuses another band" "1" "$rc"
+check "and says why" "1" "$(grep -c 'no free filter slot' <<<"$out")"
+out="$(run set-band 1 type lowpass)"; rc=$?; out="$(run set-band 1 slope 2 2>&1)"; rc=$?
+check "a slope that would overflow the slots is refused" "1" "$rc"
+check "the refusal names the slot count" "1" "$(grep -c 'needs 17 filter slots' <<<"$out")"
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+
+echo "== automatic headroom matches Model.js with bypassed and sloped bands =="
+set4='[{"type":"peaking","freq":1000,"q":1.0,"gain":9,"enabled":false},{"type":"peaking","freq":200,"q":1.4,"gain":3}]'
+set5='[{"type":"highpass","freq":60,"q":0.9,"gain":0,"slope":3},{"type":"lowshelf","freq":90,"q":0.7,"gain":5},{"type":"lowpass","freq":9000,"q":1.2,"gain":0,"slope":2}]'
+jq -cn --argjson a "$set4" --argjson b "$set5" '[$a, $b]' >"$T/headroom-sets2.json"
+model="$(node "$here/headroom-check.js" "$rate" "$T/headroom-sets2.json")"
+for i in 0 1; do
+  bands="$(jq -c ".[$i]" "$T/headroom-sets2.json")"
+  got="$(backend_auto_preamp parametric "$bands")"
+  want="$(jq -r ".[$i]" <<<"$model")"
+  check "auto headroom matches Model.autoPreampDb for set $((i + 4))" "true" \
+    "$(jq -cn --argjson a "$got" --argjson b "$want" '($a - $b) == 0')"
+done
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+
+echo "== the A/B: Flat at the curve's own loudness =="
+run set-mode graphic >/dev/null
+run apply-preset Rock >/dev/null
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+out="$(run compare on)"
+check "compare on reports the level it matched" "1" "$(grep -c "Playing Flat at the curve's loudness" <<<"$out")"
+check "compare is live, not a rebuild" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "it is one live write" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+check "every slot is Off while comparing" "16" "$(grep -oE '"para:ft_[0-9]+" 0' "$PWCLI_LOG" | wc -l | tr -d ' ')"
+check "status says what is playing" "flat" "$(run status | jq -r '.listen.mode')"
+level="$(run status | jq -r '.listen.levelDb')"
+model_level="$(node -e '
+  const fs = require("fs"), vm = require("vm"), m = {}; vm.createContext(m);
+  vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), m);
+  const s = JSON.parse(process.argv[2]);
+  process.stdout.write(m.curveLevelDb(s.bands, s.preamp, s.sampleRate).toFixed(2));' "$here/../Model.js" "$(run status)")"
+check "the backend's level is Model.curveLevelDb's" "$model_level" "$(printf '%.2f' "$level")"
+want_mult="$(LC_ALL=C awk -v d="$(run status | jq -r '.listen.preamp')" 'BEGIN { printf "%.6f", 10 ^ (d / 20) }')"
+check "Flat plays under the matched preamp" "yes" \
+  "$(grep -q "\"pre_l:Mult\" $want_mult" "$PWCLI_LOG" && echo yes || echo no)"
+check "the fragment keeps the real curve" "1" "$(grep -c '"ft_9" = 1' "$frag")"
+run compare off >/dev/null
+check "compare off plays the curve again" "null" "$(run status | jq -r '.listen')"
+run compare toggle >/dev/null
+run set-gain 0 1 >/dev/null
+check "an edit ends the comparison" "null" "$(run status | jq -r '.listen')"
+out="$(run compare maybe)"; rc=$?
+check "compare takes on, off or toggle" "1|Compare must be on, off or toggle." "$rc|$out"
+
+echo "== solo: one band alone =="
+: >"$PWCLI_LOG"
+run solo 4 >/dev/null
+check "solo names the band" "solo|4" "$(run status | jq -r '"\(.listen.mode)|\(.listen.band)"')"
+check "only that band's slot is on" "15" "$(grep -oE '"para:ft_[0-9]+" 0' "$PWCLI_LOG" | wc -l | tr -d ' ')"
+check "the soloed band is the one left" "yes" "$(grep -q '"para:ft_0" 1 "para:fm_0" 6 "para:s_0" 0 "para:f_0" 500' "$PWCLI_LOG" && echo yes || echo no)"
+run solo off >/dev/null
+check "solo off plays every band" "null" "$(run status | jq -r '.listen')"
+out="$(run solo 40)"; rc=$?
+check "solo refuses a band that does not exist" "1|Band 40 does not exist." "$rc|$out"
+
+echo "== volume relief: a boost plays as a boost below full volume =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-mode graphic >/dev/null
+run reset >/dev/null
+export PACTL_SINK_VOLUME_DB=-20.00
+: >"$PWCLI_LOG"
+run set-gain 5 6 >/dev/null
+check "at -20 dB the whole cut is given back" "-6.0|6|0" "$(run status | jq -r '"\(.preamp)|\(.relief)|\(.appliedPreamp)"')"
+check "the relief reaches the graph with the bands" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"relief_l:Mult" 1.995262 "relief_r:Mult" 1.995262' && echo yes || echo no)"
+check "the fragment carries it" "2" "$(grep -c 'name = relief_[lr] label = linear control = { "Mult" = 1.995262' "$frag")"
+export PACTL_SINK_VOLUME_DB=-2.50
+run set-gain 5 6 >/dev/null
+check "near full volume only the headroom the volume leaves is given back" "2.5|-3.5" \
+  "$(run status | jq -r '"\(.relief)|\(.appliedPreamp)"')"
+export PACTL_SINK_VOLUME_DB=0.00
+run set-gain 5 6 >/dev/null
+check "at full volume the whole cut stands" "0" "$(run status | jq -r '.relief')"
+# The follower keeps it in step when only the volume moves.
+export PACTL_DEVICE_SINK=alsa_output.stub PACTL_DEFAULT_SINK=alsa_output.stub
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+export PACTL_SINK_VOLUME_DB=-12.00
+: >"$PWCLI_LOG"
+run retarget >/dev/null
+check "a volume change moves the relief on the next pass" "6" "$(run status | jq -r '.relief')"
+check "with one live write of the relief alone" "1" "$(grep -c '"relief_l:Mult" 1.995262 "relief_r:Mult" 1.995262 \]' "$PWCLI_LOG")"
+: >"$PWCLI_LOG"
+run retarget >/dev/null
+check "a pass with nothing to change writes nothing" "0" "$(grep -c 'relief_l' "$PWCLI_LOG")"
+run set-preamp -8 >/dev/null
+check "manual headroom takes no relief" "0" "$(run status | jq -r '.relief')"
+run set-headroom auto >/dev/null
+check "auto headroom takes it back" "6" "$(run status | jq -r '.relief')"
+check "status reports the volume it read" "-12" "$(run status | jq -r '.volumeDb')"
+unset PACTL_DEVICE_SINK PACTL_DEFAULT_SINK
+unset PACTL_SINK_VOLUME_DB
+run disable >/dev/null
+
+echo "== channels and balance =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+export PACTL_DEFAULT_SINK=alsa_output.stub
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run set-channels mono >/dev/null
+check "mono is live, not a rebuild" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "mono feeds each side half of both" "yes" \
+  "$(grep -q '"mix_l:Gain 1" 0.500000 "mix_l:Gain 2" 0.500000 "mix_r:Gain 1" 0.500000 "mix_r:Gain 2" 0.500000' "$PWCLI_LOG" && echo yes || echo no)"
+run set-channels swap >/dev/null
+check "swap crosses the channels" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"mix_l:Gain 1" 0.000000 "mix_l:Gain 2" 1.000000 "mix_r:Gain 1" 1.000000 "mix_r:Gain 2" 0.000000' && echo yes || echo no)"
+run set-channels stereo >/dev/null
+run set-balance 0.5 >/dev/null
+check "a balance to the right turns the left down, never the right up" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"mix_l:Gain 1" 0.500000 "mix_l:Gain 2" 0.000000 "mix_r:Gain 1" 0.000000 "mix_r:Gain 2" 1.000000' && echo yes || echo no)"
+check "the fragment carries the balance" "1" "$(grep -c 'name = mix_l label = mixer control = { "Gain 1" = 0.500000' "$frag")"
+out="$(run set-balance 2)"; rc=$?
+check "a balance past the ends is refused" "1" "$rc"
+out="$(run set-channels quad)"; rc=$?
+check "channels take stereo, mono or swap" "1|Channels must be stereo, mono or swap." "$rc|$out"
+run set-balance 0 >/dev/null
+export OMARCHY_EQ_LV2_DIR="$T/lv2-missing"
+run set-channels swap >/dev/null   # the first command rebuilds into the biquad layout
+: >"$PWCLI_LOG"
+run set-channels mono >/dev/null
+check "channel handling works without LSP" "yes" "$(grep -q '"mix_r:Gain 2" 0.500000' "$PWCLI_LOG" && echo yes || echo no)"
+run set-channels stereo >/dev/null
+export OMARCHY_EQ_LV2_DIR="$T/lv2"
+run disable >/dev/null
+
+echo "== the leveler and the dynamics characters =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+export PACTL_DEFAULT_SINK=alsa_output.stub
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run set-leveler on >/dev/null
+check "the leveler switches live" "0|yes" \
+  "$(grep -c restart "$SYSTEMCTL_LOG")|$(tail -n1 "$PWCLI_LOG" | grep -q '"level:enabled" 1' && echo yes || echo no)"
+check "it targets -18 LUFS with at most +12 dB of lift" "yes" \
+  "$(grep 'name = level' "$frag" | grep -q '"level" = -18 .*"max_on" = 1 "max_amp" = 12' && echo yes || echo no)"
+out="$(run set-leveler loud)"; rc=$?
+check "the leveler takes on or off" "1|Leveler must be on or off." "$rc|$out"
+run set-boost night >/dev/null
+check "night compresses the mid band hardest" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:cr_1" 6 .*"boost:mk_1" 5.011872' && echo yes || echo no)"
+run set-boost voice >/dev/null
+check "voice barely touches the bass band" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:cr_0" 2 ' && echo yes || echo no)"
+check "the compressor detects both channels together, from the louder" "yes" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -q '"boost:ssplit" 0 .*"boost:scs_0" 5 .*"boost:scs_2" 5' && echo yes || echo no)"
+check "the limiter is stereo-linked with a 20 ms lookahead" "yes" \
+  "$(grep 'name = limit' "$frag" | grep -q '"lk" = 20 "at" = 20 .*"alr" = 0 .*"slink" = 100' && echo yes || echo no)"
+run set-boost off >/dev/null
+run set-leveler off >/dev/null
+run disable >/dev/null
+unset PACTL_DEVICE_SINK PACTL_DEFAULT_SINK
+
+echo "== the latency budget =="
+# The chain must stay usable for video: the limiter's lookahead is the only real
+# latency in it (tests/dsp-check.sh measures what the graph reports).
+check "the limiter looks ahead at most 20 ms" "yes" \
+  "$(grep 'name = limit' "$frag" | grep -oE '"lk" = [0-9.]+' | awk '{ print ($3 <= 20) ? "yes" : "no" }')"
+check "the band pool runs IIR filters (no FFT latency)" "1" "$(grep 'name = para' "$frag" | grep -c '"mode" = 0 ')"
+check "the compressor never runs linear phase" "0" "$(grep 'name = boost' "$frag" | grep -c '"mode" = 2 ')"
+check "the leveler adds no lookahead" "1" "$(grep 'name = level' "$frag" | grep -c '"lkahead" = 0 ')"
+
+echo "== the graph rate follows a running sink =="
+export PACTL_EQ_STATE=RUNNING PACTL_EQ_RATE=96000
+check "a running sink's negotiated rate wins" "96000" "$(run status | jq -r '.sampleRate')"
+export PACTL_EQ_STATE=SUSPENDED
+check "an idle sink falls back to the clock rate" "44100" "$(run status | jq -r '.sampleRate')"
+unset PACTL_EQ_STATE PACTL_EQ_RATE
+
+echo "== excluded apps play straight to the device =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run disable >/dev/null
+export PACTL_DEVICE_SINK=alsa_output.stub PACTL_DEFAULT_SINK=alsa_output.stub
+run exclude-app zoom >/dev/null
+check "an excluded app is stored" '["zoom"]' "$(run status | jq -c '.excludedApps')"
+export PACTL_APP_STREAMS="42:2:Chromium:chromium 43:2:ZOOM:zoom" PACTL_LOG="$T/pactl-excl.log"; : >"$PACTL_LOG"
+run enable >/dev/null
+check "enable moves the other apps onto the equalizer" "1" "$(grep -c '^move-sink-input 42 omarchy_equalizer$' "$PACTL_LOG")"
+check "and the excluded app to the device, matched without case" "1" "$(grep -c '^move-sink-input 43 alsa_output.stub$' "$PACTL_LOG")"
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+# WirePlumber puts a new stream of it on the default sink -- the equalizer.
+export PACTL_APP_STREAMS="42:1:Chromium:chromium 44:1:zoom:zoom"; : >"$PACTL_LOG"
+run retarget >/dev/null
+check "the follower moves an excluded stream off the equalizer" "1" "$(grep -c '^move-sink-input 44 alsa_output.stub$' "$PACTL_LOG")"
+check "and leaves the rest alone" "0" "$(grep -c '^move-sink-input 42 ' "$PACTL_LOG")"
+check "status lists the apps playing, excluded or not" "Chromium:false|zoom:true" \
+  "$(run status | jq -r '[.apps[] | "\(.name):\(.excluded)"] | join("|")')"
+: >"$PACTL_LOG"
+run include-app ZOOM >/dev/null
+check "include-app puts it back on the equalizer now" "1" "$(grep -c '^move-sink-input 44 omarchy_equalizer$' "$PACTL_LOG")"
+check "and drops it from the list" "[]" "$(run status | jq -c '.excludedApps')"
+out="$(run include-app zoom)"; rc=$?
+check "including an app that is not excluded is refused" "1|'zoom' is not excluded." "$rc|$out"
+check "the follower wakes for a new stream" "wake" "$(follow_event_wanted "Event 'new' on sink-input #12" && echo wake || echo ignore)"
+unset PACTL_APP_STREAMS PACTL_LOG PACTL_DEVICE_SINK PACTL_DEFAULT_SINK
+run disable >/dev/null
+
+echo "== every output device keeps its own curve =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run disable >/dev/null
+export PACTL_DEVICE_SINK=audio_effect.stub-dsp PACTL_DEFAULT_SINK=audio_effect.stub-dsp
+run apply-preset Rock >/dev/null
+run enable >/dev/null
+st="$XDG_STATE_HOME/omarchy-equalizer/state.json"
+check "the device it plays into is the active one" "audio_effect.stub-dsp" "$(jq -r '.activeDevice' "$st")"
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+run retarget >/dev/null
+jq -c '.targetPickedAt = 100' "$st" >"$st.x" && mv "$st.x" "$st"
+buds=bluez_output.AA_BB_CC_DD_EE_FF.1
+export PACTL_DEVICE_SINK2=$buds; run retarget >/dev/null
+export PACTL_EQ_AIM=1 PACTL_EQ_AIM_SINK_ID=3; run retarget >/dev/null
+check "a device seen for the first time keeps what was playing" "$buds|Rock" "$(jq -r '"\(.targetSink)|\(.preset)"' "$st")"
+check "the device is keyed without its profile suffix" "bluez_output.AA_BB_CC_DD_EE_FF" "$(jq -r '.activeDevice' "$st")"
+run apply-preset "Bass Boost" >/dev/null
+# The earbuds go back in the case: the stream falls back to the speakers.
+export PACTL_DEVICE_SINK2= PACTL_EQ_AIM_SINK_ID=2
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run retarget >/dev/null
+check "back on the speakers, their own curve comes back" "audio_effect.stub-dsp|Rock" "$(jq -r '"\(.targetSink)|\(.preset)"' "$st")"
+check "the switch is live, not a rebuild" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+check "and reaches the graph" "1" "$(grep -c 'para:ft_0' "$PWCLI_LOG")"
+check "the earbuds' curve is remembered" "Bass Boost" "$(jq -r '.deviceCurves["bluez_output.AA_BB_CC_DD_EE_FF"].preset' "$st")"
+# The earbuds come back, under their other profile.
+export PACTL_DEVICE_SINK2=bluez_output.AA_BB_CC_DD_EE_FF.2 PACTL_EQ_AIM_SINK_ID=3
+jq -c '.targetPickedAt = 100 | .seenSinks = {}' "$st" >"$st.x" && mv "$st.x" "$st"
+run retarget >/dev/null
+run retarget >/dev/null
+check "back on the earbuds, theirs comes back" "Bass Boost" "$(jq -r '.preset' "$st")"
+check "devices lists what is remembered" "audio_effect.stub-dsp:Rock|bluez_output.AA_BB_CC_DD_EE_FF:Bass Boost" \
+  "$(run devices | jq -r '[.[] | "\(.device):\(.preset)"] | join("|")')"
+run forget-device audio_effect.stub-dsp >/dev/null
+check "forget-device drops a device's curve" "1" "$(run devices | jq 'length')"
+run set-device-memory off >/dev/null
+export PACTL_DEVICE_SINK2= PACTL_EQ_AIM_SINK_ID=2
+run retarget >/dev/null
+check "with device memory off one curve plays everywhere" "Bass Boost" "$(jq -r '.preset' "$st")"
+unset PACTL_DEVICE_SINK2 PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID
+run set-device-memory on >/dev/null
+check "status names the device and its description" "audio_effect.stub-dsp|Stub audio_effect.stub-dsp" \
+  "$(run status | jq -r '"\(.deviceKey)|\(.deviceLabel)"')"
+run disable >/dev/null
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK
+
+echo "== preset files =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run export-preset Rock "$T/rock.json" >/dev/null
+check "an exported preset names its format, version and name" "omarchy-equalizer-preset|1|Rock" \
+  "$(jq -r '"\(.format)|\(.version)|\(.name)"' "$T/rock.json")"
+check "it carries the bands and the preamp" "10|-0.5" "$(jq -r '"\(.graphic | length)|\(.preamp)"' "$T/rock.json")"
+out="$(run import-preset "$T/rock.json")"; rc=$?
+check "a built-in's name is refused on import" "1" "$rc"
+out="$(run import-preset "$T/rock.json" "My Rock")"; rc=$?
+check "imported under its own name" "0|My Rock" "$rc|$(jq -r '.preset' <<<"$out")"
+check "the import is a user preset" "user" "$(run status | jq -r '[.presets[] | select(.name == "My Rock")][0].category')"
+run apply-preset "My Rock" >/dev/null
+check "and applies like one" "My Rock|false" "$(run status | jq -r '"\(.preset)|\(.presetDirty)"')"
+jq '.graphic[0].gain = 90' "$T/rock.json" >"$T/loud.json"
+out="$(run import-preset "$T/loud.json" Loud)"; rc=$?
+check "an out-of-range preset file is refused" "1" "$rc"
+check "and says why" "1" "$(grep -c 'out of range: Band 0 gain 90' <<<"$out")"
+jq '.graphic[0].q = "0.7}\nINJECTED_MARKER"' "$T/rock.json" >"$T/evil.json"
+out="$(run import-preset "$T/evil.json" Evil)"; rc=$?
+check "a crafted preset file is refused" "1" "$rc"
+printf '{"name":"x"}\n' >"$T/notapreset.json"
+out="$(run import-preset "$T/notapreset.json")"; rc=$?
+check "a file without the format is refused" "1|'$T/notapreset.json' is not an equalizer preset." "$rc|$out"
+out="$(run apply-preset ../../etc/x)"; rc=$?
+check "a preset name cannot step out of the preset directory" "1" "$rc"
+run delete-preset "My Rock" >/dev/null
+
+echo "== the state file carries its version, and keys it does not know =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-gain 1 2 >/dev/null
+check "a written state names its version" "3" "$(jq -r '.version' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+jq '.futureKey = {"kept": true} | .version = 7' "$XDG_STATE_HOME/omarchy-equalizer/state.json" >"$T/s.json" &&
+  mv "$T/s.json" "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run set-gain 1 3 >/dev/null
+check "an unknown key survives an edit" "true" "$(jq -r '.futureKey.kept' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+check "a newer version number is not written back down" "7" "$(jq -r '.version' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+
+echo "== AutoEq: unnumbered filters and a built-in's name =="
+printf 'Preamp: -3 dB\nFilter: ON PK Fc 1000 Hz Gain 3.0 dB Q 1.0\nFilter: ON LSC Fc 105 Hz Gain 2.0 dB Q 0.7\n' >"$T/Rock ParametricEQ.txt"
+out="$(run import-autoeq "$T/Rock ParametricEQ.txt")"; rc=$?
+check "unnumbered filter lines import" "0|2" "$rc|$(jq -r '.bands' <<<"$out")"
+check "a profile named like a built-in is saved under a suffix" "Rock (AutoEq)" "$(jq -r '.preset' <<<"$out")"
+check "and the state names the suffixed preset" "Rock (AutoEq)" "$(run status | jq -r '.preset')"
+run delete-preset "Rock (AutoEq)" >/dev/null
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 
 echo "== panel fields never use a native Qt text input =="

@@ -213,13 +213,71 @@ function typeLabel(type) {
   return "Peaking";
 }
 
+// Only the two pass filters take a slope: a cascade of shelves or bells would
+// just double their gain, which is a different curve, not a steeper one.
+function typeHasSlope(type) {
+  var t = String(type || "peaking");
+  return t === "lowpass" || t === "highpass";
+}
+
+// A band switched off stays in the list (and keeps its slots) but shapes nothing.
+function bandEnabled(b) {
+  return !!b && b.enabled !== false;
+}
+
+// The slope a band is run at: 1..4, i.e. 12..48 dB/octave for a pass filter, and
+// always 1 for every other type.
+var MAX_SLOPE = 4;
+function bandSlope(b) {
+  if (!b || !typeHasSlope(b.type)) return 1;
+  var n = Math.round(Number(b.slope) || 1);
+  return Math.max(1, Math.min(MAX_SLOPE, n));
+}
+
+// The filter slots a band occupies in the 16-slot pool. A bypassed band keeps
+// its slots, so switching it back on can never run out of room.
+function bandSlots(b) { return b ? bandSlope(b) : 0; }
+function slotCount(bands) {
+  var n = 0;
+  for (var i = 0; i < (bands || []).length; i++) n += bandSlots(bands[i]);
+  return n;
+}
+
+// A band as the graph runs it: nothing while bypassed, and a pass filter with a
+// slope of N as N cascaded biquads with Butterworth Qs, scaled by the band's own
+// Q so the default 0.707 is a true Butterworth of order 2N and a higher Q still
+// adds the same resonance at the corner. LSP's own slope control is not used:
+// in the APO (DR) mode the pool runs it is ignored (measured -- x2 and x4
+// respond exactly like x1), so the stages are separate slots instead.
+// tests/run-tests.sh holds the backend's jq copy of this to the same numbers.
+function bandStages(b) {
+  if (!bandEnabled(b)) return [];
+  var n = bandSlope(b);
+  if (n <= 1) return [b];
+  var scale = (Number(b.q) || Math.SQRT1_2) / Math.SQRT1_2;
+  var out = [];
+  for (var k = 1; k <= n; k++)
+    out.push({ type: b.type, freq: b.freq, gain: 0,
+               q: scale / (2 * Math.cos((2 * k - 1) * Math.PI / (4 * n))) });
+  return out;
+}
+
+function expandBands(bands) {
+  var out = [], list = bands || [];
+  for (var i = 0; i < list.length; i++) {
+    var stages = bandStages(list[i]);
+    for (var k = 0; k < stages.length; k++) out.push(stages[k]);
+  }
+  return out;
+}
+
 // "Bands" that carry a gain for the summary line: a pass filter contributes no
 // shaping, so counting it as flat would understate the preset.
 function shapedCount(bands) {
   var n = 0;
   for (var i = 0; i < (bands || []).length; i++) {
     var b = bands[i];
-    if (!b) continue;
+    if (!bandEnabled(b)) continue;
     if (!typeHasGain(b.type)) continue;
     if (Math.abs(Number(b.gain) || 0) >= 0.05) n++;
   }
@@ -230,7 +288,7 @@ function strongestBand(bands) {
   var best = null;
   for (var i = 0; i < (bands || []).length; i++) {
     var b = bands[i];
-    if (!b || !typeHasGain(b.type)) continue;
+    if (!bandEnabled(b) || !typeHasGain(b.type)) continue;
     var g = Number(b.gain) || 0;
     if (best === null || Math.abs(g) > Math.abs(Number(best.gain) || 0)) best = b;
   }
@@ -252,12 +310,13 @@ function strongestBand(bands) {
 // metrics() from several bindings for every status echo, so one memo slot and a
 // test-only build counter save the sweep without anything else accumulating.
 //
-// In parametric mode with LSP the bands run through a para_equalizer_x16_mono in
-// APO (DR) mode at slope x1 instead of the builtin biquads. That mode was chosen
-// precisely because its bell and shelf shapes and its Q meaning match this RBJ
-// math, so the same coefficients remain the model for the drawn curve and for
-// auto_preamp_db; tests/run-tests.sh pins the pool's fm/s mapping that keeps it
-// so. Nothing here changes for the plugin.
+// With LSP the bands run through a para_equalizer_x16_stereo in APO (DR) mode at
+// slope x1 instead of the builtin biquads. That mode was chosen precisely
+// because its bell, shelf and pass shapes and its Q meaning match this RBJ math,
+// so the same coefficients remain the model for the drawn curve and for
+// auto_preamp_db. tests/dsp-check.sh measures the running plugin against these
+// functions (every type within 0.05 dB), and tests/run-tests.sh pins the pool's
+// fm/s mapping that keeps it so. Nothing here changes for the plugin.
 
 function biquadCoefficients(type, freq, q, gain, rate) {
   var fs = (Number(rate) > 0) ? Number(rate) : 48000
@@ -333,13 +392,13 @@ function magnitudeDb(c, freq, rate) {
   return 20 * Math.log10(Math.max(num / den, 1e-9))
 }
 
-// The whole chain at one frequency: preamp plus every band, exactly the order
+// The whole chain at one frequency: preamp plus every stage, exactly the order
 // the graph runs them (the preamp has one control, so its dB is a plain sum).
 function responseDb(bands, preamp, freq, rate) {
   var total = Number(preamp) || 0
-  for (var i = 0; i < (bands || []).length; i++) {
-    var b = bands[i]
-    if (!b) continue
+  var stages = expandBands(bands)
+  for (var i = 0; i < stages.length; i++) {
+    var b = stages[i]
     total += magnitudeDb(biquadCoefficients(b.type, b.freq, b.q, b.gain, rate), freq, rate)
   }
   return total
@@ -379,10 +438,9 @@ function peakFromCoefficients(coeffs, rate, from, to, steps, preamp) {
 var coefficientBuilds = 0
 function chainCoefficients(bands, rate) {
   coefficientBuilds++
-  var out = [], list = bands || []
+  var out = [], list = expandBands(bands)
   for (var i = 0; i < list.length; i++) {
     var b = list[i]
-    if (!b) continue
     out.push(biquadCoefficients(b.type, b.freq, b.q, b.gain, rate))
   }
   return out
@@ -434,9 +492,53 @@ function metricsSignature(bands, rate) {
   for (var i = 0; i < list.length; i++) {
     var b = list[i]
     if (!b) continue
-    parts.push([b.type, b.freq, b.q, b.gain].join(","))
+    parts.push([b.type, b.freq, b.q, b.gain, bandEnabled(b) ? 1 : 0, bandSlope(b)].join(","))
   }
   return parts.join("|")
+}
+
+// ---------------------------------------------------------------- loudness
+//
+// How loud a curve plays against Flat, as one number: the mean of the curve over
+// the log sweep (pink noise -- equal energy per octave) blended with the same
+// mean under A-weighting (the ear's own). A-weighted alone is too generous to a
+// deep bass cut, pink alone too hard on it; tests/preset-levels.js gates the
+// built-ins on the same blend. The level-matched A/B (the backend's compare
+// command) and the "vs Flat" readout use it, so it lives here once and the
+// backend's awk copy is held to it by tests/run-tests.sh.
+
+// 0 dB at 1 kHz.
+function aWeightDb(f) {
+  var f2 = f * f, f4 = f2 * f2
+  var ra = 12194 * 12194 * f4 /
+    ((f2 + 20.6 * 20.6) * Math.sqrt((f2 + 107.7 * 107.7) * (f2 + 737.9 * 737.9)) * (f2 + 12194 * 12194))
+  return 20 * Math.log10(2 * ra) + 2
+}
+
+// The level of a curve already sampled on the 401-point sweep peakDb walks
+// (20 Hz .. 20 kHz, log-spaced), so the panel's metrics get it from the same
+// series as the peak. A-weights are fixed per point, so they are built once.
+var aWeights = null
+function levelFromSeries(values) {
+  var n = values.length
+  if (n < 2) return 0
+  if (aWeights === null || aWeights.length !== n) {
+    aWeights = []
+    for (var i = 0; i < n; i++)
+      aWeights.push(Math.pow(10, aWeightDb(20 * Math.pow(1000, i / (n - 1))) / 10))
+  }
+  var sum = 0, wn = 0, wd = 0
+  for (var k = 0; k < n; k++) {
+    sum += values[k]
+    wn += aWeights[k] * Math.pow(10, values[k] / 10)
+    wd += aWeights[k]
+  }
+  return (sum / n + 10 * Math.log10(wn / wd)) / 2
+}
+
+// The curve's level with this preamp, in dB against Flat at unity.
+function curveLevelDb(bands, preamp, rate) {
+  return levelFromSeries(responseSeries(chainCoefficients(bands, rate), preamp, rate, 401))
 }
 
 // One call per status change in the panel, shared by every binding that needs a
@@ -450,18 +552,36 @@ function metrics(bands, sampleRate) {
   if (metricsCache !== null && metricsCache.signature === signature)
     return metricsCache.value
 
-  var peak = peakFromCoefficients(chainCoefficients(bands, rate), rate)
+  var series = responseSeries(chainCoefficients(bands, rate), 0, rate, 401)
+  var peak = peakFromSeries(series)
   var value = {
     peakDb: peak.db,
     peakFreq: peak.freq,
     autoPreamp: autoPreampForPeak(peak.db),
+    // The level of the bands alone (preamp 0); add the preamp in force for
+    // what is heard against Flat at the same volume.
+    levelDb: levelFromSeries(series),
     // Bands that actually shape the sound; the gain and type it reads are in
     // the signature, so the memo keeps it in step with the rest.
     shapedCount: shapedCount(bands),
+    slots: slotCount(bands),
     signature: signature
   }
   metricsCache = { signature: signature, value: value }
   return value
+}
+
+// The peak of a series on the 401-point sweep, the same walk
+// peakFromCoefficients does over the values it computes.
+function peakFromSeries(values) {
+  var lo = 20, hi = 20000, max = -Infinity, at = lo
+  for (var i = 0; i < values.length; i++) {
+    if (values[i] > max) {
+      max = values[i]
+      at = lo * Math.pow(hi / lo, i / (values.length - 1))
+    }
+  }
+  return { db: max, freq: at }
 }
 
 // Tests start from a known-cold cache without reaching into the memo object.
