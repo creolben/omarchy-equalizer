@@ -1387,7 +1387,8 @@ live_send_params() {
 # an empty file means no walk is running.
 gain_walk_file="$state_root/gain-walk"
 gain_walk_step=0.1
-gain_walk_interval=0.02
+# (OMARCHY_EQ_WALK_INTERVAL slows a walk down for a test that has to catch one.)
+gain_walk_interval="${OMARCHY_EQ_WALK_INTERVAL:-0.02}"
 
 gain_walk_claim() {
   state_dir_ensure

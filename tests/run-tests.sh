@@ -1882,9 +1882,11 @@ frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
 check "the fragment carries it, so a restart keeps it" "1" "$(grep -c 'name = drelief_l label = linear control = { "Mult" = 1.995262' "$frag")"
 # A walk the relief alone takes over is finished, not stranded: the device
 # relief is written as the follower has it and the preamp at the walk's target.
+# The walk is slowed to 0.1 s a step (3.5 s in all), so the pass lands inside
+# it on any machine, and its start is waited for rather than assumed.
 unset OMARCHY_EQ_NO_RAMP
-run set-gains 8 6 4 0 0 0 0 0 0 0 >/dev/null
-sleep 0.1
+OMARCHY_EQ_WALK_INTERVAL=0.1 run set-gains 8 6 4 0 0 0 0 0 0 0 >/dev/null
+for _ in $(seq 100); do grep -q '^w' "$XDG_STATE_HOME/omarchy-equalizer/gain-walk" 2>/dev/null && break; sleep 0.02; done
 check "a deeper cut walks while the limiter is on" "1" "$(grep -c '^w' "$XDG_STATE_HOME/omarchy-equalizer/gain-walk")"
 PACTL_DEVICE_VOLUME_DB=-2.00 run retarget >/dev/null
 export OMARCHY_EQ_NO_RAMP=1
