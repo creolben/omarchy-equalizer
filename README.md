@@ -1,22 +1,30 @@
 # Equalizer
 
 An Omarchy shell plugin that puts a system-wide equalizer in front of any PipeWire
-output: a 10-band graphic EQ, up to 16 parametric bands (with bypass, solo and
-12–48 dB/oct pass filters), level-matched presets with a level-matched A/B,
-AutoEq headphone import, automatic headroom that gives its cut back below full
-volume, a curve per output device, and a stereo output stage (a linked brickwall
-limiter, a multiband boost with night and voice characters, and a loudness
-leveler), plus mono/swap/balance and per-app exclusions.
+output: a 10-band graphic EQ whose faders set what the curve does at their
+frequencies, up to 16 parametric bands edited on the curve (with bypass, solo
+and 12–48 dB/oct pass filters), level-matched presets with a level-matched A/B,
+undo and redo, AutoEq headphone import, headroom that is Safe, Balanced or
+manual and gives its cut back below full volume, a curve per output device, and
+a stereo output stage (a linked brickwall limiter, a multiband boost with night
+and voice characters, and a loudness leveler), plus mono/swap/balance and
+per-app exclusions.
+
+Every adjustment is heard while the hand moves: a drag is streamed into the
+running graph as it happens (about 15 ms from a move to the graph), and filed --
+one state write, one undo step -- when it is let go.
 
 <p align="center">
-  <img src="docs/panel.png" width="430" alt="The equalizer panel: power switch and level meter, the preset picker, and the Response tab with the curve, ten faders and the preamp">
+  <img src="docs/panel.png" width="430" alt="The equalizer panel: power switch, the preset picker, and the Response tab with the curve, ten faders and the preamp (this picture predates 3.0: the meter row is gone, the level sits beside the summary, and the spectrum is behind the curve)">
 </p>
 
-The panel keeps the power switch, the level meter and the preset picker fixed at
-the top; below them a tab bar switches between **Response** (the curve, the
-10-band faders or the parametric handles, the mode switch and the preamp),
-**Bands** (one row per band, parametric mode only), **Output** (limiter,
-dynamics, leveler, channels, device curves and apps) and **AutoEq**.
+The panel keeps the power switch, the output level and the preset picker fixed
+at the top; below them a tab bar switches between **Response** (the curve with
+the shape of what is playing behind it, the 10-band faders or the parametric
+handles and the selected band's strip, the mode switch, the preamp and the
+headroom), **Bands** (one card per band, parametric mode only), **Output**
+(limiter, device relief, dynamics, leveler, channels, device curves and apps)
+and **AutoEq**.
 
 Everything is driven from the panel; the same operations are available from the
 command line.
@@ -46,11 +54,12 @@ omarchy plugin enable io.github.creolben.equalizer
 - Omarchy (quickshell) with a systemd user session
 - PipeWire and `pactl`/`parec` (pipewire-pulse, libpulse), `jq`, `awk`,
   coreutils and `flock` (util-linux)
-- `python3` for the panel's level meter (`bin/omarchy-equalizer-spectrum`). It
-  reads the equalizer's own output stream -- what you hear, after every band and
-  the output stage -- through `parec --monitor-stream`, turns it into 24 band
-  levels in memory and prints them to the panel; it writes no files, uses no
-  network, and runs only while the panel is open and the equalizer is on.
+- `python3` for the spectrum drawn behind the curve
+  (`bin/omarchy-equalizer-spectrum`). It reads the equalizer's own output stream
+  -- what you hear, after every band and the output stage -- through
+  `parec --monitor-stream`, turns it into 24 band levels in memory and prints
+  them to the panel; it writes no files, uses no network, and runs only while
+  the panel is open and the equalizer is on.
 - `curl` for AutoEq import; `node` to run the test suite
 - Optional: `lsp-plugins-lv2` for the output stage (its stereo
   `para_equalizer_x16`, `mb_compressor`, `limiter` and `autogain` builds). Without
@@ -61,7 +70,10 @@ omarchy plugin enable io.github.creolben.equalizer
   16-slot LSP equalizer, so every edit -- a preset of either mode, a mode switch,
   a band's type, slope or bypass, adding/removing bands, an AutoEq import -- is a
   live `pw-cli` write rather than a filter-chain restart. Without it, a shape
-  change still restarts the chain (players may pause for it).
+  change still restarts the chain (players may pause for it), and every band
+  change clicks once: PipeWire's builtin biquad clears its history on each
+  update (measured in `tests/dsp-check.sh`), so the live editor writes it at
+  most ten times a second.
 
 Enabling makes the equalizer the default sink and moves application streams onto
 it (an excluded app goes straight to the device instead); disabling restores the
@@ -103,7 +115,11 @@ it if you plan to install the plugin again.
 
 - `bin/omarchy-equalizer` — a bash script that owns the state, generates the
   filter-chain fragment, and drives the systemd unit. All the DSP configuration
-  lives here.
+  lives here. `omarchy-equalizer live` is its drag path: the panel keeps it
+  running while it is open and streams values on its stdin; it writes only the
+  controls that changed into the running graph -- no state read and no `jq`
+  between commits, about 10–20 ms per line with the real `pw-cli` -- and on
+  `commit` files the edit like `set-band` would.
 - `host/omarchy-equalizer.conf` — the filter-chain host, copied to
   `~/.config/pipewire/omarchy-equalizer.conf` on enable. This plugin runs its own
   PipeWire client (`pipewire -c omarchy-equalizer.conf`) rather than using the
@@ -117,7 +133,7 @@ it if you plan to install the plugin again.
 
   ```
   preamp → channels (stereo/mono/swap, balance) → bands → leveler → boost
-         → relief → volume → limiter
+         → relief → volume → limiter → device relief
   ```
 
   With `lsp-plugins-lv2` the band set of either mode runs on one resident
@@ -134,8 +150,8 @@ it if you plan to install the plugin again.
 - State lives outside the plugin, in
   `${XDG_STATE_HOME:-~/.local/state}/omarchy-equalizer/`: `state.json` (versioned;
   keys a version does not know pass through every edit untouched),
-  `presets.json` for user presets, the layout of the running graph, and a cached
-  AutoEq index.
+  `presets.json` for user presets, `history.json` (the curve's undo and redo,
+  30 steps each), the layout of the running graph, and a cached AutoEq index.
 - Two user units: `omarchy-equalizer.service` (the filter-chain) and
   `omarchy-equalizer-follow.service`, which re-aims the equalizer when the output
   device changes — plugging in headphones otherwise leaves the equalizer playing
@@ -171,42 +187,68 @@ it if you plan to install the plugin again.
   the backend computes are the same formulas, in JS and `awk` respectively, and
   `tests/headroom-check.js` keeps them honest against each other.
 
-The card has a fixed band and a tabbed one. The fixed band never moves: hero,
-the meter (a row of bars driven by the output's loudness, beats and spectrum,
-that goes quiet when the signal does), and the
-preset picker with its reset/delete actions. Below it a tab bar picks one page:
-**Response** (the curve, the faders in 10-band mode, the mode control and the
-preamp row directly under them), **Bands** (one row per band, parametric mode
-only), **Output** (limiter, dynamics, leveler, channels, device curves and
-apps) and **AutoEq**. Every open starts on
-Response. A page only scrolls when it is taller than the card can fit -- the
-Response page on a short (768 px) screen, or a long parametric band list.
-Errors and AutoEq feedback appear in a one-line status strip pinned at the
-bottom, which clears 8 s after the last message. The `e`, `m`, `r` and `a` shortcuts
-are named in the tooltips of the power switch, the mode control and the preset
-reset.
+The card has a fixed band and a tabbed one. The fixed band never moves: hero
+(what is shaped, and the output level beside it, held red as CLIP when it
+clips) and the preset picker, with the actions on the loaded preset in its row
+-- back to it as saved and save over it (both only while it reads EDITED), save
+as a new one, flatten, delete. Below it a tab bar picks one page: **Response**
+(the console's A/B and mode, a line on where the curve lands the signal, the
+curve, the faders in 10-band mode or the selected band's strip in parametric
+mode, the preamp and the headroom), **Bands** (one card per band, parametric
+mode only), **Output** (limiter, device relief, dynamics, leveler, channels,
+device curves and apps) and **AutoEq**. Every open starts on Response. A page
+only scrolls when it is taller than the card can fit. Errors and notices
+appear in a one-line status strip pinned at the bottom, which clears 8 s after
+the last message. Secondary text is drawn at the dimmest shade of the
+foreground that still holds a 4.5:1 contrast against the background, in a
+light theme as in a dark one.
 
-The preset picker filters as you type, on each preset's name, category and
-description ("compas" finds Kompa). Its search box is drawn from key events like
-the panel's other fields, so the picker never creates a native text input.
+Behind the curve, softly, is the shape of what is playing: the 24 levels the
+spectrum helper reads off the equalizer's own output, on the curve's own
+frequency axis, rising at once and falling back slowly. Its scale is relative,
+so it carries no dB labels.
+
+**10-band faders set the response.** Ten octave bells at Q 1.41 overlap, so a
+bell's own gain is not what the curve does at its frequency (all ten at +6 dB
+peak at +8.8). The faders, their numbers and the curve's handles show the
+response at each band's centre, and moving one solves all ten bells so the
+curve passes through every fader and no other fader moves. The state and the
+presets keep bell gains, so a curve nobody touches plays exactly as before;
+its faders just read what it does.
+
+**Parametric bands are edited on the curve.** Drag a handle for gain and
+frequency (hold Shift for fine steps); the wheel over the selected handle (or
+any handle, with Alt) sets its Q, a sixth of an octave of bandwidth per notch;
+double-click empty plot to add a band there; a pass filter's handle is a
+diamond on the 0 dB line that moves sideways; a bypassed band keeps a hollow
+handle. With the curve focused: ←/→ pick a band, ↑/↓ move it 0.5 dB (Shift
+0.1), Shift+←/→ move its frequency 1/24 octave, `[`/`]` its Q, `0` flattens
+it, `b` bypasses it, `s` solos it and Delete removes it. Under the curve, the
+selected band's strip has its type, frequency (Hz, or kHz with a k: `2.5k`),
+Q, gain, Bypass, Solo and remove; ↑/↓ in a field nudge it.
 
 The wheel scrolls the panel. Over a band fader it nudges the band instead — hold
 Alt, or click the fader first, to arm it. The preamp only moves by dragging or
 with the arrow keys, because a vertical wheel over a horizontal control is never
-a deliberate edit. The curve ignores the wheel too. Click the curve (or Tab to
-it) and the keyboard drives it: ←/→ pick a band, ↑/↓ move it 0.5 dB, `0`
-flattens it.
+a deliberate edit.
+
+**Undo** is `u` (or Ctrl+Z) and **redo** Shift+U (Ctrl+Shift+Z): every edit of
+the curve -- a drag, a preset, a reset, a mode switch, an import -- is one step;
+the `r` that flattens says so in the status strip. A device's own curve coming
+back when its device does clears the history: undoing across it would put one
+device's curve on another. `e` switches the equalizer, `m` the mode and `a`
+the A/B.
 
 **A/B** on the response console (or `a`) plays Flat at the curve's own loudness
 -- the bands out, the preamp set to the curve's level against Flat -- so what you
 compare is the tone, not the volume (the louder side always sounds better). An
 A/B or a solo lasts until the next edit of the curve (a preamp change included)
 or the next enable; a restart in between keeps it, because the fragment carries
-what is playing. The
-console's top line reads the curve's level against Flat (`−1.4 dB VS FLAT`). In
-the Bands tab, a click on a band's number bypasses it (it keeps its values and
-shapes nothing) and a right-click solos it; the type picker offers the pass
-filters at 12, 24, 36 and 48 dB/octave, and the slot budget sits beside Add band.
+what is playing. The console's second line reads where the curve lands the
+signal (`+9.3 dB AT 32 HZ · −0.2 dB VS FLAT`). In the Bands tab each band's
+Bypass and Solo are buttons; a click on a band's number still bypasses it and a
+right-click solos it; the type picker offers the pass filters at 12, 24, 36 and
+48 dB/octave, and the slot budget sits beside Add band.
 
 ## Command line
 
@@ -218,10 +260,12 @@ retarget                        Re-aim the EQ at the current output device, repl
 follow                          Watch for output changes (run by systemd)
 set-mode <graphic|parametric>   Choose which band set is processed
 set-gain <index> <dB>           Set one band's gain (live, no restart)
+set-gains <dB> ...              Every band's gain at once (one per band)
 set-band <index> <gain|freq|q|type|enabled|slope> <value>
                                 Set one band property; enabled on|off bypasses a
                                 band, slope 1-4 is 12-48 dB/oct (pass filters)
-add-band                        Append a parametric band (16 filter slots)
+add-band [freq] [gain] [q] [type]
+                                Append a parametric band (16 filter slots)
 remove-band <index>             Drop a parametric band
 compare [on|off|toggle]         A/B: hear Flat at the curve's own loudness
 solo <index|off>                Hear one band alone
@@ -231,9 +275,14 @@ delete-preset <name>            Delete a user preset
 export-preset <name> [file]     Write a preset to a file (or stdout)
 import-preset <file> [name]     Save a preset file as a user preset
 reset                           Flatten the current mode's gains
+undo | redo                     Step the curve's history
+revert-preset                   Back to the loaded preset as saved
 presets                         List preset names
 set-preamp <dB>                 Whole-chain preamp (clamped to the curve's ceiling)
-set-headroom <auto|manual>      Auto-track the preamp to the band peaks
+set-headroom <auto|balanced|manual>
+                                The preamp follows the curve's peak (auto, "Safe"),
+                                its programme level with the limiter (balanced),
+                                or stays put (manual)
 set-limiter <on|off>            Brickwall output limiter (live, no restart)
 set-boost <off|low|medium|high|night|voice>
                                 Dynamics: a boost strength, or a character
@@ -241,6 +290,8 @@ set-leveler <on|off>            Bring every source to one loudness
 set-channels <stereo|mono|swap> Channel handling ahead of the bands
 set-balance <-1..1>             Left/right balance
 set-device-memory <on|off>      Give every output device its own curve
+set-device-relief <on|off>      Give the cut back as the device's own volume allows
+live                            Streamed edits on stdin (run by the panel)
 devices                         Devices that remember a curve
 forget-device <device>          Drop a device's remembered curve
 exclude-app <name>              Keep an app off the equalizer
@@ -271,9 +322,30 @@ application name or process binary, without case.
   A value outside that is refused with a message, whether it comes from the CLI, a
   preset or an AutoEq profile, so a well-formed but extreme profile cannot turn
   the chain into an amplifier. A refused command leaves the state as it was.
-- **Automatic headroom** (`headroom: auto`) recomputes the preamp from the peak of
+- **Safe headroom** (`headroom: auto`) recomputes the preamp from the peak of
   the whole curve on every band, mode, preset or import change, so a boost cannot
   clip at full volume. Moving the preamp by hand switches it to `manual`.
+- **Balanced headroom** (`headroom: balanced`) cuts by what the curve adds to
+  programme material -- its pink-noise power gain -- plus a 3.5 dB margin, and
+  leaves the rare peak above that to the limiter: a +9.3 dB bass shelf is cut
+  7.5 dB instead of 9.5, a +10 dB treble lift 5 instead of 10. The margin is
+  the smallest that holds `tests/dsp-check.sh`'s gate: full-scale 50 Hz bursts
+  over pink noise through the bass shelf stay under 2 % THD, move a quiet
+  pilot tone by at most 1.5 dB, and never pass the ceiling. It needs the
+  limiter: with the limiter off, or without LSP, it plays as Safe (the state
+  keeps the choice). Safe stays the default.
+- **While a control is held the preamp holds.** A drag is streamed with the
+  preamp where it was, the limiter covering the difference, and the preamp
+  settles when it is let go; the preamp row says both meanwhile
+  (`0.0 → −6.0 dB`). Without the limiter the cut deepens with every boost at
+  once (nothing else would catch the clip) and is given back after.
+- **Flat gains walk.** The preamp, the relief and the device relief are flat
+  gains, and a flat gain stepped at once clicks (measured under a 50 Hz tone:
+  13 dB above the tone's own largest step for 0.5 dB, 2.6 dB for 0.1 dB; the
+  bands, being filters, do not click). They move in steps of at most 0.1 dB,
+  one per 20 ms, while the limiter is on or whenever the cut gets smaller; a
+  newer write cancels a walk in progress. A preset of the same shape is
+  cross-faded on the pool: the bands in eight steps, then the gains walked.
 - **Volume relief.** Below full volume the volume control is already that much
   quieter than full scale, and a full cut would only make the curve play quieter
   than it should -- a +6 dB bass curve at half volume lost 6 dB of everything
@@ -290,8 +362,21 @@ application name or process binary, without case.
   takes no relief. The relief reads the equalizer's own volume, not the
   device's: a device's volume may be in its hardware (Bluetooth headphones),
   where the signal reaching it must stay under full scale whatever the volume.
-  Omarchy's volume keys move the device's volume, so with them the relief stays
-  at zero.
+  Omarchy's volume keys move the device's volume, so with them this relief
+  stays at zero; the device relief below is the one for them.
+- **Device relief** (`set-device-relief on`, or its switch on the Output tab;
+  off by default, because on it changes what is heard below full device
+  volume). Where the device applies its volume in software -- its `Flags` have
+  no `HW_VOLUME_CTRL` and its base volume is 100 %, as the J313 speakers' do --
+  the cut is given back after the limiter instead: `min(cut − relief, −device
+  volume)`. The limiter holds the graph's output at −1 dBFS, the device relief
+  lifts it by no more than the device's volume then takes off, and the device
+  converts it no louder than the ceiling. A Bluetooth headset's volume is in
+  its hardware, so it gets none, and neither does a muted device, manual
+  headroom, or a graph without the limiter. The follower answers a volume
+  change on the device before it drains the event burst; between a volume-up
+  and that answer (a few tens of ms) a peak at the device can pass full scale
+  by one volume step, which nothing after the limiter catches.
 - **The volume is in the graph**, after the bands and the dynamics and before the
   limiter (`capture.volumes`): the leveler and the boost always see the program
   at its own level (a leveler in front of the volume would undo every volume
@@ -312,7 +397,7 @@ application name or process binary, without case.
   `omarchy-audio-output-sink` do) would silently drop that correction; on an Asahi
   laptop the J313 speaker tuning is the largest single part of how the speakers
   sound.
-- **Limiter** — last node in the graph, true-peak, −1 dBFS ceiling, stereo-linked
+- **Limiter** — last processing node in the graph (only the device relief follows it), true-peak, −1 dBFS ceiling, stereo-linked
   (a peak on one side lowers both, so the image stays put). Its envelope is
   LSP's Herm Thin with a 20 ms lookahead and attack, measured on the test rig:
   holding a sine 3 dB over the ceiling, the old 5 ms lookahead made 13.9 % THD
@@ -354,8 +439,8 @@ application name or process binary, without case.
 ## Tests
 
 ```sh
-bash tests/run-tests.sh     # 491 assertions (490 where PipeWire is missing), no real sink touched
-bash tests/dsp-check.sh     # the real graph, measured (about two minutes)
+bash tests/run-tests.sh     # 607 assertions (606 where PipeWire is missing), no real sink touched
+bash tests/dsp-check.sh     # the real graph, measured (about three minutes)
 ```
 
 `tests/dsp-check.sh` (also run by the suite when PipeWire is installed) plays
@@ -364,7 +449,13 @@ daemon with the real plugins, and measures what comes out against `Model.js`: a
 null test, every filter type and slope, bypass, a preset, the A/B, solo, the
 volume relief under the in-graph volume, mono/swap/balance, the limiter's ceiling,
 its stereo link and its bass THD, the dynamics characters, the leveler and the
-latency -- on the LSP pool and on the builtin biquads. Its daemon has no devices
+latency -- on the LSP pool and on the builtin biquads. It also drives the live
+editor the way the panel does: a streamed gain is in the graph before its
+commit, a line reaches the graph in under 34 ms with the real `pw-cli`, a
+streamed +12 dB sweep under the held preamp stays at the ceiling, band steps,
+the preamp settling and a preset switch do not click under a 50 Hz tone, and
+the balanced headroom holds its gate (bursts under 2 % THD, a pilot moved at
+most 1.5 dB, nothing over the ceiling). Its daemon has no devices
 and no session manager, it uses the stub `systemctl` and `pactl`, and it refuses
 to run if the daemon it reaches shows a real device, so nothing of the running
 session is touched. Without PipeWire (the CI runner) it SKIPs. It is the test
@@ -376,7 +467,13 @@ request (`.github/workflows/tests.yml`). Its `tests` check is required to merge
 into `main` by the branch ruleset, which also blocks force-pushes and deletion.
 
 The suite also runs `tests/curve-check.js` (the response maths against
-PipeWire's own biquads) and the other `tests/*.js` checks.
+PipeWire's own biquads), `tests/fit-check.js` (the 10-band faders reach every
+value and move no other), `tests/spectrum-check.js` (the backdrop and the
+caption contrast) and the other `tests/*.js` checks, and drives
+`omarchy-equalizer live` through a fifo: one write per coalesced line of only
+the controls that changed, no `jq` between ready and commit, bad lines refused
+before they reach `pw-cli`, a stale edit dropped, end of input putting the
+graph back.
 
 The suite stubs `pactl`, `pw-cli`, `pw-dump`, `pw-metadata`, `systemctl` and
 `curl` on a scratch PATH and points `XDG_CONFIG_HOME`/`XDG_STATE_HOME` at a
@@ -393,8 +490,14 @@ declares a category that agrees with its order band.
 The suite also scans every shipped `.qml` (comments stripped) for Qt's native
 text-input types and for the clipboard — the panel must never give the shell a
 reason to read a foreign clipboard — and, when `qmltestrunner` is installed,
-runs `tests/qml/tst_keyfield.qml` offscreen against stand-ins for the shell kit
-(`tests/qml/imports`). Without the runner that part is skipped, not failed.
+runs the QML tests in `tests/qml` offscreen against stand-ins for the shell kit
+and for Quickshell's `Process` (`tests/qml/imports`): the key fields, the
+curve (the handle on the line during and after a drag, the gestures), the band
+row, and the panel's own edit path -- a drag echoed at once, streamed to the
+live editor coalesced, committed once; the preamp held under the limiter; a
+fader sending the fitted gains of every band; an undo waiting for a nudge's
+commit; the queue taking over without the editor. Without the runner that part
+is skipped, not failed.
 
 ## Presets
 
