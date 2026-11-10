@@ -702,11 +702,23 @@ covered by a test:
   switches at once); and a walk's step was not atomic against a takeover (the
   token check and the write now share the walk's lock).
 
+Installed on the live session (2026-11-09, 19:58): the plugin clone was
+fast-forwarded to this branch (the state before it is kept as
+`state.json.3.0.0-pre-backup`), the shell reloaded the panel with no QML
+warning or error, and re-applying the current mode rebuilt the running graph
+into layout v4 once. Checked afterwards, read-only: both units active, the
+running node carries the device relief's controls, the output stream aims at
+the device (HUAWEI FreeBuds Pro 3), the app stream parked for the rebuild is
+back on the equalizer, the follower runs the new code with its volume
+listener, and `omarchy-equalizer live` arms on the real graph
+(`ready graphic:10:10`, then end of input with nothing written).
+
 Not verified:
 
-- **Nothing here has been seen or heard in the live shell.** The installed
-  plugin is a separate clone and was not updated. The panel was tested
-  offscreen, and the backend on stubs and on a private PipeWire.
+- **Nothing here has been seen or heard by the user yet**: the panel by eye,
+  a drag by ear, the fitted faders, undo. The panel's edit path was tested
+  offscreen against stand-ins for the shell kit, and the backend on stubs and
+  on a private PipeWire.
 - **Device relief's live gate** (§3.5.3) plays a tone through the real
   speakers and was not run.
 - **Balanced has not been heard.**
