@@ -103,6 +103,8 @@ Panel {
   readonly property int maxSlots: status ? Number(status.maxSlots || 16) : 16
   // Each output device keeps its own curve.
   readonly property bool deviceMemory: status ? status.deviceMemory !== "off" : true
+  // Playing to Bluetooth while Wi-Fi is on 2.4 GHz, the band Bluetooth uses.
+  readonly property bool bluetoothOn24GhzWifi: status ? status.bluetoothOn24GhzWifi === true : false
   readonly property string deviceLabel: status ? String(status.deviceLabel || status.targetSink || "") : ""
   readonly property var rememberedDevices: status ? (status.devices || []) : []
   // Apps playing now, and the ones kept off the equalizer.
@@ -2331,6 +2333,19 @@ Panel {
                   font.pixelSize: Style.font.caption
                   width: parent.width
                   elide: Text.ElideRight
+                }
+
+                // The equalizer cannot hear the radio link, so this only says
+                // when the conditions for the problem are there.
+                Text {
+                  textFormat: Text.PlainText
+                  visible: root.bluetoothOn24GhzWifi
+                  text: "Bluetooth audio can break up while Wi-Fi is on 2.4 GHz. If the sound is choppy, switch Wi-Fi to a 5 GHz network."
+                  color: root.dimText
+                  font.family: root.barFontFamily
+                  font.pixelSize: Style.font.caption
+                  width: parent.width
+                  wrapMode: Text.WordWrap
                 }
 
                 PanelSeparator { foreground: root.barForeground }

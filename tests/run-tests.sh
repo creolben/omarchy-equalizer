@@ -1843,6 +1843,22 @@ run set-gain 3 3 >/dev/null
 run set-headroom auto >/dev/null
 check "and back to safe" "auto|true" "$(run status | jq -r '"\(.headroom)|\(.preamp == .autoPreamp)"')"
 
+echo "== a hint when Bluetooth shares the band with Wi-Fi =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+run disable >/dev/null
+export PACTL_DEVICE_SINK=bluez_output.AA_BB_CC_DD_EE_FF.1 PACTL_DEFAULT_SINK=bluez_output.AA_BB_CC_DD_EE_FF.1
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+check "Bluetooth output with Wi-Fi on 2.4 GHz is flagged" "true" "$(IW_FREQ=2437.0 run status | jq -r '.bluetoothOn24GhzWifi')"
+check "on 5 GHz it is not" "false" "$(IW_FREQ=5180.0 run status | jq -r '.bluetoothOn24GhzWifi')"
+check "nor with Wi-Fi disconnected" "false" "$(IW_FREQ= run status | jq -r '.bluetoothOn24GhzWifi')"
+run disable >/dev/null
+export PACTL_DEVICE_SINK=alsa_output.stub PACTL_DEFAULT_SINK=alsa_output.stub
+run enable >/dev/null
+check "a wired output on 2.4 GHz Wi-Fi is not flagged" "false" "$(IW_FREQ=2437.0 run status | jq -r '.bluetoothOn24GhzWifi')"
+run disable >/dev/null
+unset PACTL_DEVICE_SINK PACTL_DEFAULT_SINK
+
 echo "== device relief: the cut given back as the device volume allows =="
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json" "$XDG_STATE_HOME/omarchy-equalizer/history.json"
 run disable >/dev/null

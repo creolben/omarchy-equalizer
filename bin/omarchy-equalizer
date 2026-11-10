@@ -3854,14 +3854,30 @@ apps_json() {
     | unique_by(.name)'
 }
 
+# Whether Wi-Fi is connected on the 2.4 GHz band, which Bluetooth shares: on
+# machines whose two radios share hardware, streaming over it while playing to
+# Bluetooth breaks the sound up after the sink, where nothing here can see it
+# (found on an Asahi MacBook; 5 GHz fixed it). Without iw the answer is no.
+wifi_on_2g4() {
+  command -v iw >/dev/null 2>&1 || return 1
+  local dev
+  for dev in $(iw dev 2>/dev/null | awk '$1 == "Interface" { print $2 }'); do
+    iw dev "$dev" link 2>/dev/null | LC_ALL=C awk '$1 == "freq:" && $2 + 0 >= 2400 && $2 + 0 < 2500 { found = 1 } END { exit !found }' && return 0
+  done
+  return 1
+}
+
 cmd_status_full() {
-  local out target vol dvol=""
+  local out target vol dvol="" crowded=false
   out="$(cmd_status)"
   target="$(jq -r '.targetSink // ""' <<<"$out")"
   vol="$(sink_volume_db)"
   # The device's own volume, which the device relief follows.
   [[ -n $target ]] && dvol="$(device_volume_info "$target" | awk '{ print $4 }')"
-  jq -c --argjson present "$(sink_present && echo true || echo false)" \
+  # Playing to Bluetooth while Wi-Fi is on 2.4 GHz: the panel says what to try
+  # if the sound breaks up.
+  [[ $target == bluez_output.* ]] && wifi_on_2g4 && crowded=true
+  jq -c --argjson crowded "$crowded" --argjson present "$(sink_present && echo true || echo false)" \
      --arg default "$(current_default_sink)" \
      --arg physical "$(physical_output)" \
      --arg key "$( [[ -n $target ]] && device_key "$target")" \
@@ -3870,6 +3886,7 @@ cmd_status_full() {
      --argjson apps "$(apps_json "$(jq -c '.excludedApps' <<<"$out")")" \
     '.sinkPresent = $present | .defaultSink = $default | .physicalSink = $physical
      | .deviceKey = $key | .deviceLabel = $label | .apps = $apps
+     | .bluetoothOn24GhzWifi = $crowded
      | .volumeDb = (($vol | tonumber? | . * 100 | round / 100) // null)
      | .deviceVolumeDb = (($dvol | tonumber? | . * 100 | round / 100) // null)' <<<"$out"
 }

@@ -1,0 +1,9 @@
+#!/bin/bash
+# Stub iw: one interface, connected at IW_FREQ MHz (unset or empty: not connected).
+case "$*" in
+  dev) printf 'phy#0\n\tInterface wlan0\n\t\ttype managed\n' ;;
+  "dev wlan0 link")
+    if [[ -n ${IW_FREQ:-} ]]; then printf 'Connected to 00:11:22:33:44:55 (on wlan0)\n\tSSID: stub\n\tfreq: %s\n' "$IW_FREQ"
+    else printf 'Not connected.\n'; fi ;;
+esac
+exit 0

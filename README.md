@@ -436,10 +436,33 @@ application name or process binary, without case.
   graph permanently; only their controls move, because a graph-shape change is a
   unit restart and an audible dropout (a browser pauses its media for it).
 
+## Troubleshooting
+
+**Choppy or stuttering sound on Bluetooth.** First find out whether the
+equalizer is involved: press `e` in the panel to bypass it. If the sound is
+still choppy, the cause is after the equalizer.
+
+- **Wi-Fi on 2.4 GHz.** Bluetooth uses the 2.4 GHz band too, and on machines
+  whose Wi-Fi and Bluetooth radios share hardware (an Asahi MacBook does),
+  streaming over 2.4 GHz Wi-Fi while playing to Bluetooth earbuds breaks the
+  sound up. It happens on the radio link, after the equalizer, so nothing in
+  the graph shows it: no dropouts, no errors in `pw-top`. Switch Wi-Fi to a
+  5 GHz network. While the equalizer plays into a Bluetooth device and Wi-Fi is
+  on 2.4 GHz, the Output tab says so (it needs `iw`; `status` reports it as
+  `bluetoothOn24GhzWifi`). `iw dev wlan0 link` shows the band: a `freq` under
+  3000 is 2.4 GHz.
+- **The boost pumping.** If bypassing fixes it, set Dynamics to Off. A boost on
+  a bass-heavy curve turns the level down on every kick -- measured, 4 to 5 dB
+  with Medium on a +12 dB curve -- which can sound like the music being chopped
+  in rhythm. Use Low or Off with heavy curves.
+
+**Every band change clicks.** Without `lsp-plugins-lv2` the bands run on
+PipeWire's builtin biquads, which reset on every update. Install it.
+
 ## Tests
 
 ```sh
-bash tests/run-tests.sh     # 607 assertions (606 where PipeWire is missing), no real sink touched
+bash tests/run-tests.sh     # 611 assertions (610 where PipeWire is missing), no real sink touched
 bash tests/dsp-check.sh     # the real graph, measured (about three minutes)
 ```
 
@@ -476,7 +499,7 @@ before they reach `pw-cli`, a stale edit dropped, end of input putting the
 graph back.
 
 The suite stubs `pactl`, `pw-cli`, `pw-dump`, `pw-metadata`, `systemctl` and
-`curl` on a scratch PATH and points `XDG_CONFIG_HOME`/`XDG_STATE_HOME` at a
+`curl` and `iw` on a scratch PATH and points `XDG_CONFIG_HOME`/`XDG_STATE_HOME` at a
 throwaway root, so fragments and state land in isolation and the machine keeps
 playing. `systemctl` and `pw-cli` calls are logged, which is how "a frequency
 edit does not restart the unit" is an assertion rather than an observation.
