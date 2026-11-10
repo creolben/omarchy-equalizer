@@ -49,9 +49,23 @@ case "$1" in
     elif [[ ${2:-} == sink-inputs && -n ${PACTL_APP_STREAM:-} ]]; then
       printf 'Sink Input #42\n\tSink: 1\n\tProperties:\n\t\tapplication.name = "Chromium"\n'
     elif [[ ${2:-} == sinks && ${3:-} != short ]]; then
-      # The long form, for a sink's description: "Stub <name>".
+      # The long form, for a sink's description ("Stub <name>") and, for the
+      # device sink, what the device relief reads: PACTL_DEVICE_MUTE (no),
+      # PACTL_DEVICE_VOLUME_DB (0.00), PACTL_DEVICE_BASE (100, in percent) and
+      # PACTL_DEVICE_FLAGS (a software volume's flags).
       while IFS=$'\t' read -r sidx sname _; do
         printf 'Sink #%s\n\tState: SUSPENDED\n\tName: %s\n\tDescription: Stub %s\n' "$sidx" "$sname" "$sname"
+        if [[ -n ${PACTL_DEVICE_SINK:-} && $sname == "$PACTL_DEVICE_SINK" ]]; then
+          # PACTL_DEVICE_VOLUME_FILE, when set, is read instead: a test can move
+          # the volume under a running follower.
+          dv="${PACTL_DEVICE_VOLUME_DB:-0.00}"
+          [[ -n ${PACTL_DEVICE_VOLUME_FILE:-} && -s $PACTL_DEVICE_VOLUME_FILE ]] && dv="$(<"$PACTL_DEVICE_VOLUME_FILE")"
+          printf '\tMute: %s\n' "${PACTL_DEVICE_MUTE:-no}"
+          printf '\tVolume: front-left: 32768 /  50%% / %s dB,   front-right: 32768 /  50%% / %s dB\n' "$dv" "$dv"
+          printf '\t        balance 0.00\n'
+          printf '\tBase Volume: 65536 / %s%% / 0.00 dB\n' "${PACTL_DEVICE_BASE:-100}"
+          printf '\tFlags: %s\n' "${PACTL_DEVICE_FLAGS:-HARDWARE DECIBEL_VOLUME LATENCY}"
+        fi
       done <<<"$sinks"
     elif [[ ${2:-} == sink-inputs && -n ${PACTL_EQ_AIM:-} ]]; then
       { printf 'Sink Input #99\n\tSink: %s\n\tProperties:\n' "${PACTL_EQ_AIM_SINK_ID:-2}"
@@ -63,9 +77,11 @@ case "$1" in
     ;;
   subscribe)
     # PACTL_SUBSCRIBE_COUNT change events on the EQ's stream, spaced wider than
-    # the follower's 0.4 s drain so each one is its own pass.
+    # the follower's 0.4 s drain so each one is its own pass. PACTL_SUBSCRIBE_EVENT
+    # replaces the event's text (a volume change on a sink, say), and
+    # PACTL_SUBSCRIBE_GAP the spacing (a held volume key is a closer burst).
     for ((i = 0; i < ${PACTL_SUBSCRIBE_COUNT:-0}; i++)); do
-      sleep 0.5; printf "Event 'change' on sink-input #99\n"
+      sleep "${PACTL_SUBSCRIBE_GAP:-0.5}"; printf '%s\n' "${PACTL_SUBSCRIBE_EVENT:-Event 'change' on sink-input #99}"
     done
     ;;
   get-default-sink) printf '%s\n' "${PACTL_DEFAULT_SINK:-omarchy_equalizer}" ;;

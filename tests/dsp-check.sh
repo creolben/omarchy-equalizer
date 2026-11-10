@@ -198,6 +198,23 @@ set_bands() { # mode bands-json
   eq set-mode "$1" >/dev/null
 }
 status() { eq status; }
+
+# The live editor (docs/spec-v4.md §3.1), fed through a fifo the way the panel
+# feeds it.
+live_pid=""
+live_start() { # [env assignments...]
+  rm -f "$T/live.in"; mkfifo "$T/live.in"; : >"$T/live.out"
+  env "$@" "$E" live <"$T/live.in" >"$T/live.out" 2>>"$T/backend.log" &
+  live_pid=$!
+  exec 8>"$T/live.in"
+  for _ in $(seq 300); do grep -qE '^(ready|unavailable)' "$T/live.out" && break; sleep 0.02; done
+}
+live_send() { printf '%s\n' "$@" >&8; }
+live_committed() { for _ in $(seq 300); do grep -q '^status ' "$T/live.out" && return 0; sleep 0.02; done; return 1; }
+live_stop() { exec 8>&-; wait "$live_pid" 2>/dev/null; }
+# The flat gains walk to where a commit or a preset put them in 0.1 dB steps,
+# in the background; give a walk a moment to start, then wait for it to end.
+walk_done() { sleep 0.3; for _ in $(seq 400); do [[ -s $XDG_STATE_HOME/omarchy-equalizer/gain-walk ]] || return 0; sleep 0.02; done; return 1; }
 bands_file() { status | jq -c '.bands' >"$T/sig/bands.json"; printf '%s' "$T/sig/bands.json"; }
 applied() { status | jq -r '.appliedPreamp'; }
 
@@ -216,7 +233,7 @@ eq enable >/dev/null || { echo "FAIL  dsp-check: enable failed"; cat "$T/backend
 if $have_lsp; then
   echo "== the LSP pool, measured =="
   host_start
-  check "the graph runs the v3 layout" "pool" "$(sed -n 's/^# Layout: v3 //p' "$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf")"
+  check "the graph runs the v4 layout" "pool" "$(sed -n 's/^# Layout: v4 //p' "$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf")"
   eq set-limiter off >/dev/null
   set_bands graphic "$(jq -cn '[31,62,125,250,500,1000,2000,4000,8000,16000] | map({ type: "peaking", freq: ., q: 1.41, gain: 0 })')"
   play "$T/sig/impulse.wav" "$rec"
@@ -254,6 +271,92 @@ if $have_lsp; then
   status | jq -c '[.bands[4]]' >"$T/sig/solo.json"
   measure_check "solo plays one band alone" response "$rec" "$T/sig/solo.json" "$(status | jq -r '.listen.preamp')" 0.1
   eq solo off >/dev/null
+
+  echo "== live edits, measured =="
+  eq set-limiter on >/dev/null
+  set_bands parametric '[{"type":"peaking","freq":1000,"q":1,"gain":0}]'
+  live_start
+  live_send "gain 0 6"; sleep 0.3
+  play "$T/sig/impulse.wav" "$rec"
+  printf '[{"type":"peaking","freq":1000,"q":1,"gain":6}]' >"$T/sig/streamed.json"
+  measure_check "a streamed gain is in the graph before the commit, under the held preamp" response "$rec" "$T/sig/streamed.json" 0 0.1
+  live_send commit; live_committed; walk_done
+  play "$T/sig/impulse.wav" "$rec"
+  measure_check "after the commit the preamp has settled where the state has it" response "$rec" "$T/sig/streamed.json" "$(applied)" 0.1
+  live_stop
+  # A line to the graph, through a shim that times the real pw-cli.
+  mkdir -p "$T/shim"
+  printf '#!/bin/bash\n%q "$@"; rc=$?\n[[ $1 == set-param ]] && printf "%%s\\n" "${EPOCHREALTIME//[!0-9]/}" >>"%s"\nexit $rc\n' \
+    "$(command -v pw-cli)" "$T/pwcli-times" >"$T/shim/pw-cli"
+  chmod +x "$T/shim/pw-cli"
+  set_bands parametric '[{"type":"peaking","freq":1000,"q":1,"gain":0}]'
+  live_start PATH="$T/shim:$PATH"
+  : >"$T/pwcli-times"
+  worst=0 total=0
+  for i in $(seq 1 20); do
+    t0="${EPOCHREALTIME//[!0-9]/}"
+    live_send "gain 0 $((i % 6)).5"
+    for _ in $(seq 500); do (( $(wc -l <"$T/pwcli-times") >= i )) && break; sleep 0.002; done
+    ms=$(( ($(sed -n "${i}p" "$T/pwcli-times") - t0) / 1000 ))
+    total=$((total + ms)); ((ms > worst)) && worst=$ms
+    sleep 0.1
+  done
+  live_send cancel; live_stop
+  holds "a streamed line is in the graph in under 34 ms (worst of 20, ms)" "x < 34" "$worst"
+  holds "and in under 25 ms on average (ms)" "x < 25" "$((total / 20))"
+  # Clicks: the largest sample step under a 50 Hz tone at -12 dBFS against the
+  # tone's own, in dB; more than 6 dB is a click (docs/spec-v4.md §3.1.3).
+  node "$J" gen sine "$T/sig/tone50.wav" 50 0.2512 0.2512 3.2
+  set_bands parametric '[{"type":"peaking","freq":62,"q":1.41,"gain":0}]'
+  live_start
+  ( sleep 0.5; for g in 0.5 1 1.5 2 2.5 3 3.5 4 4.5 5 5.5 6 5.5 5 4.5 4 3.5 3 2.5 2 1.5 1 0.5 0 0.5 1 1.5 2 2.5 3 3.5 4 4.5 5 5.5 6 5.5 5 4.5 4; do
+      printf 'gain 0 %s\n' "$g" >&8; sleep 0.05; done ) &
+  play "$T/sig/tone50.wav" "$rec"; wait $!
+  holds "a band stepped 0.5 dB every 50 ms does not click (dB over the tone's own)" "x < 6" "$(node "$J" clicks "$rec" 50)"
+  live_send cancel; live_stop
+  # The commit's settle, with the ramps as they run for real: the preamp walks
+  # from 0 to -6 dB under the tone, 60 steps at every phase of it.
+  set_bands parametric '[{"type":"peaking","freq":62,"q":1.41,"gain":0}]'
+  live_start OMARCHY_EQ_NO_RAMP=0
+  live_send "gain 0 6"; sleep 0.3
+  ( sleep 0.4; printf 'commit\n' >&8 ) &
+  play "$T/sig/tone50.wav" "$rec"; wait $!
+  live_committed; walk_done; live_stop
+  holds "the preamp settling after a commit does not click (dB)" "x < 6" "$(node "$J" clicks "$rec" 50)"
+  holds "and it has settled where the state has it (dB)" "x == -6" "$(applied)"
+  eq apply-preset Flat >/dev/null
+  ( sleep 0.6; OMARCHY_EQ_NO_RAMP=0 eq apply-preset "Bass Boost" >/dev/null; sleep 0.5
+    OMARCHY_EQ_NO_RAMP=0 eq apply-preset Rock >/dev/null; sleep 0.5; OMARCHY_EQ_NO_RAMP=0 eq apply-preset Flat >/dev/null ) &
+  play "$T/sig/tone50.wav" "$rec"; wait $!
+  walk_done
+  holds "a preset switch in the pool, cross-faded and walked, does not click (dB)" "x < 6" "$(node "$J" clicks "$rec" 50)"
+  # The held preamp is the limiter's to cover: a +12 dB sweep streamed onto a
+  # -3 dBFS tone never passes the ceiling.
+  node "$J" gen sine "$T/sig/tone1k.wav" 1000 0.708 0.708 1.6
+  set_bands parametric '[{"type":"peaking","freq":1000,"q":1,"gain":0}]'
+  live_start
+  ( sleep 0.45; for g in $(seq 0.5 0.5 12); do printf 'gain 0 %s\n' "$g" >&8; sleep 0.025; done ) &
+  play "$T/sig/tone1k.wav" "$rec"; wait $!
+  live_send cancel; live_stop
+  holds "a streamed +12 dB sweep under the held preamp stays at the ceiling (dBFS)" "x <= -0.99" "$(node "$J" peak "$rec")"
+
+  echo "== the balanced headroom's gate =="
+  # docs/spec-v4.md §3.5.2: pink noise, full-scale 50 Hz bursts and a -30 dBFS
+  # pilot through the bass shelf under balanced headroom. The margin (3.5 dB)
+  # is the smallest that holds all three lines here; 3.0 dB pumped the pilot
+  # 1.56 dB.
+  node "$J" gen gate "$T/sig/gate.wav"
+  set_bands graphic "$(jq -cn '[31,62,125,250,500,1000,2000,4000,8000,16000] as $f | [8,6,4,0,0,0,0,0,0,0] as $g
+    | [range(0; 10) | { type: "peaking", freq: $f[.], q: 1.41, gain: $g[.] }]')"
+  eq set-headroom balanced >/dev/null
+  holds "balanced takes less cut than safe for the bass shelf (dB)" "x > -9.5" "$(applied)"
+  play "$T/sig/gate.wav" "$rec"
+  read -r thd pump peak bursts <<<"$(node "$J" gate "$rec")"
+  check "every burst is measured" "6" "$bursts"
+  holds "the bursts stay under 2 % THD" "x <= 2" "$thd"
+  holds "the pilot moves at most 1.5 dB during a burst (dB)" "x <= 1.5" "$pump"
+  holds "and nothing passes the limiter's ceiling (dBFS)" "x <= -0.99" "$peak"
+  eq set-headroom auto >/dev/null
 
   echo "== volume and relief =="
   # The relief needs the limiter as its safety net, so it is on for this part.
@@ -348,7 +451,7 @@ export OMARCHY_EQ_LV2_DIR="$T/no-lsp"
 eq apply-preset Rock >/dev/null
 host_stop
 host_start
-check "without LSP the graph is the biquad chain" "1" "$(grep -c '^# Layout: v3 biquad:' "$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf")"
+check "without LSP the graph is the biquad chain" "1" "$(grep -c '^# Layout: v4 biquad:' "$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf")"
 play "$T/sig/impulse.wav" "$rec"
 measure_check "Rock on biquads plays as drawn" response "$rec" "$(bands_file)" "$(applied)" 0.1
 set_bands parametric '[{"type":"highpass","freq":70,"q":0.7071,"gain":0,"slope":2},{"type":"lowshelf","freq":150,"q":0.71,"gain":4},{"type":"peaking","freq":3000,"q":2,"gain":-3}]'
@@ -357,6 +460,29 @@ host_start
 play "$T/sig/impulse.wav" "$rec"
 measure_check "a sloped parametric set on biquads plays as drawn" response "$rec" "$(bands_file)" "$(applied)" 0.1
 holds "the builtin chain adds nothing on top of the quantum (samples)" "x >= 0 && x < 48" "$(( $(latency_samples) - 1024 ))"
+# The bands alone: a manual preamp holds still, so only the filter moves.
+set_bands parametric '[{"type":"peaking","freq":62,"q":1.41,"gain":0}]'
+eq set-preamp -6 >/dev/null
+host_stop
+host_start
+mkdir -p "$T/shim2"
+printf '#!/bin/bash\n%q "$@"; rc=$?\n[[ $1 == set-param ]] && printf "%%s\\n" "${EPOCHREALTIME//[!0-9]/}" >>"%s"\nexit $rc\n' \
+  "$(command -v pw-cli)" "$T/bq-times" >"$T/shim2/pw-cli"
+chmod +x "$T/shim2/pw-cli"
+live_start PATH="$T/shim2:$PATH"
+: >"$T/bq-times"
+( sleep 0.5; for g in 0.5 1 1.5 2 2.5 3 3.5 4 4.5 5 5.5 6 5.5 5 4.5 4 3.5 3 2.5 2 1.5 1 0.5 0; do printf 'gain 0 %s\n' "$g" >&8; sleep 0.05; done ) &
+play "$T/sig/tone50.wav" "$rec"; wait $!
+live_send cancel; live_stop
+# PipeWire's builtin biquad clears its history on every update: any change of a
+# band clicks once, whatever its size, and smaller steps would only add clicks.
+# The live editor writes the biquad chain at most every 100 ms instead.
+printf 'INFO  a band change on the builtin biquads stands %s dB over the tone (each write resets the filter)\n' \
+  "$(node "$J" clicks "$rec" 50)"
+check "on the biquads 24 lines over 1.2 s are at most 14 writes" "yes" \
+  "$( (( $(wc -l <"$T/bq-times") <= 14 )) && echo yes || echo no)"
+holds "and no two of them are closer than 90 ms (ms)" "x >= 90" \
+  "$(awk 'NR > 1 { d = ($1 - p) / 1000; if (m == "" || d < m) m = d } { p = $1 } END { printf "%d", m }' "$T/bq-times")"
 eq set-channels swap >/dev/null
 play "$T/sig/l-only.wav" "$rec"
 read -r l r <<<"$(node "$J" level "$rec")"

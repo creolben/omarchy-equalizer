@@ -37,8 +37,8 @@ function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
 }
 
-// The meter. Pure numbers so they can be tested without Qt; LevelWave.qml only
-// eases and draws what these return.
+// The spectrum behind the curve. Pure numbers so they can be tested without
+// Qt; ResponseCurve.qml only eases and draws what these return.
 
 // One line from bin/omarchy-equalizer-spectrum: "BEAT V1 .. Vn", all integers
 // 0..100. Returns { beat: 0..1, bands: [0..1, ...] }, or null for a line that
@@ -55,104 +55,20 @@ function parseSpectrumLine(line) {
   return { beat: nums[0], bands: nums.slice(1) }
 }
 
-// The meter's motion, taken from the "sound wave" Lottie animation: 34 pill
-// bars, evenly spaced, that all play one 25-key height sequence (a key every 5
-// frames at 20 fps). Each bar has its own fixed height scale and its own start
-// offset, which is what makes the row look irregular rather than a travelling
-// sine. Keys are interpolated linearly, as in the source (its bezier handles
-// sit on the diagonal). The source holds its last key and jumps at its 90-frame
-// loop; here the sequence wraps from the last key back to the first over one
-// more key, so the loop is seamless.
-var LOTTIE_SEQ = [100, 237, 264.333, 247.667, 197, 29, 26, 158.5, 217, 250, 125,
-                  163.5, 100, 37, 52, 92, 50, 154, 115, 157, 98, 168, 39, 73, 27]
-var LOTTIE_SCALE = [76, 18, 55, 37, 28, 18, 27, 47, 76, 30, 57, 57, 18, 46, 32, 45, 75,
-                    100, 44, 45, 55, 78, 37, 28, 18, 27, 47, 76, 30, 57, 57, 18, 46, 32]
-var LOTTIE_START = [-32, -32, -23, -19, -21, -35, -30, -46, -32, -40, -29, -23, -32, -14,
-                    -9, -13, -5, 0, -3, -6, -23, -5, -19, -21, -35, -30, -46, -32, -40,
-                    -29, -23, -32, -14, -9]
-var LOTTIE_BARS = 34
-var LOTTIE_FPS = 20
-var LOTTIE_PERIOD = 125              // 25 keys x 5 frames, wrapping
-var LOTTIE_MAX = 264.333
-// Bar width as a share of the bar pitch: 6 px bars on a 14.735 px pitch.
-var LOTTIE_FILL = 6 / 14.735
-
-// Heights 0..1 for every bar at animation frame `frame` (any real number).
-function lottieBars(frame) {
-  var f = Number(frame) || 0
-  var out = []
-  for (var i = 0; i < LOTTIE_BARS; i++) {
-    var local = (f - LOTTIE_START[i]) % LOTTIE_PERIOD
-    if (local < 0) local += LOTTIE_PERIOD
-    var pos = local / 5
-    var k = Math.floor(pos), t = pos - k
-    var a = LOTTIE_SEQ[k % LOTTIE_SEQ.length]
-    var b = LOTTIE_SEQ[(k + 1) % LOTTIE_SEQ.length]
-    out.push((a + (b - a) * t) / LOTTIE_MAX * LOTTIE_SCALE[i] / 100)
-  }
-  return out
-}
-
-// One step of a damped spring pulling `x` toward `target`, for the bars'
-// motion: a hit pops with a small overshoot and settles instead of snapping.
-// `freq` is the natural frequency in Hz, `zeta` the damping ratio (1 = no
-// overshoot). Sub-stepped, so a long frame stays stable. Returns [x, v].
-function springStep(x, v, target, dt, freq, zeta) {
-  var w = 2 * Math.PI * freq
-  var steps = Math.max(1, Math.ceil(dt / 0.004))
-  var h = dt / steps
-  for (var s = 0; s < steps; s++) {
-    v += (w * w * (target - x) - 2 * zeta * w * v) * h
-    x += v * h
-  }
-  return [x, v]
-}
-
-// Energy for bar `i` of `count`, from a spectrum laid out bass-first: the row is
-// mirrored, so the centre bars follow the bass and the outer bars the treble.
-// Returns 0..1, or 0.5 (neutral) when there is no spectrum.
-function barEnergy(bands, i, count) {
-  var b = bands || []
-  if (b.length === 0 || count < 1) return 0.5
-  var d = count > 1 ? Math.abs((i / (count - 1)) * 2 - 1) : 0
-  var pos = d * (b.length - 1)
-  var k = Math.min(b.length - 1, Math.floor(pos)), f = pos - k
-  var a0 = clamp(Number(b[k]) || 0, 0, 1)
-  var a1 = clamp(Number(b[Math.min(b.length - 1, k + 1)]) || 0, 0, 1)
-  return a0 + (a1 - a0) * f
-}
-
-// Fallback beat follower, on the peak monitor alone (the spectrum helper does
-// its own, better detection). An onset is a peak that rises clearly above its
-// own slow average *since the previous call*, judged on the rise rather than
-// the level, so a loud, steady track still has beats. Call once per peak
-// update; returns [avg, onset] with onset 0 or 1. It does not decay anything:
-// the caller owns the visible pulse and passes it in as `pulse`, and a new
-// onset is refused while that pulse is still above half strength.
-function beatStep(avg, peak, pulse) {
-  var p = clamp(Number(peak) || 0, 0, 1)
-  var a = clamp(Number(avg) || 0, 0, 1)
-  var b = clamp(Number(pulse) || 0, 0, 1)
-  var onset = p > 0.05 && p - a > Math.max(0.04, a * 0.15) && b < 0.5
-  // An onset resets the average to the new level, so a plateau after a hit is
-  // not read as a string of further hits.
-  if (onset) a = p
-  else a += (p - a) * (p > a ? 0.15 : 0.05)
-  return [a, onset ? 1 : 0]
-}
-
 // Which control, if any, a wheel event belongs to. One implementation, so the
 // sliders cannot drift from each other or from tests/input-policy-check.js.
 //
 // A horizontal control under a vertical wheel is never a deliberate edit, so
 // "preamp" always declines. A vertical fader may take the wheel only when the
 // user has aimed at it (active focus, set by a click) or declared intent (Alt
-// held). The optional delta lets callers pass the vertical amount through, so
-// a zero-delta wheel is nobody's edit; omitting it keeps the three-argument
-// rule the sliders and the node tests use.
+// held). A handle on the curve follows the fader's rule: it takes the wheel
+// (for its Q) only when it is the selected one, or with Alt. The optional delta
+// lets callers pass the vertical amount through, so a zero-delta wheel is
+// nobody's edit; omitting it keeps the three-argument rule the sliders and the
+// node tests use.
 var ALT_MODIFIER = 0x08000000
 function wheelOwns(kind, modifiers, hasFocus, angleDeltaY) {
-  if (kind !== "fader") return false
+  if (kind !== "fader" && kind !== "handle") return false
   if (angleDeltaY !== undefined && Number(angleDeltaY) === 0) return false
   if (hasFocus === true) return true
   return ((Number(modifiers) || 0) & ALT_MODIFIER) !== 0
@@ -166,6 +82,58 @@ function wheelDelta(angleDeltaX, angleDeltaY, modifiers) {
   if (dy !== 0) return dy
   if (((Number(modifiers) || 0) & ALT_MODIFIER) === 0) return 0
   return Number(angleDeltaX) || 0
+}
+
+// The ranges a band may hold, the backend's own (state_problem). The panel
+// clamps what it sends to these, never to the ±12 dB a slider happens to show,
+// so touching an imported band at -15 dB keeps it at -15.
+var GAIN_MIN = -30, GAIN_MAX = 20
+var FREQ_MIN = 10, FREQ_MAX = 24000
+var Q_MIN = 0.05, Q_MAX = 30
+function clampGain(db) { return clamp(db, GAIN_MIN, GAIN_MAX) }
+
+// A gain control's range: ±12 dB, or ±24 dB for a band already outside that.
+function gainSpan(db) { return Math.abs(Number(db) || 0) > 12.0001 ? 24 : 12 }
+
+// A typed frequency: plain Hz, or kHz with a k ("2.5k" is 2500). NaN for
+// anything else.
+function parseFreqText(text) {
+  var t = String(text === undefined || text === null ? "" : text).trim().toLowerCase()
+  var m = /^([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(k?)$/.exec(t)
+  if (!m) return NaN
+  var v = Number(m[1]) * (m[2] === "k" ? 1000 : 1)
+  return isFinite(v) && v > 0 ? v : NaN
+}
+
+// A frequency for a field at rest: Hz below 1 kHz, kHz with up to two decimals
+// above ("1.25k", "16k"), so the column reads like the curve's own axis.
+function formatFreqField(hz) {
+  var n = Number(hz)
+  if (!isFinite(n) || n <= 0) return ""
+  if (n < 1000) return String(Math.round(n))
+  var k = Math.round(n / 10) / 100
+  return String(k) + "k"
+}
+
+// Bandwidth in octaves of a bell of quality Q, and back: the analog relation
+// the RBJ cookbook gives, 1/Q = 2 sinh(ln 2 / 2 * BW).
+function asinh(x) { return Math.log(x + Math.sqrt(x * x + 1)) }
+function qToOctaves(q) { return 2 / Math.LN2 * asinh(1 / (2 * Math.max(Q_MIN, Number(q) || 1))) }
+function octavesToQ(bw) { return 1 / (2 * Math.sinh(Math.LN2 / 2 * bw)) }
+
+// One step of Q in sixths of an octave of bandwidth: a positive step narrows
+// the band (raises Q). Kept inside the 0.1..30 the fields allow, and rounded
+// to the two decimals they show.
+function stepQ(q, steps) {
+  var bw = qToOctaves(q) - (Number(steps) || 0) / 6
+  var next = bw > 0.01 ? octavesToQ(bw) : 30
+  return Math.round(clamp(next, 0.1, 30) * 100) / 100
+}
+
+// A frequency moved by 1/24 octave per step, within the backend's range.
+function stepFreq(hz, steps) {
+  var f = (Number(hz) || 1000) * Math.pow(2, (Number(steps) || 0) / 24)
+  return Math.round(clamp(f, 20, 20000))
 }
 
 // Frequencies read better abbreviated once they pass 1000 Hz.
@@ -200,6 +168,14 @@ var bandTypes = [
   { value: "notch", label: "Notch" },
   { value: "allpass", label: "All pass" }
 ];
+
+// The type picker's label for a band: the type, and the slope of a pass filter.
+function typeOptionLabel(type, slope) {
+  var v = typeOptionValue(type, slope)
+  for (var i = 0; i < bandTypeOptions.length; i++)
+    if (bandTypeOptions[i].value === v) return bandTypeOptions[i].label
+  return typeLabel(type)
+}
 
 // A filter without a gain control says so on the face, rather than showing a
 // slider that moves nothing, when a parameter does not apply to the chosen
@@ -592,10 +568,19 @@ function metrics(bands, sampleRate) {
 
   var series = responseSeries(chainCoefficients(bands, rate), 0, rate, 401)
   var peak = peakFromSeries(series)
+  var program = programGainDb(series)
+  var trough = Infinity
+  for (var t = 0; t < series.length; t++) trough = Math.min(trough, series[t])
   var value = {
     peakDb: peak.db,
     peakFreq: peak.freq,
+    // The curve's lowest point, for the plot's scale.
+    troughDb: trough,
     autoPreamp: autoPreampForPeak(peak.db),
+    // How much louder programme material leaves the bands, and the cut the
+    // Balanced headroom takes for it (see balancedPreampFor).
+    programGainDb: program,
+    balancedPreamp: balancedPreampFor(peak.db, program),
     // The level of the bands alone (preamp 0); add the preamp in force for
     // what is heard against Flat at the same volume.
     levelDb: levelFromSeries(series),
@@ -640,4 +625,275 @@ function autoPreampForPeak(peakDbValue) {
 function autoPreampDb(bands, rate) {
   var peak = peakDb(bands, 0, rate)
   return autoPreampForPeak(peak.db)
+}
+
+// ---------------------------------------------------------------- balanced headroom
+//
+// The Safe preamp cancels the curve's peak, which is what a full-scale tone at
+// that one frequency needs. Programme material spreads its energy: pink noise
+// through a +9.3 dB bass shelf comes out only 3.5 dB louder. Balanced cuts by
+// that programme gain plus a margin and leaves the rare peak above it to the
+// limiter -- so it needs the limiter, and plays as Safe without one (the
+// backend decides that; these are the numbers). The backend's awk copy of both
+// is held to these by tests/headroom-check.js.
+
+// The margin over the programme gain, in dB. Raised from 1.5 by the gate in
+// tests/dsp-check.sh (docs/spec-v4.md §3.5.2), which records why.
+var BALANCED_MARGIN = 3.5
+
+// Pink-noise power gain of a curve sampled on the 401-point log sweep: the
+// mean of 10^(H/10), in dB. Rounded to 0.01 dB so the JS and awk copies agree
+// at the 0.5 dB steps the preamp is rounded to.
+function programGainDb(values) {
+  var n = values.length
+  if (n < 1) return 0
+  var p = 0
+  for (var i = 0; i < n; i++) p += Math.pow(10, values[i] / 10)
+  return Math.round(10 * Math.log10(p / n) * 100) / 100
+}
+
+// -min(the Safe cut, the programme gain plus the margin, rounded up to the
+// preamp's 0.5 dB step).
+function balancedPreampFor(peakDbValue, programGain) {
+  var safe = autoPreampForPeak(peakDbValue)
+  var cut = Math.ceil(Math.round((Math.max(0, Number(programGain) || 0) + BALANCED_MARGIN) * 100) / 50) / 2
+  var p = Math.max(safe, -cut)
+  return p === 0 ? 0 : p
+}
+
+// ---------------------------------------------------------------- graphic fit
+//
+// Ten octave bells at Q 1.41 overlap, so a band's own gain is not what the
+// curve does at its frequency: all ten at +6 dB read +6.5 to +8.8 dB at the
+// centres, and alternating ±6 only ±4. The 10-band console therefore shows the
+// response at each band's centre -- the fader, its number and its handle -- and
+// an edit solves the bells for it. The state and the presets keep bell gains,
+// so nothing the backend computes changes meaning, and a curve that was never
+// touched plays exactly as before; its faders just read what it does.
+
+// The response at each band's own centre frequency, from the whole chain. A
+// one-slot memo on the bands' content: every status echo asks again.
+var graphicCache = null
+function graphicResponse(bands, rate) {
+  var fs = (Number(rate) > 0) ? Number(rate) : 48000
+  var list = bands || []
+  var signature = metricsSignature(list, fs)
+  if (graphicCache !== null && graphicCache.signature === signature) return graphicCache.value.slice()
+  var stages = expandBands(list), coeffs = []
+  for (var s = 0; s < stages.length; s++)
+    coeffs.push(biquadCoefficients(stages[s].type, stages[s].freq, stages[s].q, stages[s].gain, fs))
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    var f = list[i] ? (Number(list[i].freq) || 1000) : 1000, total = 0
+    for (var k = 0; k < coeffs.length; k++) total += magnitudeDb(coeffs[k], f, fs)
+    out.push(total)
+  }
+  graphicCache = { signature: signature, value: out }
+  return out.slice()
+}
+
+// Solve a small dense system a.x = b by Gaussian elimination with partial
+// pivoting; null when it is singular.
+function solveLinear(a, b) {
+  var n = b.length, m = []
+  for (var i = 0; i < n; i++) m.push(a[i].slice().concat([b[i]]))
+  for (var c = 0; c < n; c++) {
+    var p = c
+    for (var r = c + 1; r < n; r++) if (Math.abs(m[r][c]) > Math.abs(m[p][c])) p = r
+    if (Math.abs(m[p][c]) < 1e-12) return null
+    var t = m[c]; m[c] = m[p]; m[p] = t
+    for (var r2 = 0; r2 < n; r2++) {
+      if (r2 === c) continue
+      var k = m[r2][c] / m[c][c]
+      if (k === 0) continue
+      for (var j = c; j <= n; j++) m[r2][j] -= k * m[c][j]
+    }
+  }
+  var x = []
+  for (var i2 = 0; i2 < n; i2++) x.push(m[i2][n] / m[i2][i2])
+  return x
+}
+
+// Bell gains whose response at the band centres is `targets` (dB, one per
+// band). Newton's method from the current gains, with the Jacobian measured at
+// each step; a band without a gain of its own (a pass filter, a bypassed band)
+// keeps its value and its target is ignored. Gains stay inside the backend's
+// range and are rounded to 0.01 dB.
+//
+// Returns { bands, achieved, clamped }: the new band set, the response it
+// reaches at each centre, and whether a gain hit the range before the targets
+// were met (neighbours too far apart to be fully reached).
+function fitGraphic(bands, targets, rate) {
+  var fs = (Number(rate) > 0) ? Number(rate) : 48000
+  var list = bands || [], n = list.length
+  var gains = [], free = [], centres = []
+  for (var i = 0; i < n; i++) {
+    var b = list[i] || {}
+    gains.push(Number(b.gain) || 0)
+    centres.push(Number(b.freq) || 1000)
+    if (list[i] && bandEnabled(b) && typeHasGain(b.type)) free.push(i)
+  }
+  // Everything that is not a free bell, at every centre, once.
+  var fixedStages = []
+  for (var s = 0; s < n; s++) {
+    if (free.indexOf(s) >= 0) continue
+    var st = bandStages(list[s])
+    for (var k = 0; k < st.length; k++)
+      fixedStages.push(biquadCoefficients(st[k].type, st[k].freq, st[k].q, st[k].gain, fs))
+  }
+  var fixed = []
+  for (var r = 0; r < n; r++) {
+    var tot = 0
+    for (var q = 0; q < fixedStages.length; q++) tot += magnitudeDb(fixedStages[q], centres[r], fs)
+    fixed.push(tot)
+  }
+  function coeffFor(idx, g) {
+    var bb = list[idx]
+    return biquadCoefficients(bb.type, bb.freq, bb.q, g, fs)
+  }
+  function responseRows(g) {
+    var cs = []
+    for (var a = 0; a < free.length; a++) cs.push(coeffFor(free[a], g[free[a]]))
+    var out = []
+    for (var row = 0; row < n; row++) {
+      var t = fixed[row]
+      for (var c2 = 0; c2 < cs.length; c2++) t += magnitudeDb(cs[c2], centres[row], fs)
+      out.push(t)
+    }
+    return out
+  }
+  var hitBound = false, worst = 0, resp = responseRows(gains)
+  for (var iter = 0; iter < 8 && free.length > 0; iter++) {
+    var err = []
+    worst = 0
+    for (var a2 = 0; a2 < free.length; a2++) {
+      var e = (Number(targets[free[a2]]) || 0) - resp[free[a2]]
+      err.push(e)
+      worst = Math.max(worst, Math.abs(e))
+    }
+    if (worst < 0.02) break
+    var up = [], down = [], D = 0.05
+    for (var c3 = 0; c3 < free.length; c3++) {
+      up.push(coeffFor(free[c3], gains[free[c3]] + D))
+      down.push(coeffFor(free[c3], gains[free[c3]] - D))
+    }
+    var jac = []
+    for (var r3 = 0; r3 < free.length; r3++) {
+      var jrow = [], fr = centres[free[r3]]
+      for (var c4 = 0; c4 < free.length; c4++)
+        jrow.push((magnitudeDb(up[c4], fr, fs) - magnitudeDb(down[c4], fr, fs)) / (2 * D))
+      jac.push(jrow)
+    }
+    var step = solveLinear(jac, err)
+    if (step === null) break
+    for (var c5 = 0; c5 < free.length; c5++) {
+      var g2 = gains[free[c5]] + step[c5]
+      if (g2 > GAIN_MAX) { g2 = GAIN_MAX; hitBound = true }
+      if (g2 < GAIN_MIN) { g2 = GAIN_MIN; hitBound = true }
+      gains[free[c5]] = g2
+    }
+    resp = responseRows(gains)
+  }
+  var out = []
+  for (var i3 = 0; i3 < n; i3++) {
+    var copy = {}
+    for (var key in list[i3]) copy[key] = list[i3][key]
+    if (free.indexOf(i3) >= 0) copy.gain = Math.round(gains[i3] * 100) / 100
+    out.push(copy)
+  }
+  var achieved = graphicResponse(out, fs)
+  worst = 0
+  for (var a4 = 0; a4 < free.length; a4++)
+    worst = Math.max(worst, Math.abs((Number(targets[free[a4]]) || 0) - achieved[free[a4]]))
+  return { bands: out, achieved: achieved, clamped: hitBound && worst > 0.05 }
+}
+
+// What a fader edit asks of the fit: band `index` at `target`, every other band
+// where the curve has it now (unrounded), so the other faders do not move.
+function graphicTargets(bands, index, target, rate) {
+  var t = graphicResponse(bands, rate)
+  if (index >= 0 && index < t.length) t[index] = Number(target) || 0
+  return t
+}
+
+// ---------------------------------------------------------------- contrast
+//
+// Secondary text is the foreground blended toward the background, but only as
+// far as it still reads: the dimmest blend that keeps a 4.5:1 contrast ratio
+// (WCAG AA for body text) against the background. A foreground that is already
+// below the ratio is returned as it is. Colours are anything with r, g, b in
+// 0..1 (a QML color) or a "#rrggbb" string; the result is a "#rrggbb" string,
+// which a QML color property takes.
+
+function colorParts(c) {
+  if (typeof c === "string") {
+    var h = c.replace("#", "")
+    if (h.length === 8) h = h.slice(2)
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2]
+    return { r: parseInt(h.slice(0, 2), 16) / 255, g: parseInt(h.slice(2, 4), 16) / 255, b: parseInt(h.slice(4, 6), 16) / 255 }
+  }
+  return { r: Number(c.r) || 0, g: Number(c.g) || 0, b: Number(c.b) || 0 }
+}
+
+function relativeLuminance(c) {
+  var p = colorParts(c)
+  function lin(v) { return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4) }
+  return 0.2126 * lin(p.r) + 0.7152 * lin(p.g) + 0.0722 * lin(p.b)
+}
+
+function contrastRatio(a, b) {
+  var la = relativeLuminance(a), lb = relativeLuminance(b)
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
+}
+
+function hexColor(p) {
+  function two(v) { var s = Math.round(clamp(v, 0, 1) * 255).toString(16); return s.length < 2 ? "0" + s : s }
+  return "#" + two(p.r) + two(p.g) + two(p.b)
+}
+
+function dimColor(fg, bg, ratio) {
+  var want = Number(ratio) > 0 ? Number(ratio) : 4.5
+  var f = colorParts(fg), b = colorParts(bg)
+  if (contrastRatio(f, b) <= want) return hexColor(f)
+  function blend(t) { return { r: f.r + (b.r - f.r) * t, g: f.g + (b.g - f.g) * t, b: f.b + (b.b - f.b) * t } }
+  var lo = 0, hi = 1
+  for (var i = 0; i < 24; i++) {
+    var t = (lo + hi) / 2
+    if (contrastRatio(blend(t), b) >= want) lo = t; else hi = t
+  }
+  // The 8-bit colour it is written as can round across the line; step back
+  // toward the foreground until the colour as written still holds the ratio.
+  var out = hexColor(blend(lo))
+  for (var s = 0; s < 64 && lo > 0 && contrastRatio(out, b) < want; s++) {
+    lo = Math.max(0, lo - 1 / 255)
+    out = hexColor(blend(lo))
+  }
+  return out
+}
+
+// ---------------------------------------------------------------- spectrum backdrop
+//
+// The 24 levels the spectrum helper prints (40 Hz .. 11 kHz, log-spaced, 0..1)
+// as points on the curve's own frequency axis, for the soft shape drawn behind
+// the response. Empty for no levels: the backdrop then draws nothing.
+var SPECTRUM_LOW = 40, SPECTRUM_HIGH = 11000
+function spectrumPoints(levels) {
+  var list = levels || [], n = list.length, out = []
+  if (n < 2) return out
+  for (var i = 0; i < n; i++)
+    out.push({ freq: SPECTRUM_LOW * Math.pow(SPECTRUM_HIGH / SPECTRUM_LOW, i / (n - 1)),
+               level: clamp(Number(list[i]) || 0, 0, 1) })
+  return out
+}
+
+// The backdrop's motion: a level rises at once and falls back slowly, so the
+// shape reads as what is playing rather than flickering at the frame rate.
+function easeLevels(previous, next, fall) {
+  var p = previous || [], n = next || [], out = []
+  var k = Number(fall) > 0 ? Number(fall) : 0.18
+  for (var i = 0; i < n.length; i++) {
+    var was = i < p.length ? Number(p[i]) || 0 : 0, now = clamp(Number(n[i]) || 0, 0, 1)
+    out.push(now >= was ? now : was + (now - was) * k)
+  }
+  return out
 }

@@ -13,6 +13,10 @@
 //   node tests/dsp-check.js thd <rec.wav> <freq>
 //   node tests/dsp-check.js trend <rec.wav>
 //   node tests/dsp-check.js lag <rec4.wav>
+//   node tests/dsp-check.js clicks <rec.wav> <freq>
+//   node tests/dsp-check.js peak <rec.wav>
+//   node tests/dsp-check.js gen gate <out.wav>
+//   node tests/dsp-check.js gate <rec.wav>
 //
 // Every measurement prints one line and exits 0 on a pass, 1 on a fail, so the
 // shell side only has to count.
@@ -77,6 +81,7 @@ function fft(re, im) {
 }
 
 const IMPULSE_AMP = 0.1;
+const GATE_LEAD = 0.6, GATE_BURSTS = 6, GATE_PILOT = 1025;
 const N = 32768;
 // The impulse response of one channel, as dB at any frequency. The window
 // starts just before the strongest sample, so the graph's latency (the
@@ -129,6 +134,41 @@ if (cmd === 'gen') {
       L[lead + i] = aL * v; R[lead + i] = aR * v;
     }
     writeWav(out, [L, R]);
+  } else if (kind === 'gate') {
+    // The balanced headroom's gate (docs/spec-v4.md §3.5.2): pink noise at a
+    // 12 dB crest factor, normalised to -0.1 dBFS peak; every 500 ms a
+    // full-scale 50 Hz burst of four cycles in its place; and under all of it a
+    // -30 dBFS pilot at 1025 Hz (an exact bin of a 40 ms window, and no
+    // harmonic of 50 Hz), alone for the first 0.6 s as the reference.
+    const n = Math.round(RATE * (GATE_LEAD + GATE_BURSTS * 0.5 + 0.3)), L = new Float32Array(n);
+    let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0, seed = 12345;
+    const white = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x3fffffff - 1; };
+    const pink = new Float64Array(n);
+    let sq = 0;
+    for (let i = 0; i < n; i++) {
+      // Paul Kellet's pink filter.
+      const w = white();
+      b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759; b2 = 0.96900 * b2 + w * 0.1538520;
+      b3 = 0.86650 * b3 + w * 0.3104856; b4 = 0.55000 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.0168980;
+      pink[i] = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362; b6 = w * 0.115926;
+      sq += pink[i] * pink[i];
+    }
+    const rms = Math.sqrt(sq / n), clipAt = rms * 4;          // 12 dB crest
+    let mx = 0;
+    for (let i = 0; i < n; i++) { pink[i] = Math.max(-clipAt, Math.min(clipAt, pink[i])); mx = Math.max(mx, Math.abs(pink[i])); }
+    const noiseScale = Math.pow(10, -0.1 / 20) / mx * 0.95;  // room for the pilot
+    const pilot = 0.0316;
+    for (let i = 0; i < n; i++) {
+      const t = i / RATE;
+      let v = pilot * Math.sin(2 * Math.PI * GATE_PILOT * t);
+      if (t >= GATE_LEAD) {
+        const rel = (t - GATE_LEAD) % 0.5, k = Math.floor((t - GATE_LEAD) / 0.5);
+        if (k < GATE_BURSTS && rel < 4 / 50) v += 0.965 * Math.sin(2 * Math.PI * 50 * rel);
+        else if (k < GATE_BURSTS) v += pink[i] * noiseScale;
+      }
+      L[i] = v;
+    }
+    writeWav(out, [L, L]);
   } else {
     done(false, 'unknown signal ' + kind);
   }
@@ -214,6 +254,65 @@ if (cmd === 'trend') {
   const peakIn = (a, b) => { let p = 0; for (let i = Math.max(a, 0); i < Math.min(b, x.length); i++) p = Math.max(p, Math.abs(x[i])); return p; };
   const db = p => (20 * Math.log10(p + 1e-12)).toFixed(1);
   console.log(db(peakIn(s.first + Math.floor(sec * 0.2), s.first + sec)) + ' ' + db(peakIn(s.last - sec, s.last - Math.floor(sec * 0.1))));
+  process.exit(0);
+}
+
+if (cmd === 'clicks') {
+  // The largest sample-to-sample jump of channel 0 against what a clean tone
+  // of the local amplitude can do (2 A sin(pi f / fs)), in dB over 25 ms
+  // windows: a gain step that clicks shows as a jump far above the tone's own.
+  const f0 = Number(args[1]), x = rec[0], s = steady(x), W = Math.round(RATE * 0.025);
+  const own = 2 * Math.sin(Math.PI * f0 / RATE);
+  let worst = -Infinity;
+  for (let a = s.first + Math.round(RATE * 0.05); a + W < s.last - Math.round(RATE * 0.05); a += W) {
+    let pk = 0, jump = 0;
+    for (let i = a; i < a + W; i++) { pk = Math.max(pk, Math.abs(x[i])); jump = Math.max(jump, Math.abs(x[i] - x[i - 1])); }
+    if (pk < 1e-4) continue;
+    worst = Math.max(worst, 20 * Math.log10(jump / (pk * own)));
+  }
+  console.log(worst.toFixed(2));
+  process.exit(0);
+}
+
+if (cmd === 'peak') {
+  // The largest sample anywhere in the recording, either channel, in dBFS.
+  let p = 0;
+  for (const sig of rec) for (const v of sig) p = Math.max(p, Math.abs(v));
+  console.log((20 * Math.log10(p + 1e-12)).toFixed(2));
+  process.exit(0);
+}
+
+if (cmd === 'gate') {
+  // The gate's three numbers: the worst THD of a burst (harmonics 2..10 over
+  // its middle two cycles), the most the pilot moves during a burst against
+  // its level alone (dB), and the largest sample (dBFS). The recording starts
+  // at the graph's latency, so the bursts are found by their 50 Hz energy.
+  const x = rec[0], N = 1920;                         // 40 ms: 2 cycles of 50 Hz
+  const bin = (seg, f) => { let re = 0, im = 0; for (let i = 0; i < seg.length; i++) { const w = 2 * Math.PI * f * i / RATE; re += seg[i] * Math.cos(w); im -= seg[i] * Math.sin(w); } return Math.hypot(re, im) * 2 / seg.length; };
+  // The first sample of signal: the pilot alone starts the recording.
+  let start = 0;
+  while (start < x.length && Math.abs(x[start]) < 0.005) start++;
+  const ref = bin(x.subarray(start + Math.round(RATE * 0.2), start + Math.round(RATE * 0.2) + N), GATE_PILOT);
+  // The first burst is the first loud sample after the pilot alone; the rest
+  // follow every 500 ms. Each is measured over its middle two cycles, past the
+  // limiter's attack and clear of the noise either side.
+  let onset = start + Math.round(RATE * 0.4);
+  while (onset < x.length && Math.abs(x[onset]) < 0.3) onset++;
+  let worstThd = 0, worstPump = 0, found = 0;
+  for (let k = 0; k < GATE_BURSTS; k++) {
+    const a = onset + Math.round(RATE * (k * 0.5 + 0.02));
+    if (a + N > x.length) break;
+    const seg = x.subarray(a, a + N), fund = bin(seg, 50);
+    if (fund < 0.1) continue;
+    found++;
+    let harm = 0;
+    for (let h = 2; h <= 10; h++) harm += Math.pow(bin(seg, 50 * h), 2);
+    worstThd = Math.max(worstThd, 100 * Math.sqrt(harm) / fund);
+    worstPump = Math.max(worstPump, Math.abs(20 * Math.log10(bin(seg, GATE_PILOT) / ref)));
+  }
+  let p = 0;
+  for (const sig of rec) for (const v of sig) p = Math.max(p, Math.abs(v));
+  console.log(worstThd.toFixed(2) + ' ' + worstPump.toFixed(2) + ' ' + (20 * Math.log10(p + 1e-12)).toFixed(2) + ' ' + found);
   process.exit(0);
 }
 

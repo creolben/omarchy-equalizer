@@ -9,9 +9,13 @@ QtObject {
     property string family: "monospace"
     property real body: 14
     property real caption: 11
+    property real title: 15
+    property real display: 24
+    property real iconSmall: 12
   }
   property QtObject spacing: QtObject {
     property int controlPaddingX: 10
+    property int controlPaddingY: 6
     property int inputPaddingY: 7
     property int controlHeight: 32
     property int popupRowHeight: 28
@@ -29,5 +33,6 @@ QtObject {
   function hoverStateColor(f, a) { return a }
   function space(px) { return Math.round(px) }
   function spaceReal(px) { return px }
+  function selectedFillFor(f, a) { return "#30ffffff" }
   function controlFill(focused, hot, foreground, accent) { return focused ? "#30ffffff" : (hot ? "#20ffffff" : "#10ffffff") }
 }

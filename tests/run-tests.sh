@@ -154,7 +154,7 @@ run set-headroom auto >/dev/null
 check "set-headroom auto recomputes the preamp" "true" \
   "$(jq -cn --argjson a "$(run status | jq -r '.preamp')" --argjson b "$(run status | jq -r '.autoPreamp')" '($a - $b) == 0')"
 out="$(run set-headroom bogus)"; rc=$?
-check "set-headroom rejects anything else" "1|Headroom must be auto or manual." "$rc|$out"
+check "set-headroom rejects anything else" "1|Headroom must be auto, balanced or manual." "$rc|$out"
 
 echo "== headroom on a state written before the field =="
 run set-mode graphic >/dev/null
@@ -178,6 +178,31 @@ for i in 0 1 2; do
   check "auto headroom matches Model.autoPreampDb for set $((i + 1))" "true" \
     "$(jq -cn --argjson a "$got" --argjson b "$want" '($a - $b) == 0')"
 done
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+
+echo "== the balanced headroom matches Model.js =="
+# The bass shelf, the smile and the treble lift of docs/spec-v4.md §1.3 on top of
+# the three sets above: the programme gain and the balanced preamp the backend's
+# awk computes against the panel's model, number for number.
+set4="$(jq -cn '[31,62,125,250,500,1000,2000,4000,8000,16000] as $f | [8,6,4,0,0,0,0,0,0,0] as $g
+  | [range(0; 10) | { type: "peaking", freq: $f[.], q: 1.41, gain: $g[.] }]')"
+set5="$(jq -cn '[31,62,125,250,500,1000,2000,4000,8000,16000] as $f | [6,4,2,0,-2,-2,0,2,4,6] as $g
+  | [range(0; 10) | { type: "peaking", freq: $f[.], q: 1.41, gain: $g[.] }]')"
+set6="$(jq -cn '[31,62,125,250,500,1000,2000,4000,8000,16000] | map({ type: "peaking", freq: ., q: 1.41, gain: (if . == 16000 then 10 else 0 end) })')"
+jq -c --argjson d "$set4" --argjson e "$set5" --argjson f "$set6" '. + [$d, $e, $f]' "$T/headroom-sets.json" >"$T/balanced-sets.json"
+model_b="$(node "$here/headroom-check.js" "$rate" "$T/balanced-sets.json" balanced)"
+model_p="$(node "$here/headroom-check.js" "$rate" "$T/balanced-sets.json" program)"
+modes=(graphic parametric parametric graphic graphic graphic)
+for i in 0 1 2 3 4 5; do
+  bands="$(jq -c ".[$i]" "$T/balanced-sets.json")"
+  backend_auto_preamp "${modes[$i]}" "$bands" >/dev/null
+  got="$(run status | jq -c '[.balancedPreamp, .programGainDb]')"
+  want="$(jq -cn --argjson b "$model_b" --argjson p "$model_p" "[\$b[$i], \$p[$i]]")"
+  check "balanced preamp and programme gain match Model.js for set $((i + 1))" "true" \
+    "$(jq -cn --argjson a "$got" --argjson b "$want" '($a[0] - $b[0]) == 0 and (($a[1] - $b[1]) | fabs) < 0.005')"
+done
+check "the bass shelf takes less cut balanced than safe" "true" \
+  "$(jq -cn --argjson b "$model_b" --argjson a "$(node "$here/headroom-check.js" "$rate" "$T/balanced-sets.json")" '$b[3] > $a[3]')"
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 
 echo "== live vs rebuild =="
@@ -273,25 +298,28 @@ node "$here/metrics-check.js" >"$T/metrics-check.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] || sed 's/^/      /' "$T/metrics-check.log"
 check "the metrics memo is correct and builds coefficients once" "0" "$rc"
 
-echo "== the meter: spectrum parsing, the Lottie bar motion, and beats =="
-node "$here/wave-check.js" >"$T/wave-check.log" 2>&1; rc=$?
-[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/wave-check.log"
-check "the meter functions are pure, bounded, and parse only real frames" "0" "$rc"
+echo "== the spectrum behind the curve, and the caption contrast =="
+node "$here/spectrum-check.js" >"$T/spectrum-check.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/spectrum-check.log"
+check "the backdrop parses only real frames and the dim text holds 4.5:1" "0" "$rc"
+
+echo "== the 10-band faders set the response at their centres =="
+node "$here/fit-check.js" >"$T/fit-check.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/fit-check.log"
+check "the fit reaches every fader and moves no other" "0" "$rc"
 
 echo "== one input policy: the wheel scrolls, it does not edit =="
 node "$here/input-policy-check.js" >"$T/input-policy-check.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] || sed 's/^/      /' "$T/input-policy-check.log"
 check "the wheel policy follows the rule table exactly" "0" "$rc"
 
-echo "== a band's first drag starts from its own frequency =="
-# The press handler must read the band's frequency before it marks the band as
-# dragged: bandFreqAt() answers with draftFreq for the dragged band, so the other
-# order reads back the previous drag -- 0 on the first one -- and the handle is
-# drawn at the 1 kHz fallback. tests/press-order-check.js holds the order, and
-# fails against the pre-fix handler.
-node "$here/press-order-check.js" >"$T/press-order-check.log" 2>&1; rc=$?
-[[ $rc -eq 0 ]] || sed 's/^/      /' "$T/press-order-check.log"
-check "the press handler reads the frequency before it marks the drag" "0" "$rc"
+echo "== the curve draws its handles from the bands it draws its line from =="
+# Issue #3 (a first drag drew its handle at the 1 kHz fallback) came from draft
+# values the curve kept beside the bands. The curve now has none: the panel
+# echoes every move into the bands, and tests/qml/tst_responsecurve.qml holds
+# the handle on the line during and after a drag.
+check "the curve keeps no draft gain or frequency of its own" "0" \
+  "$(grep -cE 'draft(Gain|Freq)' "$here/../ResponseCurve.qml")"
 
 echo "== the preamp slider is plugin-owned and cannot take the wheel =="
 check "the preamp slider is the plugin's own component" "yes" \
@@ -900,7 +928,7 @@ rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/presets.json"
 
 echo "== preset ramp =="
-# The crossfade belongs to the biquad chain, i.e. a machine without LSP.
+# A machine without LSP runs the biquad chain.
 export OMARCHY_EQ_LV2_DIR="$T/lv2-missing"; mkdir -p "$OMARCHY_EQ_LV2_DIR"
 # Get into graphic mode with a flat graphic set, then clear the logs so only the
 # preset application is measured. The ramp is enabled here; every other test
@@ -911,11 +939,13 @@ run reset >/dev/null
 unset OMARCHY_EQ_NO_RAMP
 run apply-preset "Bass Boost" >/dev/null
 export OMARCHY_EQ_NO_RAMP=1
+# PipeWire's builtin biquad clears its history on every update, so each write
+# clicks once whatever its size (tests/dsp-check.sh): the biquad chain takes a
+# preset in one write rather than eight.
 check "a shape-compatible preset does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
-check "a shape-compatible preset writes the graph more than once" "yes" \
-  "$( (( $(wc -l <"$PWCLI_LOG") > 1)) && echo yes || echo no )"
-check "the last ramp step carries the preset's final gains" "yes" \
-  "$(tail -n1 "$PWCLI_LOG" | grep -q '"g9_l:Gain" -5.5.*"g9_r:Gain" -5.5' && echo yes || echo no)"
+check "a shape-compatible preset is one write of the biquads" "1" "$(grep -c 'g9_l:Gain' "$PWCLI_LOG")"
+check "which carries the preset's final gains" "yes" \
+  "$(grep 'g9_l:Gain' "$PWCLI_LOG" | tail -n1 | grep -q '"g9_l:Gain" -5.5.*"g9_r:Gain" -5.5' && echo yes || echo no)"
 : >"$SYSTEMCTL_LOG"
 run apply-preset "Speech Clarity" >/dev/null
 check "a parametric preset rebuilds the graph" "yes" \
@@ -930,6 +960,28 @@ check "a biquad graph left running is rebuilt into the pool once" "1" "$(grep -c
 run add-band >/dev/null
 check "adding a band to a running pool does not restart the unit" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
 check "adding a band to the pool is one live write" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+# A whole new set in one write clicks in the pool too (tests/dsp-check.sh), so a
+# preset of the same shape is cross-faded there as well; another shape is one write.
+# The flat gains then walk to the new preamp in 0.1 dB steps (they click when
+# stepped at once), in the background: Rock's -0.5 dB to Bass Boost's 0 is five.
+run apply-preset Rock >/dev/null
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+unset OMARCHY_EQ_NO_RAMP
+run apply-preset "Bass Boost" >/dev/null
+export OMARCHY_EQ_NO_RAMP=1
+for _ in $(seq 100); do tail -n1 "$PWCLI_LOG" | grep -q '"pre_l:Mult" 1.000000' && break; sleep 0.02; done
+check "a preset of the same shape is cross-faded in the pool" "8|0" \
+  "$(grep -c 'para:g_9' "$PWCLI_LOG")|$(grep -c restart "$SYSTEMCTL_LOG")"
+check "and the last band step is the preset itself" "yes" \
+  "$(grep 'para:g_9' "$PWCLI_LOG" | tail -n1 | grep -q "\"para:g_9\" $(LC_ALL=C awk 'BEGIN { printf "%.6f", 10 ^ (-5.5 / 20) }')" && echo yes || echo no)"
+check "the bands move under the old preamp" "8" "$(grep 'para:g_9' "$PWCLI_LOG" | grep -c '"pre_l:Mult" 0.944061')"
+check "then the flat gains walk to the new one in 0.1 dB steps" "5|1" \
+  "$(grep -vc 'para:' "$PWCLI_LOG")|$(tail -n1 "$PWCLI_LOG" | grep -c '"pre_l:Mult" 1.000000')"
+: >"$PWCLI_LOG"
+unset OMARCHY_EQ_NO_RAMP
+run apply-preset "Speech Clarity" >/dev/null
+export OMARCHY_EQ_NO_RAMP=1
+check "a preset of another shape is one write" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
 
 echo "== output stage defaults =="
 check "the limiter defaults on" "on" "$(run status | jq -r '.limiter')"
@@ -964,8 +1016,9 @@ check "the leveler feeds the compressor" "1" \
 check "the compressor feeds the relief, the relief the volume" "2" \
   "$(grep -cE 'boost:out_l" input = "relief_l:In"|relief_l:Out" input = "vol_l:In"' "$frag")"
 check "the volume feeds the limiter" "1" "$(grep -c 'vol_r:Out" input = "limit:in_r"' "$frag")"
-check "the limiter is the graph output" "1" "$(grep -c 'outputs = \[ "limit:out_l" "limit:out_r" \]' "$frag")"
-check "nothing links out of the limiter" "0" "$(grep -c 'output = "limit:out' "$frag")"
+check "the device relief is the graph output" "1" "$(grep -c 'outputs = \[ "drelief_l:Out" "drelief_r:Out" \]' "$frag")"
+check "and the limiter feeds only it" "2" "$(grep -c 'output = "limit:out' "$frag")"
+check "the limiter feeds the device relief" "1" "$(grep -c 'limit:out_r" input = "drelief_r:In"' "$frag")"
 check "the sink volume drives the in-graph volume nodes" "2" \
   "$(grep -cE '\{ control = "vol_[lr]:Mult" \}' "$frag")"
 # With no bands the preamp is the whole head of the chain and feeds the pool,
@@ -1190,14 +1243,21 @@ run disable >/dev/null
 run enable >/dev/null
 export PACTL_DEFAULT_SINK=omarchy_equalizer
 frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
-check "the fragment names its layout" "1" "$(grep -c '^# Layout: v3 pool$' "$frag")"
-check "enable records the layout the graph runs" "pool" "$(cat "$XDG_STATE_HOME/omarchy-equalizer/running-layout")"
+check "the fragment names its layout" "1" "$(grep -c '^# Layout: v4 pool$' "$frag")"
+check "enable records the layout the graph runs" "v4 pool" "$(cat "$XDG_STATE_HOME/omarchy-equalizer/running-layout")"
+# What a version-3 backend recorded ("pool", no version) is another layout: the
+# first edit after the upgrade rebuilds once, to add the device relief.
+printf 'pool\n' >"$XDG_STATE_HOME/omarchy-equalizer/running-layout"
+: >"$SYSTEMCTL_LOG"
+run set-gain 2 1 >/dev/null
+check "a graph a version-3 backend started is rebuilt once" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
+run set-gain 2 0 >/dev/null
 # A graph from before the layout line: the first live command rebuilds it once.
 printf '' >"$XDG_STATE_HOME/omarchy-equalizer/running-layout"
 : >"$SYSTEMCTL_LOG"
 run set-gain 2 1 >/dev/null
 check "a graph of an older layout is rebuilt on the first edit" "1" "$(grep -c '^--user restart' "$SYSTEMCTL_LOG")"
-check "and the rebuild records the new layout" "pool" "$(cat "$XDG_STATE_HOME/omarchy-equalizer/running-layout")"
+check "and the rebuild records the new layout" "v4 pool" "$(cat "$XDG_STATE_HOME/omarchy-equalizer/running-layout")"
 : >"$SYSTEMCTL_LOG"
 run set-gain 2 0 >/dev/null
 check "after that edits are live again" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
@@ -1389,7 +1449,8 @@ export PACTL_SINK_VOLUME_DB=-12.00
 : >"$PWCLI_LOG"
 run retarget >/dev/null
 check "a volume change moves the relief on the next pass" "6" "$(run status | jq -r '.relief')"
-check "with one live write of the relief alone" "1" "$(grep -c '"relief_l:Mult" 1.995262 "relief_r:Mult" 1.995262 \]' "$PWCLI_LOG")"
+check "with one live write of the relief alone" "1" \
+  "$(grep -c 'params = \[ "relief_l:Mult" 1.995262 "relief_r:Mult" 1.995262 "drelief_l:Mult" 1.000000 "drelief_r:Mult" 1.000000 \]' "$PWCLI_LOG")"
 : >"$PWCLI_LOG"
 run retarget >/dev/null
 check "a pass with nothing to change writes nothing" "0" "$(grep -c 'relief_l' "$PWCLI_LOG")"
@@ -1557,6 +1618,7 @@ run retarget >/dev/null
 check "back on the speakers, their own curve comes back" "audio_effect.stub-dsp|Rock" "$(jq -r '"\(.targetSink)|\(.preset)"' "$st")"
 check "the switch is live, not a rebuild" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
 check "and reaches the graph" "1" "$(grep -c 'para:ft_0' "$PWCLI_LOG")"
+check "a device-curve switch clears the undo history" "false|false" "$(run status | jq -r '"\(.canUndo)|\(.canRedo)"')"
 check "the earbuds' curve is remembered" "Bass Boost" "$(jq -r '.deviceCurves["bluez_output.AA_BB_CC_DD_EE_FF"].preset' "$st")"
 # The earbuds come back, under their other profile.
 export PACTL_DEVICE_SINK2=bluez_output.AA_BB_CC_DD_EE_FF.2 PACTL_EQ_AIM_SINK_ID=3
@@ -1621,7 +1683,7 @@ run delete-preset "My Rock" >/dev/null
 echo "== the state file carries its version, and keys it does not know =="
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 run set-gain 1 2 >/dev/null
-check "a written state names its version" "3" "$(jq -r '.version' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
+check "a written state names its version" "4" "$(jq -r '.version' "$XDG_STATE_HOME/omarchy-equalizer/state.json")"
 jq '.futureKey = {"kept": true} | .version = 7' "$XDG_STATE_HOME/omarchy-equalizer/state.json" >"$T/s.json" &&
   mv "$T/s.json" "$XDG_STATE_HOME/omarchy-equalizer/state.json"
 run set-gain 1 3 >/dev/null
@@ -1637,6 +1699,385 @@ check "a profile named like a built-in is saved under a suffix" "Rock (AutoEq)" 
 check "and the state names the suffixed preset" "Rock (AutoEq)" "$(run status | jq -r '.preset')"
 run delete-preset "Rock (AutoEq)" >/dev/null
 rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json"
+
+echo "== the queue path walks the preamp too =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json" "$XDG_STATE_HOME/omarchy-equalizer/history.json"
+run set-mode parametric >/dev/null
+: >"$PWCLI_LOG"
+unset OMARCHY_EQ_NO_RAMP
+run set-gain 4 6 >/dev/null
+# The walk is detached; it is done when the preamp lands on the new cut.
+for _ in $(seq 300); do tail -n1 "$PWCLI_LOG" | grep -q '"pre_l:Mult" 0.501187' && break; sleep 0.02; done
+export OMARCHY_EQ_NO_RAMP=1
+check "a band edit goes in under the preamp the graph had" "1" "$(head -n1 "$PWCLI_LOG" | grep -c '"para:g_4" 1.995262.*\|"pre_l:Mult" 1.000000')"
+check "and the preamp walks to the new cut in 0.1 dB steps" "60|1" \
+  "$(grep -vc 'para:' "$PWCLI_LOG")|$(tail -n1 "$PWCLI_LOG" | grep -c '"pre_l:Mult" 0.501187')"
+# An A/B is a comparison: it switches at once, not over a walk.
+: >"$PWCLI_LOG"
+unset OMARCHY_EQ_NO_RAMP
+run compare on >/dev/null
+sleep 0.3
+export OMARCHY_EQ_NO_RAMP=1
+check "an A/B switches in one write, without a walk" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+run compare off >/dev/null
+
+echo "== set-gains: every band at once =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json" "$XDG_STATE_HOME/omarchy-equalizer/history.json"
+run set-mode graphic >/dev/null
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run set-gains 1 2 3 4 5 6 7 8 9 10 >/dev/null
+check "set-gains sets every band" "1,2,3,4,5,6,7,8,9,10" "$(run status | jq -r '[.bands[].gain | tostring] | join(",")')"
+check "in one live write" "1" "$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+check "without a restart" "0" "$(grep -c restart "$SYSTEMCTL_LOG")"
+out="$(run set-gains 1 2 3)"; rc=$?
+check "the wrong count is refused" "1|set-gains takes one gain per band: 10, not 3." "$rc|$out"
+out="$(run set-gains 1 2 3 4 5 6 7 8 9 x)"; rc=$?
+check "a non-number is refused" "1|'x' is not a number." "$rc|$out"
+out="$(run set-gains 1 2 3 4 5 6 7 8 9 40)"; rc=$?
+check "a gain out of range is refused" "1" "$rc"
+check "and a refused set leaves the bands as they were" "10" "$(run status | jq -r '.bands[9].gain')"
+
+echo "== add-band where the curve was double-clicked =="
+run set-mode parametric >/dev/null
+n="$(run status | jq '.bands | length')"
+run add-band 3150 4.5 1 peaking >/dev/null
+check "add-band takes a frequency, a gain, a Q and a type" "3150|4.5|1|peaking" \
+  "$(run status | jq -r '.bands[-1] | "\(.freq)|\(.gain)|\(.q)|\(.type)"')"
+check "and appends one band" "$((n + 1))" "$(run status | jq '.bands | length')"
+out="$(run add-band 1000 0 1 wobble)"; rc=$?
+check "a type the graph does not know is refused" "1" "$rc"
+out="$(run add-band 99999)"; rc=$?
+check "a frequency out of range is refused" "1" "$rc"
+check "and nothing was added by either" "$((n + 1))" "$(run status | jq '.bands | length')"
+run remove-band "$n" >/dev/null
+
+echo "== undo, redo and revert =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json" "$XDG_STATE_HOME/omarchy-equalizer/history.json"
+run set-mode graphic >/dev/null
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/history.json"
+out="$(run undo)"; rc=$?
+check "nothing to undo says so" "1|Nothing to undo." "$rc|$out"
+run set-gain 2 3 >/dev/null
+check "an edit can be undone" "true|false" "$(run status | jq -r '"\(.canUndo)|\(.canRedo)"')"
+: >"$SYSTEMCTL_LOG"; : >"$PWCLI_LOG"
+run undo >/dev/null
+check "undo puts the curve back" "0|false|true" "$(run status | jq -r '"\(.bands[2].gain)|\(.canUndo)|\(.canRedo)"')"
+check "live, without a restart" "0|1" "$(grep -c restart "$SYSTEMCTL_LOG")|$(wc -l <"$PWCLI_LOG" | tr -d ' ')"
+run redo >/dev/null
+check "redo puts the edit back" "3|true|false" "$(run status | jq -r '"\(.bands[2].gain)|\(.canUndo)|\(.canRedo)"')"
+for g in 4 5 6 7; do run set-gain 2 "$g" >/dev/null; done
+run undo >/dev/null
+check "a burst of set-gain on one band within a second is one step" "3" "$(run status | jq -r '.bands[2].gain')"
+run redo >/dev/null
+run apply-preset Rock >/dev/null
+run undo >/dev/null
+check "a preset can be undone" "Flat|7" "$(run status | jq -r '"\(.preset)|\(.bands[2].gain)"')"
+run reset >/dev/null
+run undo >/dev/null
+check "a reset can be undone" "7" "$(run status | jq -r '.bands[2].gain')"
+run set-mode parametric >/dev/null
+run undo >/dev/null
+check "a mode switch can be undone" "graphic" "$(run status | jq -r '.mode')"
+run set-preamp -12 >/dev/null
+run undo >/dev/null
+check "a hand-set preamp can be undone, headroom and all" "auto" "$(run status | jq -r '.headroom')"
+run set-gain 1 1 >/dev/null
+check "a new edit after an undo clears redo" "false" "$(run status | jq -r '.canRedo')"
+steps="$(jq '.undo | length' "$XDG_STATE_HOME/omarchy-equalizer/history.json")"
+run save-preset "Undo Test" >/dev/null
+check "saving a preset is not a step" "$steps" "$(jq '.undo | length' "$XDG_STATE_HOME/omarchy-equalizer/history.json")"
+run delete-preset "Undo Test" >/dev/null
+printf 'Preamp: -3 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3.0 dB Q 1.0\n' >"$T/Undone ParametricEQ.txt"
+run import-autoeq "$T/Undone ParametricEQ.txt" >/dev/null
+run undo >/dev/null
+check "an AutoEq import can be undone" "graphic" "$(run status | jq -r '.mode')"
+run delete-preset "Undone" >/dev/null
+for i in $(seq 1 35); do run set-gain $((i % 10)) "$((i / 10)).$((i % 10))" >/dev/null; done
+check "the history keeps at most 30 steps" "30" "$(jq '.undo | length' "$XDG_STATE_HOME/omarchy-equalizer/history.json")"
+run apply-preset Rock >/dev/null
+run set-gain 4 5 >/dev/null
+check "an edited preset reads as edited" "true" "$(run status | jq -r '.presetDirty')"
+run revert-preset >/dev/null
+check "revert-preset goes back to it as saved" "Rock|false" "$(run status | jq -r '"\(.preset)|\(.presetDirty)"')"
+run undo >/dev/null
+check "and the revert is a step of its own" "true" "$(run status | jq -r '.presetDirty')"
+run save-preset "Gone Soon" >/dev/null
+run delete-preset "Gone Soon" >/dev/null
+out="$(run revert-preset)"; rc=$?
+check "a preset that is gone cannot be reverted to" "1" "$rc"
+# Only a burst on one band merges: two presets in a second are two steps.
+run apply-preset Rock >/dev/null
+run apply-preset Jazz >/dev/null
+run undo >/dev/null
+check "two presets within a second are two steps" "Rock" "$(run status | jq -r '.preset')"
+
+echo "== balanced headroom =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json" "$XDG_STATE_HOME/omarchy-equalizer/history.json"
+run set-mode graphic >/dev/null
+run set-gains 8 6 4 0 0 0 0 0 0 0 >/dev/null
+safe="$(run status | jq -r '.preamp')"
+: >"$PWCLI_LOG"
+run set-headroom balanced >/dev/null
+check "balanced plays the balanced preamp" "balanced|true" "$(run status | jq -r '"\(.headroom)|\(.preamp == .balancedPreamp)"')"
+check "which cuts less than safe for a bass shelf" "true" "$(run status | jq --argjson s "$safe" '.preamp > $s')"
+check "the switch reaches the graph" "1" "$(grep -c 'pre_l:Mult' "$PWCLI_LOG")"
+check "a manual preamp's ceiling stays the safe one" "true" "$(run status | jq '.preampCeiling == .autoPreamp')"
+: >"$PWCLI_LOG"
+run set-limiter off >/dev/null
+check "without the limiter balanced plays as safe" "balanced|$safe" "$(run status | jq -r '"\(.headroom)|\(.preamp)"')"
+check "and the limiter switch moves the preamp in the graph too" "1" "$(grep -c 'pre_l:Mult' "$PWCLI_LOG")"
+run set-limiter on >/dev/null
+check "with the limiter back it is balanced again" "true" "$(run status | jq '.preamp == .balancedPreamp')"
+run set-gain 3 3 >/dev/null
+check "an edit under balanced stays balanced" "true" "$(run status | jq '.preamp == .balancedPreamp')"
+check "the summary of the cut is in the status" "true" "$(run status | jq '(.programGainDb | type) == "number"')"
+# An edit recomputes the relief; at -20 dB the whole balanced cut is given back.
+PACTL_SINK_VOLUME_DB=-20 run set-gain 3 3 >/dev/null
+check "the volume relief gives back the balanced cut" "true" "$(run status | jq '.relief == -.preamp and .relief > 0')"
+run set-gain 3 3 >/dev/null
+export OMARCHY_EQ_LV2_DIR="$T/lv2-missing"
+run set-gain 3 2 >/dev/null
+check "without LSP balanced plays as safe" "true" "$(run status | jq '.preamp == .autoPreamp')"
+export OMARCHY_EQ_LV2_DIR="$T/lv2"
+run set-gain 3 3 >/dev/null
+run set-headroom auto >/dev/null
+check "and back to safe" "auto|true" "$(run status | jq -r '"\(.headroom)|\(.preamp == .autoPreamp)"')"
+
+echo "== device relief: the cut given back as the device volume allows =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json" "$XDG_STATE_HOME/omarchy-equalizer/history.json"
+run disable >/dev/null
+export PACTL_DEVICE_SINK=audio_effect.stub-dsp PACTL_DEFAULT_SINK=audio_effect.stub-dsp
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+run set-mode graphic >/dev/null
+run set-gains 0 0 0 0 0 6 0 0 0 0 >/dev/null
+export PACTL_DEVICE_VOLUME_DB=-12.00
+run retarget >/dev/null
+check "off by default: nothing is given back, whatever the device volume" "off|0|-6" \
+  "$(run status | jq -r '"\(.followDeviceVolume)|\(.deviceRelief)|\(.appliedPreamp)"')"
+: >"$PWCLI_LOG"
+run set-device-relief on >/dev/null
+check "on, the cut is given back as far as the device volume allows" "6|0" "$(run status | jq -r '"\(.deviceRelief)|\(.appliedPreamp)"')"
+check "and it reaches the graph" "1" "$(grep -c '"drelief_l:Mult" 1.995262' "$PWCLI_LOG")"
+frag="$XDG_CONFIG_HOME/pipewire/omarchy-equalizer.conf.d/90-eq.conf"
+check "the fragment carries it, so a restart keeps it" "1" "$(grep -c 'name = drelief_l label = linear control = { "Mult" = 1.995262' "$frag")"
+# A walk the relief alone takes over is finished, not stranded: the device
+# relief is written as the follower has it and the preamp at the walk's target.
+unset OMARCHY_EQ_NO_RAMP
+run set-gains 8 6 4 0 0 0 0 0 0 0 >/dev/null
+sleep 0.1
+check "a deeper cut walks while the limiter is on" "1" "$(grep -c '^w' "$XDG_STATE_HOME/omarchy-equalizer/gain-walk")"
+PACTL_DEVICE_VOLUME_DB=-2.00 run retarget >/dev/null
+export OMARCHY_EQ_NO_RAMP=1
+sleep 0.2
+check "the relief's own write ends the walk" "0" "$(wc -c <"$XDG_STATE_HOME/omarchy-equalizer/gain-walk" | tr -d ' ')"
+check "with the walk's preamp target and the follower's device relief" "1" \
+  "$(tail -n1 "$PWCLI_LOG" | grep -c '"pre_l:Mult" 0.334965.*"drelief_l:Mult" 1.258925\|"drelief_l:Mult" 1.258925.*"pre_l:Mult" 0.334965')"
+check "which is what the state says" "-9.5|2" "$(PACTL_DEVICE_VOLUME_DB=-2.00 run status | jq -r '"\(.preamp)|\(.deviceRelief)"')"
+run set-gains 0 0 0 0 0 6 0 0 0 0 >/dev/null
+export PACTL_DEVICE_VOLUME_DB=-3.50
+run retarget >/dev/null
+check "a louder device gives less back" "3.5" "$(run status | jq -r '.deviceRelief')"
+export PACTL_DEVICE_FLAGS="HARDWARE HW_VOLUME_CTRL DECIBEL_VOLUME LATENCY"
+run retarget >/dev/null
+check "a volume in the device's hardware (Bluetooth) gives nothing back" "0" "$(run status | jq -r '.deviceRelief')"
+unset PACTL_DEVICE_FLAGS
+export PACTL_DEVICE_MUTE=yes; run retarget >/dev/null
+check "a muted device gives nothing back" "0" "$(run status | jq -r '.deviceRelief')"
+unset PACTL_DEVICE_MUTE
+export PACTL_DEVICE_BASE=80; run retarget >/dev/null
+check "a base volume under 100 % gives nothing back" "0" "$(run status | jq -r '.deviceRelief')"
+unset PACTL_DEVICE_BASE
+export PACTL_DEVICE_VOLUME_DB=-12.00; run retarget >/dev/null
+PACTL_SINK_VOLUME_DB=-2.00 run retarget >/dev/null
+check "the equalizer's own volume gives back its part first" "2|4" \
+  "$(PACTL_SINK_VOLUME_DB=-2.00 run status | jq -r '"\(.relief)|\(.deviceRelief)"')"
+run retarget >/dev/null
+run set-headroom manual >/dev/null
+check "manual headroom takes none" "0" "$(run status | jq -r '.deviceRelief')"
+run set-headroom auto >/dev/null
+run set-limiter off >/dev/null
+check "without the limiter there is none" "0" "$(run status | jq -r '.deviceRelief')"
+run set-limiter on >/dev/null
+check "with it back there is again" "6" "$(run status | jq -r '.deviceRelief')"
+# The follower answers a volume change on the device it plays into at once, on
+# its own write, before the event burst is drained.
+echo "-12.00" >"$T/device-volume"
+export PACTL_DEVICE_VOLUME_FILE="$T/device-volume"
+: >"$PWCLI_LOG"
+( sleep 0.2; echo "-4.00" >"$T/device-volume" ) &
+PACTL_SUBSCRIBE_COUNT=1 PACTL_SUBSCRIBE_EVENT="Event 'change' on sink #2" run follow >/dev/null
+wait
+check "a volume change on the device is answered with the device relief alone" "1" \
+  "$(grep -c 'params = \[ "drelief_l:Mult" 1.584893 "drelief_r:Mult" 1.584893 \]' "$PWCLI_LOG")"
+check "and the state follows" "4" "$(run status | jq -r '.deviceRelief')"
+# A held volume key is one close burst, its steps landing while a retarget pass
+# is still running: the follower's own listener answers every one of them.
+echo "-12.00" >"$T/device-volume"
+run retarget >/dev/null
+: >"$PWCLI_LOG"
+( sleep 0.1; echo "-8.00" >"$T/device-volume"; sleep 0.12; echo "-5.00" >"$T/device-volume"; sleep 0.12; echo "-3.00" >"$T/device-volume" ) &
+PACTL_SUBSCRIBE_COUNT=4 PACTL_SUBSCRIBE_GAP=0.12 PACTL_SUBSCRIBE_EVENT="Event 'change' on sink #2" run follow >/dev/null
+wait
+# At a 6 dB cut the device relief is 6 dB at -12 and at -8 dB: -5 and -3 change it.
+check "a held volume key is followed step by step" "2" \
+  "$(grep -c 'params = \[ "drelief_l:Mult" [0-9.]* "drelief_r:Mult" [0-9.]* \]' "$PWCLI_LOG")"
+check "to the last step" "3" "$(run status | jq -r '.deviceRelief')"
+unset PACTL_DEVICE_VOLUME_FILE PACTL_DEVICE_VOLUME_DB
+run set-device-relief off >/dev/null
+check "off again, nothing is given back" "0" "$(run status | jq -r '.deviceRelief')"
+run disable >/dev/null
+unset PACTL_DEVICE_SINK PACTL_DEFAULT_SINK
+
+echo "== the live editor: a drag streamed into the graph =="
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/state.json" "$XDG_STATE_HOME/omarchy-equalizer/history.json"
+run disable >/dev/null
+export PACTL_DEVICE_SINK=alsa_output.stub PACTL_DEFAULT_SINK=alsa_output.stub
+run enable >/dev/null
+export PACTL_DEFAULT_SINK=omarchy_equalizer
+run set-mode parametric >/dev/null
+rm -f "$XDG_STATE_HOME/omarchy-equalizer/history.json"
+# A jq that counts itself, for the live process only: nothing between ready and
+# commit may run one.
+real_jq="$(command -v jq)"
+mkdir -p "$T/jqlog"
+printf '#!/bin/bash\n[[ -n ${JQ_LOG:-} ]] && printf x >>"$JQ_LOG"\nexec %q "$@"\n' "$real_jq" >"$T/jqlog/jq"
+chmod +x "$T/jqlog/jq"
+live_pid=""
+live_start() { # [env assignments...]
+  rm -f "$T/live.in"; mkfifo "$T/live.in"; : >"$T/live.out"
+  env "$@" PATH="$T/jqlog:$PATH" JQ_LOG="$T/jq.log" "$E" live <"$T/live.in" >"$T/live.out" 2>"$T/live.err" &
+  live_pid=$!
+  exec 8>"$T/live.in"
+  live_wait_for '^(ready|unavailable)'
+}
+live_send() { printf '%s\n' "$@" >&8; }
+live_wait_for() { local i; for i in $(seq 1 300); do grep -qE "$1" "$T/live.out" && return 0; sleep 0.02; done; return 1; }
+live_wait_writes() { local i; for i in $(seq 1 300); do (( $(wc -l <"$PWCLI_LOG") >= $1 )) && return 0; sleep 0.01; done; return 1; }
+live_stop() { exec 8>&-; wait "$live_pid" 2>/dev/null; live_rc=$?; }
+live_writes() { wc -l <"$PWCLI_LOG" | tr -d ' '; }
+
+live_start OMARCHY_EQ_NO_RAMP=0
+check "the editor says it is ready, with the shape it holds" "ready parametric:8:8" "$(head -n1 "$T/live.out")"
+: >"$PWCLI_LOG"; : >"$T/jq.log"
+live_send "freq 2 300"; live_wait_writes 1
+check "a frequency is one write of only that control" 'params = [ "para:f_2" 300 ]' "$(grep -o 'params = \[.*\]' "$PWCLI_LOG")"
+live_send "gain 2 4.5"; live_wait_writes 2
+check "a gain is one write of only that slot" 'params = [ "para:g_2" 1.678804 ]' "$(tail -n1 "$PWCLI_LOG" | grep -o 'params = \[.*\]')"
+check "with the limiter on the preamp is held" "0" "$(grep -c 'pre_l' "$PWCLI_LOG")"
+live_send 'gain 2 1}' 'freq 2 1e9' 'gain 99 1' 'q 2 -1' 'preamp abc' 'gain 2 "x"' 'bogus 1'
+live_wait_for 'unknown line'
+check "every bad line is refused" "7" "$(grep -c '^error ' "$T/live.out")"
+check "and none of them reaches the graph" "2" "$(live_writes)"
+burst=()
+for i in $(seq 1 50); do burst+=("gain 2 $((i % 9)).25"); done
+live_send "${burst[@]}"
+live_wait_writes 3; sleep 0.3
+check "a burst of 50 lines is one or two writes" "yes" "$( (( $(live_writes) <= 4 )) && echo yes || echo no)"
+check "and the graph ends on the last value" "1" "$(tail -n1 "$PWCLI_LOG" | grep -c "\"para:g_2\" $(LC_ALL=C awk 'BEGIN { printf "%.6f", 10 ^ (5.25 / 20) }')")"
+# Line to graph, one at a time: the cost of a line on the stubs.
+total=0
+for i in $(seq 1 20); do
+  n0="$(live_writes)"; t0="${EPOCHREALTIME//[!0-9]/}"
+  live_send "gain 4 $((i % 7)).5"
+  until (( $(live_writes) > n0 )); do :; done
+  total=$((total + ${EPOCHREALTIME//[!0-9]/} - t0))
+done
+mean=$((total / 20 / 1000))
+printf '      a line reaches the graph in %s ms on average\n' "$mean"
+check "a line reaches the graph in under 25 ms" "yes" "$( ((mean < 25)) && echo yes || echo no)"
+check "no jq runs between ready and commit" "0" "$(wc -c <"$T/jq.log" | tr -d ' ')"
+n0="$(live_writes)"
+live_send commit
+live_wait_for '^status '
+check "the commit answers with the status" "1" "$(grep -c '^status {' "$T/live.out")"
+check "and files the edit" "300|5.25|6.5" "$(run status | jq -r '"\(.bands[2].freq)|\(.bands[2].gain)|\(.bands[4].gain)"')"
+check "as one undo step" '["live:2,4"]' "$(jq -c '[.undo[].key]' "$XDG_STATE_HOME/omarchy-equalizer/history.json")"
+settled="$(run status | jq -r '.preamp')"
+final="\"pre_l:Mult\" $(LC_ALL=C awk -v p="$settled" 'BEGIN { printf "%.6f", 10 ^ (p / 20) }')"
+for _ in $(seq 400); do tail -n1 "$PWCLI_LOG" | grep -q "$final" && break; sleep 0.02; done
+# The commit sends the session's own controls once more (another command may
+# have written over them meanwhile), and the rest is the walk.
+check "the preamp settles in 0.1 dB steps of the flat gains alone" \
+  "$(LC_ALL=C awk -v p="$settled" 'BEGIN { n = int(-p / 0.1 + 0.999999); print n "|1" }')" \
+  "$(tail -n +$((n0 + 1)) "$PWCLI_LOG" | grep -c 'pre_l:Mult')|$(tail -n +$((n0 + 1)) "$PWCLI_LOG" | grep -c 'para:')"
+check "and lands where the state has it" "1" "$(tail -n1 "$PWCLI_LOG" | grep -c "$final")"
+# Two gestures on one band within a second are two steps: a drag is one.
+live_send "gain 2 1" commit
+for _ in $(seq 300); do (( $(grep -c '^status ' "$T/live.out") >= 2 )) && break; sleep 0.02; done
+live_send "gain 2 2" commit
+for _ in $(seq 300); do (( $(grep -c '^status ' "$T/live.out") >= 3 )) && break; sleep 0.02; done
+check "two live commits on one band within a second are two undo steps" '["live:2,4","live:2","live:2"]' \
+  "$(jq -c '[.undo[].key]' "$XDG_STATE_HOME/omarchy-equalizer/history.json")"
+# The state moves while the commit waits for the lock: the commit is stale,
+# and it still answers with the status, so the panel is never left waiting.
+live_send "gain 6 3"; sleep 0.3
+( exec 9>"$XDG_STATE_HOME/omarchy-equalizer/.lock"; flock 9; sleep 0.6
+  st="$XDG_STATE_HOME/omarchy-equalizer/state.json"; jq -c '.parametric[7].gain = 1' "$st" >"$st.x" && mv "$st.x" "$st" ) &
+sleep 0.2
+statuses="$(grep -c '^status ' "$T/live.out")"
+live_send commit
+wait $!
+for _ in $(seq 300); do (( $(grep -c '^status ' "$T/live.out") > statuses )) && break; sleep 0.02; done
+check "a commit the state moved under is stale" "1" "$(grep -c '^stale$' "$T/live.out")"
+check "and is answered with the status all the same" "$((statuses + 1))" "$(grep -c '^status ' "$T/live.out")"
+check "and the state keeps the other command's band, not the dropped edit" "1|0" \
+  "$(run status | jq -r '"\(.bands[7].gain)|\(.bands[6].gain)"')"
+# Another command changes the bands under an uncommitted edit: dropped, and the
+# graph put back as the state now has it.
+live_send "gain 2 6"; sleep 0.2
+run set-gain 5 2 >/dev/null
+: >"$PWCLI_LOG"
+live_send "gain 3 1"
+live_wait_for '^stale$'
+check "an edit the state moved under is stale" "1" "$(grep -c '^stale$' "$T/live.out")"
+live_wait_writes 2
+check "and the graph is put back from the state" "1" "$(head -n1 "$PWCLI_LOG" | grep -c '"para:ft_15"')"
+check "the band the other command set stays set" "2" "$(run status | jq -r '.bands[5].gain')"
+# End of input with an edit not committed: the graph is put back.
+: >"$PWCLI_LOG"
+live_stop
+check "the editor leaves at the end of its input" "0" "$live_rc"
+check "and puts back what was not committed" "1" "$(tail -n1 "$PWCLI_LOG" | grep -c '"para:ft_15"')"
+check "which the state never saw" "0" "$(run status | jq -r '.bands[3].gain')"
+# Without the limiter nothing would catch the clip: the preamp follows each line.
+run set-limiter off >/dev/null
+live_start
+: >"$PWCLI_LOG"
+# A boost past the curve's peak deepens the cut at once; taking it back does
+# not give the cut back during the drag (the commit does).
+live_send "gain 1 12"; live_wait_writes 1
+check "with the limiter off a boost deepens the cut at once" "1" "$(grep -c '"pre_l:Mult"' "$PWCLI_LOG")"
+live_send "gain 1 0"; live_wait_writes 2
+check "and taking it back keeps the cut until the commit" "1" "$(grep -c '"pre_l:Mult"' "$PWCLI_LOG")"
+live_send commit; live_wait_for '^status '
+check "and the commit files the preamp the backend computes" "true" "$(run status | jq '.preamp == .autoPreamp')"
+live_stop
+run set-limiter on >/dev/null
+# The 10-band console's fit: one line, every band.
+run set-mode graphic >/dev/null
+live_start
+: >"$PWCLI_LOG"
+live_send "gains 1 2 3 4 5 6 7 8 9 10"; live_wait_writes 1
+check "a fitted set is one write of ten slots" "10" "$(grep -o '"para:g_[0-9]*"' "$PWCLI_LOG" | wc -l | tr -d ' ')"
+live_send commit; live_wait_for '^status '
+check "and is filed as ten gains" "1,2,3,4,5,6,7,8,9,10" "$(run status | jq -r '[.bands[].gain | tostring] | join(",")')"
+steps="$(jq '.undo | length' "$XDG_STATE_HOME/omarchy-equalizer/history.json")"
+live_send "balance -0.5" commit
+live_wait_for 'status .*"balance":-0.5'
+check "a balance drag is filed too, and is not a curve step" "-0.5|$steps" \
+  "$(run status | jq -r '.balance')|$(jq '.undo | length' "$XDG_STATE_HOME/omarchy-equalizer/history.json")"
+live_stop
+run set-balance 0 >/dev/null
+# An A/B, or the equalizer off: nothing to stream into.
+run compare on >/dev/null
+live_start
+check "an A/B in force makes the editor unavailable" "1" "$(grep -c '^unavailable ' "$T/live.out")"
+live_stop
+check "and it says so with exit 3" "3" "$live_rc"
+run compare off >/dev/null
+run disable >/dev/null
+unset PACTL_DEVICE_SINK PACTL_DEFAULT_SINK
 
 echo "== panel fields never use a native Qt text input =="
 # Every editable Qt text input reads another application's clipboard offer on
@@ -1679,7 +2120,7 @@ else
   check "the real graph measures as Model.js draws it" "0" "$rc"
 fi
 
-echo "== offscreen QML tests (key fields, response curve) =="
+echo "== offscreen QML tests (key fields, response curve, band row, panel) =="
 qmltestrunner=""
 [[ -x /usr/lib/qt6/bin/qmltestrunner ]] && qmltestrunner=/usr/lib/qt6/bin/qmltestrunner
 if [[ -n $qmltestrunner ]]; then

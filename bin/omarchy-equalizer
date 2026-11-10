@@ -54,6 +54,9 @@ running_layout_file="$state_root/running-layout"
 # A file of its own, not a state field: a command holding the state in memory
 # and writing it after the restart must not be able to drop the record.
 parked_file="$state_root/parked-streams"
+# The curve's undo and redo stacks (see history_note). A file of its own: the
+# state is rewritten by the follower too, and its passes must not be steps.
+history_file="$state_root/history.json"
 user_presets="$state_root/presets.json"
 builtin_presets="$plugin_dir/presets"
 
@@ -77,11 +80,14 @@ lsp_plugins="para_equalizer_x16_stereo mb_compressor_stereo limiter_stereo autog
 # The graph's shape, written into the fragment's header. A live write is only
 # possible into a graph of the same layout, so this is what decides between a
 # values write and a rebuild -- including the one rebuild an upgrade from a
-# fragment without this line needs.
-layout_version=3
+# fragment without this line needs. The version is part of the layout string,
+# so a graph built by an older version is rebuilt once (v4 added the device
+# relief after the limiter).
+layout_version=4
 # The state file's format. A state from before the field reads as version 2;
 # keys this version does not know are carried through every edit untouched.
-state_version=3
+# Version 4 added the balanced headroom, which a version-3 backend refuses.
+state_version=4
 
 # Graphic equalizer centre frequencies: the ISO octave series, one decimal
 # place so the graph file stays readable.
@@ -208,9 +214,10 @@ state_read() {
   if [[ -s $state_file ]]; then
     if jq -e . "$state_file" >/dev/null 2>&1; then
       state="$(cat "$state_file")"
-      # Persisted, so the note appears once rather than on every command.
+      # Persisted, so the note appears once rather than on every command. The
+      # cap is housekeeping, not an edit, so it is never an undo step.
       capped="$(cap_parametric_state "$state")"
-      [[ $capped == "$state" ]] || state_write "$capped"
+      [[ $capped == "$state" ]] || history_key="" state_write "$capped"
       printf '%s\n' "$capped"
       return
     fi
@@ -254,7 +261,9 @@ state_problem() {
     if type != "object" then "The state is not a JSON object."
     else
       [ check("Preamp"; .preamp // 0; $pmin; $pmax; ""),
-        oneof("Headroom"; .headroom; ["auto", "manual"]),
+        oneof("Headroom"; .headroom; ["auto", "balanced", "manual"]),
+        oneof("Device volume relief"; .followDeviceVolume; ["on", "off"]),
+        check("Device relief"; .deviceRelief // 0; 0; 60; ""),
         oneof("Limiter"; .limiter; ["on", "off"]),
         oneof("Boost"; .boost; ["off", "low", "medium", "high", "night", "voice"]),
         oneof("Leveler"; .leveler; ["off", "on"]),
@@ -311,8 +320,69 @@ need_valid_state() {
 state_write() {
   need_valid_state "${1:-}"
   state_dir_ensure
+  # A command that edits the curve names itself in history_key; its first write
+  # files the curve as it was before the command on the undo stack.
+  if [[ -n ${history_key:-} ]] && ((!history_noted)); then history_note "$1"; fi
   jq --argjson v "$state_version" '.version = (if ((.version // 0) | type) == "number" and (.version // 0) > $v then .version else $v end)' \
     >"$state_file.tmp.$$" <<<"$1" && mv "$state_file.tmp.$$" "$state_file"
+}
+
+# ---------------------------------------------------------------- history
+#
+# Undo and redo for the curve: two stacks of at most 30 snapshots in
+# history.json, each a curve as it was ({ mode, preset, graphic, parametric,
+# preamp, headroom }, jq_curve). A command that edits the curve names itself in
+# history_key (the dispatch at the end sets it); its first state write files the
+# curve on disk as one undo step and clears redo. A write that changes nothing
+# but the preset label (save-preset) is not a step. Two steps from one command
+# on one band within a second are one step, so a scripted burst of set-gain is
+# undone at once. A device-curve switch by the follower clears both stacks:
+# undoing across it would put one device's curve on another.
+history_key=""
+history_noted=0
+history_max=30
+
+history_read() {
+  if [[ -s $history_file ]] && jq -e 'type == "object"' "$history_file" >/dev/null 2>&1; then
+    cat "$history_file"
+  else
+    printf '{}\n'
+  fi
+}
+
+history_write() {
+  state_dir_ensure
+  printf '%s\n' "$1" >"$history_file.tmp.$$" && mv "$history_file.tmp.$$" "$history_file"
+}
+
+history_clear() { rm -f "$history_file"; }
+
+# Milliseconds since the epoch, whatever the locale's decimal mark.
+now_ms() { local us="${EPOCHREALTIME//[!0-9]/}"; printf '%s\n' "$((us / 1000))"; }
+
+history_note() { # the state about to be written
+  local next
+  history_noted=1
+  [[ -s $state_file ]] || return 0
+  next="$(jq -c -n --slurpfile old "$state_file" --argjson new "$1" --argjson h "$(history_read)" \
+    --arg key "$history_key" --argjson now "$(now_ms)" --argjson max "$history_max" '
+    def curve: '"$jq_curve"';
+    ($old[0] | curve) as $o | ($new | curve) as $n
+    | if ($o | del(.preset)) == ($n | del(.preset)) then empty
+      else
+        ($h.undo // []) as $u
+        # Only a burst of one command on one band merges (set-gain 3 ..., a
+        # drag sent through the queue); a preset, a mode or a live commit is
+        # always a step of its own.
+        | if ($key | test("^set-(gain|band):[0-9]+$|^set-gains$"))
+               and ($u | length) > 0 and $u[-1].key == $key and ($now - ($u[-1].at // 0)) < 1000
+               and (($h.redo // []) | length) == 0
+          then $h | .undo[-1].at = $now
+          else { undo: (($u + [{ key: $key, at: $now, curve: $o }]) | .[-$max:]), redo: [] }
+          end
+      end' 2>/dev/null)" || return 0
+  [[ -n $next ]] && history_write "$next"
+  return 0
 }
 
 # The bands the equalizer is currently processing.
@@ -368,6 +438,28 @@ curve_level_db() {
   stages_tsv "$1" | biquad_curve level "${2:-0}" "$(graph_rate)"
 }
 
+# The balanced headroom's preamp for a band set, and the programme gain it rests
+# on (Model.js balancedPreampFor and programGainDb).
+balanced_preamp_db() {
+  stages_tsv "$1" | biquad_curve balanced 0 "$(graph_rate)"
+}
+program_gain_db() {
+  stages_tsv "$1" | biquad_curve program 0 "$(graph_rate)"
+}
+
+# Balanced cuts by what a boost adds to programme material and leaves the rare
+# peak above that to the limiter, so it only plays as balanced while there is a
+# limiter: off, or without LSP, it plays as auto (the state keeps the choice).
+balanced_in_force() { # state
+  [[ $(jq -r '(.headroom // "auto") == "balanced" and (.limiter // "on") == "on"' <<<"$1") == true ]] && lsp_available
+}
+
+# The preamp a state's headroom policy asks for: the curve's peak cut (auto, and
+# balanced without a limiter) or the balanced cut.
+policy_preamp_db() { # state bands
+  if balanced_in_force "$1"; then balanced_preamp_db "$2"; else auto_preamp_db "$2"; fi
+}
+
 # One line per filter stage the graph runs: type, freq, gain, Q. Model.js
 # bandStages is the same expansion -- Butterworth stage Qs for a pass filter's
 # slope, scaled by the band's own Q -- and tests/run-tests.sh holds the two to
@@ -385,12 +477,10 @@ stages_tsv() {
     | @tsv' <<<"${1:-[]}"
 }
 
-# The response maths over stage lines on stdin. "peak" prints the automatic
-# preamp for the curve; "level" prints the curve's loudness against Flat with the
-# given preamp added.
-biquad_curve() {
-  local what="$1" pre="${2:-0}" rate="${3:-48000}"
-  LC_ALL=C awk -v fs="$rate" -v what="$what" -v pre="$pre" '
+# The biquad maths in awk: |H| in dB for one stage, and the A-weighting. One
+# copy, used by the headroom (biquad_curve) and by the live editor (cmd_live),
+# so the two can never compute a different curve. PI must be set before use.
+awk_biquad_lib='
       # |H(e^jw)| in dB for one biquad, from coefficients already divided by a0.
       function magnitude_db(type, fc, q, gain, f,
                             A, w0, alpha, k, k2, b0, b1, b2, a0, a1, a2,
@@ -463,6 +553,24 @@ biquad_curve() {
         return 20 * log(2 * ra) / log(10) + 2
       }
 
+      # A stage of a pass filter with a slope: its Butterworth Q, scaled by the
+      # Q of the band itself (Model.js bandStages, stages_tsv).
+      function stage_q(q, n, k) {
+        if (n <= 1) return q
+        if (q == 0) q = 0.7071067811865476
+        return (q / 0.7071067811865476) / (2 * cos((2 * k - 1) * 3.141592653589793 / (4 * n)))
+      }
+'
+
+# The response maths over stage lines on stdin. "peak" prints the automatic
+# preamp for the curve; "level" prints the curve's loudness against Flat with the
+# given preamp added; "program" prints the curve's pink-noise power gain, and
+# "balanced" the preamp the balanced headroom takes for it (Model.js
+# programGainDb and balancedPreampFor; BALANCED_MARGIN is the same number).
+balanced_margin=3.5
+biquad_curve() {
+  local what="$1" pre="${2:-0}" rate="${3:-48000}"
+  LC_ALL=C awk -v fs="$rate" -v what="$what" -v pre="$pre" -v margin="$balanced_margin" "$awk_biquad_lib"'
       # n starts at 0 explicitly: an uninitialized awk scalar has the string value
       # "", so types[n] would file the first band under an index the END loop can
       # never reach. -F\t because a type never contains a tab but jq @tsv
@@ -472,12 +580,13 @@ biquad_curve() {
       END {
         PI = atan2(0, -1)
         lo = 20; hi = 20000; steps = 400; max = -1e300
-        sum = 0; wn = 0; wd = 0
+        sum = 0; wn = 0; wd = 0; pw = 0
         for (i = 0; i <= steps; i++) {
           f = lo * (hi / lo) ^ (i / steps)
           total = (what == "level") ? pre + 0 : 0
           for (b = 0; b < n; b++) total += magnitude_db(types[b], freqs[b], qs[b], gains[b], f)
           if (total > max) max = total
+          pw += 10 ^ (total / 10)
           if (what == "level") {
             w = 10 ^ (a_weight_db(f) / 10)
             sum += total; wn += w * 10 ^ (total / 10); wd += w
@@ -487,6 +596,10 @@ biquad_curve() {
           printf "%.2f\n", (sum / (steps + 1) + 10 * log(wn / wd) / log(10)) / 2
           exit
         }
+        # The programme gain, rounded to 0.01 dB the way Model.js rounds it.
+        pg = 10 * log(pw / (steps + 1)) / log(10)
+        pg = (pg < 0 ? -int(-pg * 100 + 0.5) : int(pg * 100 + 0.5)) / 100
+        if (what == "program") { printf "%.2f\n", pg; exit }
         if (max <= 0.05) {
           result = 0
         } else {
@@ -495,6 +608,14 @@ biquad_curve() {
           result = -c / 2
           if (result < -24) result = -24
           if (result > 0) result = 0
+        }
+        if (what == "balanced") {
+          # -min(the safe cut, the programme gain plus the margin, rounded up
+          # to the 0.5 dB step): the smaller cut wins.
+          x = (pg > 0 ? pg : 0) + margin
+          x = int(x * 100 + 0.5)
+          c = int(x / 50); if (c * 50 < x) c++
+          if (-c / 2 > result) result = -c / 2
         }
         # Unity is the common case, so print it plainly rather than as "0.0".
         if (result == 0) printf "0\n"; else printf "%.1f\n", result
@@ -538,8 +659,8 @@ apply_headroom() {
   # the next enable -- not a curve for the device it played into last.
   state="$(jq -c 'del(.listen) | if .enabled == true then . else .curveEditedOff = true end' <<<"$state")"
   headroom="$(jq -r '.headroom // "auto"' <<<"$state")"
-  if [[ $headroom == auto ]]; then
-    state="$(jq -c --argjson p "$(auto_preamp_db "$(active_bands "$state")")" '.preamp = $p' <<<"$state")"
+  if [[ $headroom == auto || $headroom == balanced ]]; then
+    state="$(jq -c --argjson p "$(policy_preamp_db "$state" "$(active_bands "$state")")" '.preamp = $p' <<<"$state")"
   else
     ceiling="$(preamp_ceiling_db "$(active_bands "$state")")"
     preamp="$(jq -r '.preamp // 0' <<<"$state")"
@@ -597,7 +718,70 @@ relief_db() {
 
 with_relief() {
   local state="$1"
-  jq -c --argjson r "$(relief_db "$state")" '.relief = $r' <<<"$state"
+  state="$(jq -c --argjson r "$(relief_db "$state")" '.relief = $r' <<<"$state")"
+  jq -c --argjson d "$(device_relief_db "$state")" '.deviceRelief = $d' <<<"$state"
+}
+
+# ---------------------------------------------------------------- device relief
+#
+# Omarchy's volume keys move the device's volume, not the equalizer's, so the
+# relief above never applies with them. Where the device applies its volume in
+# software, the cut can be given back after the limiter instead: the limiter
+# holds the graph's output at -1 dBFS, the device relief lifts it by at most as
+# much as the device's volume then takes off, and the device converts it no
+# louder than the ceiling. It is zero unless all of this holds:
+#
+#   - the user switched it on (followDeviceVolume, off by default: turning it on
+#     changes what is heard below full device volume)
+#   - automatic or balanced headroom, the limiter on and LSP present
+#   - the device is not muted, its volume is not in hardware (no HW_VOLUME_CTRL,
+#     a Bluetooth headset's is), and its base volume is 100 %
+#
+#   device relief = min(cut - relief, -device volume), floored to 0.1 dB
+#
+# The follower answers a volume change on the device before it drains the event
+# burst, so the moment a volume step can pass full scale at the device is one
+# write long; nothing after the limiter catches that.
+
+# "muted hwvol basefull volume-dB" for a sink, from pactl list sinks.
+device_volume_info() { # sink
+  pactl list sinks 2>/dev/null | LC_ALL=C awk -v want="$1" '
+    /^Sink #/ { if (found) exit; name = "" }
+    /^[[:space:]]*Name: / { found = ($2 == want) }
+    !found { next }
+    /^[[:space:]]*Mute: / { muted = ($2 == "yes") ? 1 : 0 }
+    /^[[:space:]]*Flags: / { hw = (index($0, "HW_VOLUME_CTRL") > 0) ? 1 : 0 }
+    /^[[:space:]]*Base Volume: / { base = (index($0, " 100% ") > 0 || index($0, "/ 100%") > 0) ? 1 : 0 }
+    /^[[:space:]]*Volume: / {
+      best = ""; for (i = 2; i <= NF; i++) if ($i == "dB" || $i == "dB,") {
+        v = $(i - 1); if (v == "-inf") v = -200
+        if (best == "" || v + 0 > best + 0) best = v + 0 }
+      vol = best
+    }
+    END { if (found || vol != "") printf "%d %d %d %s\n", muted, hw, base, (vol == "" ? 0 : vol) }'
+}
+
+# The device relief for a state, from its target's volume right now.
+device_relief_db() { # state
+  local state="$1" target info muted hw base vol
+  [[ $(jq -r '.followDeviceVolume // "off"' <<<"$state") == on ]] || { printf '0\n'; return; }
+  [[ $(jq -r '(.headroom // "auto") != "manual" and (.limiter // "on") == "on"' <<<"$state") == true ]] && lsp_available ||
+    { printf '0\n'; return; }
+  target="$(jq -r '.targetSink // ""' <<<"$state")"
+  [[ -n $target ]] || { printf '0\n'; return; }
+  info="$(device_volume_info "$target")"
+  read -r muted hw base vol <<<"$info"
+  [[ -n $info && $muted == 0 && $hw == 0 && $base == 1 ]] || { printf '0\n'; return; }
+  device_relief_for "$(jq -r '.preamp // 0' <<<"$state")" "$(jq -r '.relief // 0' <<<"$state")" "$vol"
+}
+
+# min(cut - relief, -volume), floored to 0.1 dB and never negative.
+device_relief_for() { # preamp relief volume-dB
+  LC_ALL=C awk -v p="$1" -v r="$2" -v v="$3" 'BEGIN {
+    cut = (p < 0) ? -p : 0; room = cut - r; if (room < 0) room = 0
+    give = -v; if (give < 0) give = 0
+    d = (room < give) ? room : give
+    print int(d * 10 + 1e-9) / 10 }'
 }
 
 # ---------------------------------------------------------------- presets
@@ -656,6 +840,8 @@ preset_list_json() {
 #   relief_l/_r     the headroom the volume gives back (see volume relief)
 #   vol_l/vol_r     the sink volume, driven by capture.volumes
 #   limit           the brickwall limiter           } LSP only, stereo-linked
+#   drelief_l/_r    the headroom the device's volume gives back (device relief),
+#                   after everything that could clip; unity unless it is on
 #
 # The volume sits after the dynamics and before the limiter: the leveler and the
 # compressor always see the program at its own level (a leveler in front of the
@@ -848,27 +1034,29 @@ using_para_pool() { lsp_available; }
 # values, so moving between them is a live write.
 desired_layout() {
   if using_para_pool; then
-    printf 'pool\n'
+    printf 'v%s pool\n' "$layout_version"
   else
-    printf 'biquad:%s\n' "$(stages_tsv "$(listen_bands "$1")" | cut -f1 |
+    printf 'v%s biquad:%s\n' "$layout_version" "$(stages_tsv "$(listen_bands "$1")" | cut -f1 |
       while IFS= read -r t; do filter_label "$t"; printf ','; done)"
   fi
 }
 
 # The layout the running graph was built with, read from the fragment it was
 # loaded from. A fragment from before the layout line (or none at all) matches
-# nothing, which is what makes the first command after an upgrade rebuild once.
+# nothing, and neither does one an older version recorded (its layout carries
+# no version, or another one): that is what makes the first command after an
+# upgrade rebuild once.
 running_layout() {
   if [[ -f $running_layout_file ]]; then
     head -n1 "$running_layout_file"
   elif [[ -f $fragment ]]; then
-    sed -n "s/^# Layout: v$layout_version //p" "$fragment" | head -n1
+    sed -n 's/^# Layout: //p' "$fragment" | head -n1
   fi
 }
 
 # Whether the running graph is the pool. Live writes address para:* controls only
 # then; anything else addresses the biquads.
-running_pool() { [[ $(running_layout) == pool ]]; }
+running_pool() { [[ $(running_layout) == "v$layout_version pool" ]]; }
 
 # Whether a state's bands can be written into the running graph as values.
 layout_live() { [[ $(desired_layout "$1") == "$(running_layout)" ]]; }
@@ -924,6 +1112,7 @@ biquad_stage_lines() {
 # The preamp, one value on both channels.
 preamp_params() { local m; m="$(db_to_mult "${1:-0}")"; printf '"pre_l:Mult" %s "pre_r:Mult" %s' "$m" "$m"; }
 relief_params() { local m; m="$(db_to_mult "${1:-0}")"; printf '"relief_l:Mult" %s "relief_r:Mult" %s' "$m" "$m"; }
+drelief_params() { local m; m="$(db_to_mult "${1:-0}")"; printf '"drelief_l:Mult" %s "drelief_r:Mult" %s' "$m" "$m"; }
 
 # The live param list for the bands: the preamp first (a gain or type edit
 # changes the automatic headroom), then the relief that goes with it, then every
@@ -931,12 +1120,12 @@ relief_params() { local m; m="$(db_to_mult "${1:-0}")"; printf '"relief_l:Mult" 
 # for the same reason as the fragment writer: its die only ends this command
 # substitution, so the caller must carry the failure out.
 build_band_params() {
-  local bands="$1" preamp="${2:-0}" relief="${3:-0}" params k=0
+  local bands="$1" preamp="${2:-0}" relief="${3:-0}" drelief="${4:-0}" params k=0
   need_numeric_bands "$bands"
   # The preamp and the slot set share one line: a newline between them would
   # split the parameter list into two arguments, so one pw-cli call would look
   # like two to anything counting invocations.
-  params="$(preamp_params "$preamp") $(relief_params "$relief")"
+  params="$(preamp_params "$preamp") $(relief_params "$relief") $(drelief_params "$drelief")"
   if running_pool; then
     params+=" $(para_values "$bands" | stage_params para)"
   else
@@ -980,16 +1169,17 @@ write_fragment() {
   state_dir_ensure
   mkdir -p "$fragment_dir"
 
-  local channels balance preamp relief cur_l cur_r
+  local channels balance preamp relief drelief cur_l cur_r
   channels="$(jq -r '.channels // "stereo"' <<<"$state")"
   balance="$(jq -r '.balance // 0' <<<"$state")"
   preamp="$(listen_preamp "$state")"
   relief="$(jq -r '.relief // 0' <<<"$state")"
+  drelief="$(jq -r '.deviceRelief // 0' <<<"$state")"
 
   {
     printf '# Generated by omarchy-equalizer -- do not edit by hand.\n'
     printf '# Mode: %s, %s band(s).\n' "$mode" "$count"
-    printf '# Layout: v%s %s\n\n' "$layout_version" "$layout"
+    printf '# Layout: %s\n\n' "$layout"
     printf 'context.modules = [\n  { name = libpipewire-module-filter-chain\n    args = {\n'
     printf '      node.description = "Equalizer"\n'
     printf '      media.name       = "Equalizer"\n\n'
@@ -1046,6 +1236,10 @@ write_fragment() {
       printf '          { type = lv2 name = limit plugin = "%s" control = { %s } }\n' \
         "$lsp_limiter_uri" "$(limiter_values "$(jq -r '.limiter // "on"' <<<"$state")" | stage_controls)"
     fi
+    for ch in l r; do
+      printf '          { type = builtin name = drelief_%s label = linear control = { "Mult" = %s "Add" = 0 } }\n' \
+        "$ch" "$(db_to_mult "$drelief")"
+    done
 
     printf '        ]\n'
     printf '        links = [\n'
@@ -1079,6 +1273,9 @@ write_fragment() {
       printf '          { output = "%s" input = "limit:in_r" }\n' "$cur_r"
       cur_l="limit:out_l" cur_r="limit:out_r"
     fi
+    printf '          { output = "%s" input = "drelief_l:In" }\n' "$cur_l"
+    printf '          { output = "%s" input = "drelief_r:In" }\n' "$cur_r"
+    cur_l="drelief_l:Out" cur_r="drelief_r:Out"
     printf '        ]\n'
     printf '        inputs  = [ "pre_l:In" "pre_r:In" ]\n'
     printf '        outputs = [ "%s" "%s" ]\n' "$cur_l" "$cur_r"
@@ -1161,26 +1358,179 @@ live_send_params() {
   local params="$1" id="${2:-}"
   [[ -n $id ]] || id="$(find_node_id)"
   [[ -n $id ]] || return 1
+  # A write of the flat gains supersedes a walk of them still in progress; a
+  # write of only some of them finishes the walk's others, at its targets.
+  params="$(gain_walk_settle "$params")"
   # pw-cli needs the params as a spa pod struct; one call keeps every band
   # consistent with the same audio quantum.
   pw-cli set-param "$id" Props "{ params = [ $params ] }" >/dev/null 2>&1
 }
 
+# ---------------------------------------------------------------- gain walks
+#
+# The preamp, the relief and the device relief are flat gains, and a flat gain
+# stepped at once clicks. Measured on tests/dsp-check.sh's rig under a 50 Hz
+# tone, the largest sample step against the tone's own: 13 dB for a 0.5 dB
+# step, 7.9 dB for 0.25 dB, 2.6 dB for 0.1 dB (the bands, being filters, did not
+# click at 0.5 dB steps). So while the limiter is on -- it holds the output
+# while a cut is still on its way down -- a change of them is walked in steps
+# of at most 0.1 dB, one per 20 ms, in the background, and without it whenever
+# the cut gets smaller (less cut cannot clip on the way). A deeper cut without a
+# limiter is written at once, because nothing else would catch the clip.
+#
+# A walk keeps one line in gain_walk_file: its token, its targets and where it
+# is now (dB), and reads the token before every step. Every other write of the
+# flat gains takes the walk over (gain_walk_settle): a write of all three stops
+# it; a write of only some stops it and writes the walk's targets for the
+# others in the same call, so nothing is left halfway. A new walk starts from
+# where a running one has got to. A walk that finishes empties the file, so
+# an empty file means no walk is running.
+gain_walk_file="$state_root/gain-walk"
+gain_walk_step=0.1
+gain_walk_interval=0.02
+
+gain_walk_claim() {
+  state_dir_ensure
+  if [[ -n ${1:-} ]]; then printf '%s\n' "$1" >"$gain_walk_file" 2>/dev/null; else : >"$gain_walk_file" 2>/dev/null; fi
+}
+
+# Rewrite the walk's line only while it is still the walk's own: the check and
+# the write under one lock, so a writer that takes the walk over in between
+# cannot be overwritten.
+gain_walk_update() { # token line
+  ( flock -x 7; read -r mine _ <"$gain_walk_file" 2>/dev/null; [[ $mine == "$1" ]] && gain_walk_claim "$2" ) \
+    7>"$gain_walk_file.lock" 2>/dev/null
+}
+
+# "token p1 r1 d1 p r d" of the walk running now, or nothing.
+gain_walk_running() {
+  local line=""
+  [[ -s $gain_walk_file ]] && read -r line <"$gain_walk_file" 2>/dev/null
+  [[ $line == w* ]] && printf '%s\n' "$line"
+}
+
+# Where the flat gains are now: the running walk's position, or the given ones.
+gain_walk_position() { # pre rel drel
+  local token p1 r1 d1 p r d
+  read -r token p1 r1 d1 p r d < <(gain_walk_running)
+  if [[ -n ${token:-} && -n ${d:-} ]]; then printf '%s %s %s\n' "$p" "$r" "$d"; else printf '%s %s %s\n' "$1" "$2" "$3"; fi
+}
+
+# A param list about to be written, completed for a walk it takes over.
+gain_walk_settle() { # params
+  local params="$1" token p1 r1 d1 p r d
+  [[ $params == *'"pre_l:Mult"'* || $params == *'"relief_l:Mult"'* || $params == *'"drelief_l:Mult"'* ]] ||
+    { printf '%s\n' "$params"; return; }
+  exec 7>"$gain_walk_file.lock"
+  flock -x 7
+  read -r token p1 r1 d1 p r d < <(gain_walk_running)
+  [[ -n ${token:-} ]] && gain_walk_claim
+  flock -u 7
+  exec 7>&-
+  if [[ -n ${token:-} ]]; then
+    [[ $params == *'"pre_l:Mult"'* ]] || params+=" $(preamp_params "$p1")"
+    [[ $params == *'"relief_l:Mult"'* ]] || params+=" $(relief_params "$r1")"
+    [[ $params == *'"drelief_l:Mult"'* ]] || params+=" $(drelief_params "$d1")"
+  fi
+  printf '%s\n' "$params"
+}
+
+# The steps from one set of the three gains to another: "p r d|params" a line.
+gain_walk_steps() { # pre0 pre1 rel0 rel1 drel0 drel1 [steps]
+  LC_ALL=C awk -v a="$1" -v b="$2" -v c="$3" -v d="$4" -v e="$5" -v f="$6" -v step="$gain_walk_step" -v fixed="${7:-0}" 'BEGIN {
+    m = b - a; if (m < 0) m = -m
+    t = d - c; if (t < 0) t = -t; if (t > m) m = t
+    t = f - e; if (t < 0) t = -t; if (t > m) m = t
+    n = int(m / step + 0.999999); if (n < 1) n = 1
+    if (fixed > 0) n = fixed
+    for (k = 1; k <= n; k++) {
+      p = a + (b - a) * k / n; r = c + (d - c) * k / n; q = e + (f - e) * k / n
+      if (k == n) { p = b; r = d; q = f }
+      printf "%.4f %.4f %.4f|\"pre_l:Mult\" %.6f \"pre_r:Mult\" %.6f \"relief_l:Mult\" %.6f \"relief_r:Mult\" %.6f \"drelief_l:Mult\" %.6f \"drelief_r:Mult\" %.6f\n",
+        p, r, q, 10 ^ (p / 20), 10 ^ (p / 20), 10 ^ (r / 20), 10 ^ (r / 20), 10 ^ (q / 20), 10 ^ (q / 20)
+    }
+  }'
+}
+
+# Walk node $1's gains, in this process. OMARCHY_EQ_NO_RAMP=1 makes it the one
+# final write.
+gain_walk() { # node pre0 pre1 rel0 rel1 drel0 drel1
+  local node="$1" token="w$BASHPID.$RANDOM" line here mine first=1 p0 r0 d0
+  shift
+  read -r p0 r0 d0 < <(gain_walk_position "$1" "$3" "$5")
+  [[ "$p0|$r0|$d0" == "$2|$4|$6" ]] && return 0
+  gain_walk_claim "$token $2 $4 $6 $p0 $r0 $d0"
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    ((first)) || sleep "$gain_walk_interval"
+    first=0
+    here="${line%%|*}"
+    # The check, the write and the position under the walk lock: a writer that
+    # takes the walk over either lands after this step or stops it before.
+    exec 7>"$gain_walk_file.lock"
+    flock -x 7
+    read -r mine _ <"$gain_walk_file" 2>/dev/null
+    if [[ $mine != "$token" ]]; then flock -u 7; exec 7>&-; return 0; fi
+    pw-cli set-param "$node" Props "{ params = [ ${line#*|} ] }" >/dev/null 2>&1 || { flock -u 7; exec 7>&-; return 1; }
+    gain_walk_claim "$token $2 $4 $6 $here"
+    flock -u 7
+    exec 7>&-
+  done < <(gain_walk_steps "$p0" "$2" "$r0" "$4" "$d0" "$6" "$( ((${OMARCHY_EQ_NO_RAMP:-0} == 1)) && echo 1 || echo 0)")
+  gain_walk_update "$token" ""
+  return 0
+}
+
+# Whether a change of the flat gains may be walked: always while the limiter
+# holds the output, and without it only a change that adds gain back (less cut
+# cannot clip on the way). A deeper cut without a limiter is written at once.
+gains_may_walk() { # state pre0 pre1 rel0 rel1 drel0 drel1
+  gains_walked "$1" && return 0
+  LC_ALL=C awk -v a="$2" -v b="$3" -v c="$4" -v d="$5" -v e="$6" -v f="$7" 'BEGIN { exit !(b + d + f >= a + c + e && b >= a) }'
+}
+
+# The same walk, detached: the command that starts it returns at once, and the
+# walk holds neither the state lock nor anybody's output pipe.
+gain_walk_detached() { # node pre0 pre1 rel0 rel1 drel0 drel1
+  if ((${OMARCHY_EQ_NO_RAMP:-0} == 1)); then gain_walk "$@"; return; fi
+  ( exec 9>&- </dev/null >/dev/null 2>&1; gain_walk "$@" ) &
+  disown 2>/dev/null || true
+}
+
+# Whether a state's flat gains are walked (the limiter is there to hold the
+# output meanwhile) or written at once.
+gains_walked() { [[ $(jq -r '.limiter // "on"' <<<"$1") == on ]] && lsp_available; }
+
 # The bands, preamp and relief the graph should be playing right now: the state's
 # own, or the A/B and solo overrides (see listen_bands).
-live_apply_bands() {
+live_apply_bands() { # state [pre rel drel: the flat gains to hold instead]
   local state="$1" params
   # build_band_params refuses a non-numeric band from inside a command
   # substitution, so its die only ends that subshell: carry the failure out here
   # rather than send an empty parameter list.
-  params="$(build_band_params "$(listen_bands "$state")" "$(listen_preamp "$state")" "$(jq -r '.relief // 0' <<<"$state")")" || exit 1
+  params="$(build_band_params "$(listen_bands "$state")" "${2:-$(listen_preamp "$state")}" \
+    "${3:-$(jq -r '.relief // 0' <<<"$state")}" "${4:-$(jq -r '.deviceRelief // 0' <<<"$state")}")" || exit 1
   live_send_params "$params"
+}
+
+# The flat gains a fragment on disk holds, in dB: what the graph was given last
+# (every write of them rewrites the fragment).
+fragment_gains() {
+  [[ -f $fragment ]] || { printf '0 0 0\n'; return; }
+  LC_ALL=C awk '
+    function db(v) { return (v > 0) ? 20 * log(v) / log(10) : 0 }
+    /name = pre_l label = linear/ { if (match($0, /"Mult" = [0-9.eE+-]+/)) p = substr($0, RSTART + 9, RLENGTH - 9) }
+    /name = relief_l label = linear/ { if (match($0, /"Mult" = [0-9.eE+-]+/)) r = substr($0, RSTART + 9, RLENGTH - 9) }
+    /name = drelief_l label = linear/ { if (match($0, /"Mult" = [0-9.eE+-]+/)) d = substr($0, RSTART + 9, RLENGTH - 9) }
+    END { printf "%.4f %.4f %.4f\n", db(p == "" ? 1 : p), db(r == "" ? 1 : r), db(d == "" ? 1 : d) }' "$fragment"
 }
 
 # Write the active band set to whatever the running graph holds. The fragment is
 # kept in step, because it carries the band values; a live write that cannot
 # find the node, or a graph of another layout, rebuilds instead, so a sink torn
 # down under us still comes back correct.
+# The A/B and solo are comparisons: they switch at once (walk_flat_gains=0),
+# not over a walk that would blur what is compared.
+walk_flat_gains=1
 live_apply_active() {
   local state="$2"
   if ! layout_live "$state"; then
@@ -1190,7 +1540,23 @@ live_apply_active() {
     service_restart >/dev/null 2>&1
     return
   fi
+  # The flat gains as the graph has them, before the fragment is rewritten: a
+  # running walk's position, or what the fragment gave it last. The bands go
+  # under those, and the gains walk to the new ones where that is safe.
+  local p0 r0 d0 p1 r1 d1
+  read -r p0 r0 d0 < <(gain_walk_position $(fragment_gains))
   sync_fragment "$state"
+  p1="$(listen_preamp "$state")"; r1="$(jq -r '.relief // 0' <<<"$state")"; d1="$(jq -r '.deviceRelief // 0' <<<"$state")"
+  if ((${OMARCHY_EQ_NO_RAMP:-0} != 1 && walk_flat_gains)) && gains_may_walk "$state" "$p0" "$p1" "$r0" "$r1" "$d0" "$d1" &&
+     [[ $(LC_ALL=C awk -v a="$p0" -v b="$p1" -v c="$r0" -v d="$r1" -v e="$d0" -v f="$d1" 'BEGIN {
+          m = b - a; if (m < 0) m = -m; t = d - c; if (t < 0) t = -t; if (t > m) m = t
+          t = f - e; if (t < 0) t = -t; if (t > m) m = t; print (m > 0.0001) ? 1 : 0 }') == 1 ]]; then
+    live_apply_bands "$state" "$p0" "$r0" "$d0" || { service_restart >/dev/null 2>&1; return; }
+    local id
+    id="$(find_node_id)"
+    [[ -n $id ]] && gain_walk_detached "$id" "$p0" "$p1" "$r0" "$r1" "$d0" "$d1"
+    return 0
+  fi
   live_apply_bands "$state" || service_restart >/dev/null 2>&1
 }
 
@@ -1215,27 +1581,27 @@ interpolate_bands() {
 # target write (the tests use it to avoid the sleeps where they do not assert on
 # the fade itself).
 live_ramp_bands() {
-  local from_bands="$1" to_bands="$2" from_preamp="$3" to_preamp="$4" relief="${5:-0}" id k t step_bands step_preamp params
+  local from_bands="$1" to_bands="$2" from_preamp="$3" to_preamp="$4" relief="${5:-0}" drelief="${6:-0}" steps="${7:-8}" id k t step_bands step_preamp params
   id="$(find_node_id)"
   [[ -n $id ]] || return 1
-  if [[ ${OMARCHY_EQ_NO_RAMP:-} == 1 ]]; then
-    params="$(build_band_params "$to_bands" "$to_preamp" "$relief")" || exit 1
+  if [[ ${OMARCHY_EQ_NO_RAMP:-} == 1 ]] || ((steps <= 1)); then
+    params="$(build_band_params "$to_bands" "$to_preamp" "$relief" "$drelief")" || exit 1
     live_send_params "$params" "$id"
     return
   fi
-  for ((k = 1; k <= 8; k++)); do
-    if ((k == 8)); then
+  for ((k = 1; k <= steps; k++)); do
+    if ((k == steps)); then
       step_bands="$to_bands"
       step_preamp="$to_preamp"
     else
-      t="$(LC_ALL=C awk -v k="$k" 'BEGIN { printf "%.6f", k / 8 }')"
+      t="$(LC_ALL=C awk -v k="$k" -v n="$steps" 'BEGIN { printf "%.6f", k / n }')"
       step_bands="$(interpolate_bands "$from_bands" "$to_bands" "$t")"
       step_preamp="$(LC_ALL=C awk -v a="$from_preamp" -v b="$to_preamp" -v t="$t" \
         'BEGIN { printf "%.6f", a + (b - a) * t }')"
     fi
-    params="$(build_band_params "$step_bands" "$step_preamp" "$relief")" || exit 1
+    params="$(build_band_params "$step_bands" "$step_preamp" "$relief" "$drelief")" || exit 1
     live_send_params "$params" "$id"
-    if ((k < 8)); then sleep 0.02; fi
+    if ((k < steps)); then sleep 0.02; fi
   done
 }
 
@@ -1471,7 +1837,7 @@ EOF
 # layout is only ever written together with a restart (place_graph).
 note_running_layout() {
   state_dir_ensure
-  sed -n "s/^# Layout: v$layout_version //p" "$fragment" 2>/dev/null | head -n1 >"$running_layout_file"
+  sed -n 's/^# Layout: //p' "$fragment" 2>/dev/null | head -n1 >"$running_layout_file"
 }
 
 service_start() {
@@ -1880,6 +2246,7 @@ device_memory_pass() {
   fi
   state="$(apply_headroom "$state")" || return 1
   state_write "$state"
+  history_clear
   name="$(jq -r '.preset // "Custom"' <<<"$state")"
   echo "omarchy-equalizer: $target has its own curve; playing '$name'" >&2
   live_apply_active "" "$state"
@@ -1890,14 +2257,77 @@ device_memory_pass() {
 # when the relief actually moved. The fragment follows too: a restart has to
 # come up with no more gain than the volume allows right now.
 refresh_relief() {
-  local state relief
+  local state relief drelief
+  # The device's volume is read and its relief written under the device-relief
+  # lock, which the listener takes too: whichever writes last read last.
+  exec 6>"$state_root/drelief.lock"
+  flock -x 6
   state="$(state_read)"
   relief="$(relief_db "$state")"
-  [[ $(jq -n --argjson a "$relief" --argjson b "$(jq -r '.relief // 0' <<<"$state")" '(($a - $b) | fabs) < 0.05') == true ]] && return 0
-  state="$(jq -c --argjson r "$relief" '.relief = $r' <<<"$state")"
-  state_write "$state"
-  sync_fragment "$state"
-  ((graph_rebuilt)) || live_send_params "$(relief_params "$relief")" || true
+  drelief="$(device_relief_db "$(jq -c --argjson r "$relief" '.relief = $r' <<<"$state")")"
+  if [[ $(jq -n --argjson a "$relief" --argjson b "$(jq -r '.relief // 0' <<<"$state")" \
+        --argjson c "$drelief" --argjson d "$(jq -r '.deviceRelief // 0' <<<"$state")" \
+        '(($a - $b) | fabs) < 0.05 and (($c - $d) | fabs) < 0.05') != true ]]; then
+    state="$(jq -c --argjson r "$relief" --argjson d "$drelief" '.relief = $r | .deviceRelief = $d' <<<"$state")"
+    state_write "$state"
+    sync_fragment "$state"
+    ((graph_rebuilt)) || live_send_params "$(relief_params "$relief") $(drelief_params "$drelief")" || true
+  fi
+  flock -u 6
+  exec 6>&-
+}
+
+# The fast path for a volume change on the device the equalizer plays into: one
+# state read, one pactl, one write into the graph -- the device relief must come
+# down as fast as the volume goes up. It runs in the follower's own listener,
+# so a retarget pass in progress never holds it up, and it writes the graph
+# without the state lock (the device-relief lock orders it against the pass's
+# own relief write); the state follows, under the lock, when the relief moved
+# by 0.05 dB or more.
+refresh_device_relief() {
+  local fields follow headroom limiter preamp relief drelief target enabled info muted hw base vol next
+  exec 6>"$state_root/drelief.lock"
+  flock -x 6
+  fields="$(jq -r '[.followDeviceVolume // "off", .headroom // "auto", .limiter // "on", .preamp // 0,
+    .relief // 0, .deviceRelief // 0, .targetSink // "", .enabled // false] | @tsv' "$state_file" 2>/dev/null)" ||
+    { flock -u 6; exec 6>&-; return 0; }
+  IFS=$'\t' read -r follow headroom limiter preamp relief drelief target enabled <<<"$fields"
+  next="$drelief"
+  if [[ $enabled == true && -n $target ]]; then
+    next=0
+    if [[ $follow == on && $headroom != manual && $limiter == on ]] && lsp_available; then
+      info="$(device_volume_info "$target")"
+      read -r muted hw base vol <<<"$info"
+      if [[ -n $info && $muted == 0 && $hw == 0 && $base == 1 ]]; then
+        next="$(device_relief_for "$preamp" "$relief" "$vol")"
+      fi
+    fi
+    [[ $next == "$drelief" ]] || live_send_params "$(drelief_params "$next")" || true
+  fi
+  flock -u 6
+  exec 6>&-
+  if [[ $next != "$drelief" && $(LC_ALL=C awk -v a="$next" -v b="$drelief" 'BEGIN { d = a - b; print (d < 0 ? -d : d) >= 0.05 }') == 1 ]]; then
+    local state
+    take_lock
+    state="$(state_read)"
+    state="$(jq -c --argjson d "$next" '.deviceRelief = $d' <<<"$state")"
+    state_write "$state"
+    sync_fragment "$state"
+    flock -u 9
+  fi
+  return 0
+}
+
+# The follower's second listener: volume changes on the device it plays into,
+# answered at once (refresh_device_relief) whatever the main loop is doing.
+device_relief_listener() {
+  local line index
+  pactl subscribe 2>/dev/null | while IFS= read -r line; do
+    [[ $line == *"'change' on sink #"* ]] || continue
+    index="$(sink_index "$(jq -r '.targetSink // ""' "$state_file" 2>/dev/null)")"
+    [[ -n $index && $line == *"'change' on sink #$index" ]] || continue
+    refresh_device_relief
+  done
 }
 
 # Long-running watcher (omarchy-equalizer-follow.service): retarget when the
@@ -1924,6 +2354,11 @@ cmd_follow() {
     cmd_retarget
     flock -u 9
   }
+  # The device relief's own listener: a volume step on the device is answered
+  # at once, never behind a retarget pass. It ends with this process.
+  ( exec 9>&- >/dev/null; device_relief_listener ) &
+  local listener=$!
+  trap 'kill "$listener" 2>/dev/null; pkill -P "$listener" 2>/dev/null' EXIT
   follow_pass() {
     locked_retarget
     # A vanished target waits out its grace period; no event will announce the
@@ -1978,6 +2413,458 @@ cmd_set_gain() {
   if sink_present; then live_apply_active "" "$state"; fi
 }
 
+# ---------------------------------------------------------------- live edits
+#
+# The panel's drag path (docs/spec-v4.md §3.1). The panel keeps this running
+# while it is open and the equalizer is on, and streams what a drag produces on
+# stdin, one line per value:
+#
+#   gain <i> <dB>        band i's gain
+#   gains <g0> ...       every band's gain (the 10-band console's fit)
+#   freq <i> <Hz>        band i's frequency, on every slot it takes
+#   q <i> <Q>            band i's Q, per stage for a sloped pass filter
+#   preamp <dB>          the preamp, under the ceiling in force at the start
+#   balance <v>          the left/right balance
+#   commit               file what was streamed since the last commit
+#   cancel               put the graph back as the state has it
+#
+# It answers on stdout: "ready <mode>:<bands>:<slots>" once, "status <json>"
+# after a commit, "stale" when the state changed under an uncommitted edit (the
+# edit is dropped and the graph put back), "error <message>" for a refused line,
+# and "unavailable <reason>" (exit 3) when there is no graph to write to.
+#
+# Each batch of lines is one pw-cli write of only the controls it changed:
+# whatever else is already waiting on stdin is drained first, and only the last
+# value per control is written, so a slow write never builds a backlog. Between
+# commits nothing reads the state and no jq runs: the bands are held in shell
+# arrays, numbers are checked with integer arithmetic, and the maths is one awk
+# per write. While the limiter is on the preamp is held (the limiter covers the
+# difference) and settles at the commit; with the limiter off, or without LSP,
+# it follows every write, because nothing else would catch the clip.
+#
+# A commit takes the lock and files the edit the way set-band would -- headroom,
+# undo, fragment -- then ramps the preamp to its new value and prints the
+# status. End of input, or a TERM, without a commit is a cancel.
+
+live_term=0 live_pool=0 live_node="" live_mode="" live_count=0 live_sig="" live_summary=""
+live_preamp=0 live_relief=0 live_drelief=0 live_ceiling=0 live_headroom=auto live_limiter=on
+live_follow=0 live_channels=stereo live_balance=0 live_rate=48000 live_marker="" live_held=0
+declare -a live_type=() live_freq=() live_q=() live_gain=() live_en=() live_slot0=() live_nst=()
+declare -A live_dirty=() live_s_gain=() live_s_freq=() live_s_q=()
+live_s_preamp="" live_s_balance=""
+
+# The number times 10^6, as an integer, in REPLY: range checks without a process.
+# The caller has already matched the number against live_number_re.
+live_number_re='^-?[0-9]{1,6}([.][0-9]{1,9})?$'
+live_micro() {
+  local v="$1" sign=1 int frac=""
+  [[ $v == -* ]] && { sign=-1; v="${v#-}"; }
+  int="${v%%.*}"
+  [[ $v == *.* ]] && frac="${v#*.}"
+  frac="${frac}000000"
+  REPLY=$((sign * (10#$int * 1000000 + 10#${frac:0:6})))
+}
+live_in_range() { # value lo hi
+  local v lo hi
+  [[ $1 =~ $live_number_re ]] || return 1
+  live_micro "$1"; v=$REPLY
+  live_micro "$2"; lo=$REPLY
+  live_micro "$3"; hi=$REPLY
+  ((v >= lo && v <= hi))
+}
+live_index_ok() { [[ $1 =~ ^(0|[1-9][0-9]{0,2})$ ]] && (($1 < live_count)); }
+
+# What makes an uncommitted edit stale: the mode and both band sets. A relief
+# or a stage toggle changes neither, so it never drops an edit.
+live_signature() { jq -c '[(.mode // "graphic"), (.graphic // []), (.parametric // [])]' <<<"$1"; }
+
+live_has_edits() {
+  ((${#live_s_gain[@]} + ${#live_s_freq[@]} + ${#live_s_q[@]})) || [[ -n $live_s_preamp || -n $live_s_balance ]]
+}
+
+live_reset_session() {
+  live_s_gain=() live_s_freq=() live_s_q=() live_dirty=()
+  live_s_preamp="" live_s_balance=""
+}
+
+# The scalars a state holds for the live path: the preamp in force, the
+# reliefs, and what decides whether the preamp follows the bands.
+live_load_scalars() { # state
+  local fields
+  fields="$(jq -r '[(.preamp // 0), (.relief // 0), (.deviceRelief // 0), (.headroom // "auto"),
+    (.limiter // "on"), (.channels // "stereo"), (.balance // 0)] | @tsv' <<<"$1")"
+  IFS=$'\t' read -r live_preamp live_relief live_drelief live_headroom live_limiter live_channels live_balance <<<"$fields"
+  live_held="$live_preamp"
+  if [[ $live_limiter == on ]] && lsp_available; then live_follow=0; else live_follow=1; fi
+}
+
+# Read the state into the arrays. The mark comes first, so any write after it
+# is newer than the mark and is seen by live_check_state.
+live_load() {
+  local state bands rows tag type freq q gain en nst slot=0 i=0
+  live_reason=""
+  state_dir_ensure
+  : >"$live_marker"
+  state="$(state_read)"
+  [[ $(jq -r '.enabled // false' <<<"$state") == true ]] || { live_reason="the equalizer is off"; return 1; }
+  sink_present || { live_reason="the equalizer sink is not there"; return 1; }
+  [[ $(jq -r '.listen == null' <<<"$state") == true ]] || { live_reason="an A/B or a solo is playing"; return 1; }
+  layout_live "$state" || { live_reason="the graph is not the one the state needs yet"; return 1; }
+  live_node="$(find_node_id)"
+  [[ -n $live_node ]] || { live_reason="the equalizer node is not there"; return 1; }
+  if running_pool; then live_pool=1; else live_pool=0; fi
+  live_mode="$(jq -r '.mode // "graphic"' <<<"$state")"
+  bands="$(active_bands "$state")"
+  live_sig="$(live_signature "$state")"
+  live_load_scalars "$state"
+  live_ceiling="$(preamp_ceiling_db "$bands")"
+  live_rate="$(graph_rate)"
+  rows="$(jq -r "$jq_slots"'.[] | [(.type // "peaking"), (.freq // 1000), (.q // 1.0), (.gain // 0),
+    (if .enabled == false then 0 else 1 end), slots] | @tsv' <<<"$bands")"
+  live_type=() live_freq=() live_q=() live_gain=() live_en=() live_slot0=() live_nst=()
+  while IFS=$'\t' read -r type freq q gain en nst; do
+    [[ -n $type ]] || continue
+    live_type[i]="$type" live_freq[i]="$freq" live_q[i]="$q" live_gain[i]="$gain" live_en[i]="$en" live_nst[i]="$nst"
+    # Slots are handed out to the bands that play, in order (stages_tsv), so a
+    # bypassed band has none.
+    if ((en)); then live_slot0[i]=$slot; slot=$((slot + nst)); else live_slot0[i]=-1; fi
+    i=$((i + 1))
+  done <<<"$rows"
+  live_count=$i
+  live_summary="$live_mode:$live_count:$slot"
+  return 0
+}
+
+# A state written since the last load: a relief or a stage toggle only refreshes
+# the scalars; anything that changed the bands drops an uncommitted edit.
+live_check_state() {
+  local state
+  [[ $state_file -nt $live_marker ]] || return 0
+  : >"$live_marker"
+  state="$(state_read)"
+  if [[ $(live_signature "$state") == "$live_sig" && $(jq -r '.listen == null' <<<"$state") == true ]]; then
+    # The graph holds what the session wrote: keep that preamp (streamed, or
+    # followed) and balance rather than the state's.
+    local keep_pre="$live_preamp" keep_bal="$live_balance"
+    live_load_scalars "$state"
+    live_has_edits && live_preamp="$keep_pre"
+    [[ -n $live_s_balance ]] && live_balance="$keep_bal"
+    return 0
+  fi
+  if live_has_edits; then
+    printf 'stale\n'
+    live_restore "$state"
+  fi
+  live_reset_session
+  live_load || { printf 'unavailable %s\n' "$live_reason"; exit 3; }
+}
+
+# Put the graph back as a state has it.
+live_restore() { # state
+  live_apply_bands "$1" >/dev/null 2>&1 || true
+  [[ -n $live_s_balance ]] && { live_send_params "$(mixer_params "$1")" >/dev/null 2>&1 || true; }
+  return 0
+}
+
+# One line of edits, into the arrays and the dirty set. A refused line is
+# reported and changes nothing.
+live_edit() {
+  local kind="$1" i="${2:-}" v="${3:-}" k
+  case "$kind" in
+    gain)
+      live_index_ok "$i" && live_in_range "$v" "$band_gain_min" "$band_gain_max" ||
+        { printf 'error gain takes a band and a gain in %s..%s dB\n' "$band_gain_min" "$band_gain_max"; return; }
+      live_gain[i]="$v"; live_s_gain[$i]="$v"; live_dirty["g:$i"]=1 ;;
+    gains)
+      shift
+      if (($# != live_count)); then printf 'error gains takes %s gains, not %s\n' "$live_count" "$#"; return; fi
+      for v in "$@"; do
+        live_in_range "$v" "$band_gain_min" "$band_gain_max" ||
+          { printf 'error a gain is outside %s..%s dB\n' "$band_gain_min" "$band_gain_max"; return; }
+      done
+      k=0
+      for v in "$@"; do
+        live_gain[k]="$v"; live_s_gain[$k]="$v"; live_dirty["g:$k"]=1
+        k=$((k + 1))
+      done ;;
+    freq)
+      live_index_ok "$i" && live_in_range "$v" "$band_freq_min" "$band_freq_max" ||
+        { printf 'error freq takes a band and a frequency in %s..%s Hz\n' "$band_freq_min" "$band_freq_max"; return; }
+      live_freq[i]="$v"; live_s_freq[$i]="$v"; live_dirty["f:$i"]=1 ;;
+    q)
+      live_index_ok "$i" && live_in_range "$v" "$band_q_min" "$band_q_max" ||
+        { printf 'error q takes a band and a Q in %s..%s\n' "$band_q_min" "$band_q_max"; return; }
+      live_q[i]="$v"; live_s_q[$i]="$v"; live_dirty["q:$i"]=1 ;;
+    preamp)
+      v="$i"
+      live_in_range "$v" "$preamp_min" "$preamp_max" ||
+        { printf 'error preamp takes a gain in %s..%s dB\n' "$preamp_min" "$preamp_max"; return; }
+      # Never above the ceiling: a hand-set preamp is headroom, not a volume.
+      live_micro "$v"; local want=$REPLY
+      live_micro "$live_ceiling"; ((want > REPLY)) && v="$live_ceiling"
+      live_preamp="$v"; live_s_preamp="$v"; live_dirty[pre]=1 ;;
+    balance)
+      v="$i"
+      live_in_range "$v" -1 1 || { printf 'error balance runs from -1 to 1\n'; return; }
+      live_balance="$v"; live_s_balance="$v"; live_dirty[bal]=1 ;;
+  esac
+}
+
+# Write the dirty controls: one awk for the numbers, one pw-cli for the graph.
+live_flush() {
+  ((${#live_dirty[@]})) || return 0
+  local req="" key i s n k band_edit=0 out params preamp
+  for key in "${!live_dirty[@]}"; do
+    case "$key" in
+      g:*)
+        band_edit=1; i="${key#g:}"; s="${live_slot0[i]}"
+        # A bypassed band has no slot, and a sloped pass filter's stages carry
+        # no gain: the edit is filed at the commit, nothing plays it now.
+        ((s >= 0 && live_nst[i] == 1)) || continue
+        if ((live_pool)); then
+          req+="D para:g_$s ${live_gain[i]}"$'\n'
+        else
+          case "${live_type[i]}" in
+            peaking | lowshelf | highshelf) req+="R g${s}_l:Gain ${live_gain[i]}"$'\n'"R g${s}_r:Gain ${live_gain[i]}"$'\n' ;;
+          esac
+        fi ;;
+      f:*)
+        band_edit=1; i="${key#f:}"; s="${live_slot0[i]}"
+        ((s >= 0)) || continue
+        for ((k = 0; k < live_nst[i]; k++)); do
+          if ((live_pool)); then req+="R para:f_$((s + k)) ${live_freq[i]}"$'\n'
+          else req+="R g$((s + k))_l:Freq ${live_freq[i]}"$'\n'"R g$((s + k))_r:Freq ${live_freq[i]}"$'\n'
+          fi
+        done ;;
+      q:*)
+        band_edit=1; i="${key#q:}"; s="${live_slot0[i]}"; n="${live_nst[i]}"
+        ((s >= 0)) || continue
+        for ((k = 0; k < n; k++)); do
+          if ((live_pool)); then req+="Q para:q_$((s + k)) ${live_q[i]} $n $((k + 1))"$'\n'
+          else req+="Q g$((s + k))_l:Q ${live_q[i]} $n $((k + 1))"$'\n'"Q g$((s + k))_r:Q ${live_q[i]} $n $((k + 1))"$'\n'
+          fi
+        done ;;
+      pre)
+        # A hand-set preamp is manual headroom, which takes no relief.
+        req+="D pre_l:Mult $live_preamp"$'\n'"D pre_r:Mult $live_preamp"$'\n'
+        req+="D relief_l:Mult 0"$'\n'"D relief_r:Mult 0"$'\n'"D drelief_l:Mult 0"$'\n'"D drelief_r:Mult 0"$'\n'
+        live_relief=0 live_drelief=0 ;;
+      bal) req+="M $live_channels $live_balance"$'\n' ;;
+    esac
+  done
+  live_dirty=()
+  if ((band_edit && live_follow)) && [[ -z $live_s_preamp ]]; then
+    # Nothing would catch the clip, so the preamp follows the bands.
+    for ((i = 0; i < live_count; i++)); do
+      ((live_en[i])) && req+="B ${live_type[i]} ${live_freq[i]} ${live_gain[i]} ${live_q[i]} ${live_nst[i]}"$'\n'
+    done
+    req+="P $live_headroom $live_held $live_preamp"$'\n'
+  fi
+  [[ -n $req ]] || return 0
+  out="$(printf '%s' "$req" | LC_ALL=C awk -v fs="$live_rate" "$awk_biquad_lib"'
+    function add(name, value) { out = out (out == "" ? "" : " ") "\"" name "\" " value }
+    BEGIN { PI = atan2(0, -1); out = ""; nb = 0; want = 0 }
+    $1 == "R" { add($2, $3) }
+    $1 == "D" { add($2, sprintf("%.6f", 10 ^ ($3 / 20))) }
+    $1 == "Q" { add($2, sprintf("%.10g", stage_q($3 + 0, $4 + 0, $5 + 0))) }
+    $1 == "M" {
+      b = $3 + 0
+      gl = 1 - b; if (gl > 1) gl = 1; if (gl < 0) gl = 0
+      gr = 1 + b; if (gr > 1) gr = 1; if (gr < 0) gr = 0
+      if ($2 == "mono") { ll = 0.5; lr = 0.5; rl = 0.5; rr = 0.5 }
+      else if ($2 == "swap") { ll = 0; lr = 1; rl = 1; rr = 0 }
+      else { ll = 1; lr = 0; rl = 0; rr = 1 }
+      add("mix_l:Gain 1", sprintf("%.6f", ll * gl)); add("mix_l:Gain 2", sprintf("%.6f", lr * gl))
+      add("mix_r:Gain 1", sprintf("%.6f", rl * gr)); add("mix_r:Gain 2", sprintf("%.6f", rr * gr))
+    }
+    $1 == "B" { bt[nb] = $2; bf[nb] = $3; bg[nb] = $4; bq[nb] = $5; bn[nb] = $6; nb++ }
+    $1 == "P" { want = 1; policy = $2; held = $3 + 0; now = $4 + 0 }
+    END {
+      p = ""
+      if (want) {
+        lo = 20; hi = 20000; steps = 400; max = -1e300
+        for (i = 0; i <= steps; i++) {
+          f = lo * (hi / lo) ^ (i / steps); total = 0
+          for (b = 0; b < nb; b++) {
+            if (bn[b] <= 1) total += magnitude_db(bt[b], bf[b], bq[b], bg[b], f)
+            else for (k = 1; k <= bn[b]; k++) total += magnitude_db(bt[b], bf[b], stage_q(bq[b], bn[b], k), 0, f)
+          }
+          if (total > max) max = total
+        }
+        if (max <= 0.05) auto = 0
+        else { c = int(max * 2); if (c < max * 2) c++; auto = -c / 2; if (auto < -24) auto = -24 }
+        # Manual keeps its value under the curve ceiling; everything else is
+        # the full cut, since there is no limiter for balanced to lean on. The
+        # cut follows a boost at once but is not given back during the drag:
+        # the commit walks it up, which cannot click and cannot clip.
+        p = (policy == "manual" && held < auto) ? held : auto
+        if (p >= now) p = ""
+        else { add("pre_l:Mult", sprintf("%.6f", 10 ^ (p / 20))); add("pre_r:Mult", sprintf("%.6f", 10 ^ (p / 20))) }
+      }
+      # The preamp first, behind a P so an empty one still makes a line.
+      printf "P%s\n%s\n", p, out
+    }')"
+  preamp="${out%%$'\n'*}"; preamp="${preamp#P}"
+  params=""
+  [[ $out == *$'\n'* ]] && params="${out#*$'\n'}"
+  [[ -n $preamp ]] && live_preamp="$preamp"
+  [[ -n $params ]] || return 0
+  [[ $req == *"pre_"* || -n $preamp ]] && gain_walk_claim
+  live_write "$params"
+}
+
+# One pw-cli write. A failed one finds the node again (a rebuild gives it a new
+# id) and tries once more; a second failure ends the editor, and the panel
+# falls back to its command queue.
+live_last_write=0
+live_write() {
+  live_last_write="${EPOCHREALTIME//[!0-9]/}"
+  pw-cli set-param "$live_node" Props "{ params = [ $1 ] }" >/dev/null 2>&1 && return 0
+  live_node="$(find_node_id)"
+  [[ -n $live_node ]] && pw-cli set-param "$live_node" Props "{ params = [ $1 ] }" >/dev/null 2>&1 && return 0
+  printf 'error the equalizer graph did not take the write\n'
+  exit 1
+}
+
+# File the session's edits into the state like the one-shot commands would.
+live_commit() {
+  local state next jg='{}' jf='{}' jq_='{}' i touched="" pre0="$live_preamp" rel0="$live_relief" drel0="$live_drelief"
+  local pre1 rel1 drel1
+  if ! live_has_edits; then
+    printf 'status %s\n' "$(cmd_status_full)"
+    return 0
+  fi
+  take_lock
+  state="$(state_read)"
+  if [[ $(live_signature "$state") != "$live_sig" ]]; then
+    printf 'stale\n'
+    live_restore "$state"
+    flock -u 9
+    live_reset_session
+    live_load || { printf 'unavailable %s\n' "$live_reason"; exit 3; }
+    # Every commit is answered with the status, so the panel never waits on one.
+    printf 'status %s\n' "$(cmd_status_full)"
+    return 0
+  fi
+  # Another command may have written the graph under the session (a preset's
+  # cross-fade runs while it holds the lock): the session's controls again.
+  for i in "${!live_s_gain[@]}"; do live_dirty["g:$i"]=1; done
+  for i in "${!live_s_freq[@]}"; do live_dirty["f:$i"]=1; done
+  for i in "${!live_s_q[@]}"; do live_dirty["q:$i"]=1; done
+  [[ -n $live_s_balance ]] && live_dirty[bal]=1
+  live_flush
+  jg="{$(for i in "${!live_s_gain[@]}"; do printf '"%s":%s,' "$i" "${live_s_gain[$i]}"; done)"; jg="${jg%,}}"
+  jf="{$(for i in "${!live_s_freq[@]}"; do printf '"%s":%s,' "$i" "${live_s_freq[$i]}"; done)"; jf="${jf%,}}"
+  jq_="{$(for i in "${!live_s_q[@]}"; do printf '"%s":%s,' "$i" "${live_s_q[$i]}"; done)"; jq_="${jq_%,}}"
+  next="$(jq -c --arg m "$live_mode" --argjson g "$jg" --argjson f "$jf" --argjson q "$jq_" '
+    .[$m] |= [ to_entries[] | (.key | tostring) as $k | .value
+      + (if $g[$k] != null then { gain: $g[$k] } else {} end)
+      + (if $f[$k] != null then { freq: $f[$k] } else {} end)
+      + (if $q[$k] != null then { q: $q[$k] } else {} end) ]' <<<"$state")"
+  if [[ -n $live_s_preamp ]]; then
+    next="$(jq -c --argjson p "$live_s_preamp" '.preamp = $p | .headroom = "manual" | .relief = 0' <<<"$next")"
+  fi
+  if [[ -n $live_s_balance ]]; then
+    next="$(jq -c --argjson b "$live_s_balance" '.balance = $b' <<<"$next")"
+  fi
+  if ((${#live_s_gain[@]} + ${#live_s_freq[@]} + ${#live_s_q[@]})) || [[ -n $live_s_preamp ]]; then
+    touched="$(printf '%s\n' "${!live_s_gain[@]}" "${!live_s_freq[@]}" "${!live_s_q[@]}" | sort -nu | paste -sd, -)"
+    history_key="live:${touched}${live_s_preamp:+:preamp}" history_noted=0
+    next="$(apply_headroom "$next")" || {
+      printf 'error the edit could not be filed\n'; history_key=""
+      live_restore "$state"; flock -u 9; live_reset_session; live_load >/dev/null
+      printf 'status %s\n' "$(cmd_status_full)"
+      return 0
+    }
+  fi
+  state_write "$next"
+  history_key=""
+  sync_fragment "$next"
+  flock -u 9
+  IFS=$'\t' read -r pre1 rel1 drel1 < <(jq -r '[(.preamp // 0), (.relief // 0), (.deviceRelief // 0)] | @tsv' <<<"$next")
+  live_reset_session
+  live_load || { printf 'unavailable %s\n' "$live_reason"; exit 3; }
+  printf 'status %s\n' "$(cmd_status_full)"
+  # The preamp settles while the next drag may already be streaming: the walk
+  # touches only the flat gains, and the next write of them supersedes it.
+  # Without the limiter the cut followed every boost at once and gave nothing
+  # back, so what is left is a walk up -- or, for a cut still deeper (a manual
+  # preamp the commit clamped), one write.
+  if gains_may_walk "$next" "$pre0" "$pre1" "$rel0" "$rel1" "$drel0" "$drel1"; then
+    gain_walk_detached "$live_node" "$pre0" "$pre1" "$rel0" "$rel1" "$drel0" "$drel1"
+  else
+    live_send_params "$(preamp_params "$pre1") $(relief_params "$rel1") $(drelief_params "$drel1")" "$live_node" || true
+  fi
+}
+
+live_cancel() {
+  live_dirty=()
+  if live_has_edits; then live_restore "$(state_read)"; fi
+  live_reset_session
+}
+
+cmd_live() {
+  local line batch w n
+  live_marker="$state_root/.live-mark.$$"
+  trap 'live_term=1' TERM INT HUP
+  trap 'rm -f "$live_marker"' EXIT
+  if ! live_load; then printf 'unavailable %s\n' "$live_reason"; exit 3; fi
+  printf 'ready %s\n' "$live_summary"
+  while ((!live_term)); do
+    IFS= read -r line || break
+    batch=("$line")
+    # On the biquad chain every write clicks (PipeWire's builtin biquad clears
+    # its history on each update), so writes are at least 100 ms apart there:
+    # whatever arrives in the rest of the window joins this batch.
+    if ((!live_pool)); then
+      local now rest
+      now="${EPOCHREALTIME//[!0-9]/}"
+      while ((now - live_last_write < 100000)); do
+        rest="$(printf '0.%06d' $((100000 - (now - live_last_write))))"
+        IFS= read -r -t "$rest" line && batch+=("$line")
+        now="${EPOCHREALTIME//[!0-9]/}"
+      done
+    fi
+    # Drain what is already waiting: only the last value per control is played.
+    n=0
+    while ((n < 256)) && IFS= read -r -t 0 && IFS= read -r line; do batch+=("$line"); n=$((n + 1)); done
+    live_check_state
+    for line in "${batch[@]}"; do
+      set -f; w=($line); set +f
+      case "${w[0]:-}" in
+        "") ;;
+        commit) live_flush; live_commit ;;
+        cancel) live_cancel ;;
+        gain | gains | freq | q | preamp | balance) live_edit "${w[@]}" ;;
+        *) printf 'error unknown line: %s\n' "${w[0]:0:20}" ;;
+      esac
+    done
+    live_flush
+  done
+  live_cancel
+  exit 0
+}
+
+# Every active band's gain at once: the 10-band console's fit moves all ten
+# bells for one fader. One state write and one live write.
+cmd_set_gains() {
+  local state mode bands count g json='[' sep=''
+  state="$(state_read)"
+  mode="$(jq -r '.mode' <<<"$state")"
+  bands="$(active_bands "$state")"
+  count="$(jq 'length' <<<"$bands")"
+  (($# == count)) || die "set-gains takes one gain per band: $count, not $#."
+  for g in "$@"; do
+    need_number "$g"
+    json+="$sep$g"; sep=','
+  done
+  json+=']'
+  state="$(jq -c --arg m "$mode" --argjson g "$json" '.[$m] |= [ to_entries[] | .value + { gain: $g[.key] } ]' <<<"$state")"
+  state="$(apply_headroom "$state")" || exit 1
+  state_write "$state"
+  if sink_present; then live_apply_active "" "$state"; fi
+}
+
 # A yes/no from the command line, for a band's enabled flag.
 parse_bool() {
   case "${1:-}" in
@@ -2023,14 +2910,19 @@ cmd_set_band() {
   if sink_present; then live_apply_active "" "$state"; fi
 }
 
+# A new band: a flat bell at 1 kHz, or where the curve was double-clicked
+# (frequency, gain, Q and type, each checked against the state's ranges).
 cmd_add_band() {
-  local state count slots
+  local freq="${1:-1000}" gain="${2:-0}" q="${3:-1.0}" type="${4:-peaking}" state count slots
+  need_number "$freq"; need_number "$gain"; need_number "$q"
+  [[ " $band_types " == *" $type "* ]] || die "Band type '$type' is not one of: $band_types."
   state="$(state_read)"
   count="$(jq '.parametric | length' <<<"$state")"
   ((count < max_slots)) || die "Parametric mode holds at most 16 bands."
   slots="$(jq "$jq_slots"' [ .parametric[] | slots ] | add // 0' <<<"$state")"
   ((slots < max_slots)) || die "Parametric mode has no free filter slot: a steeper slope uses one slot per 12 dB/octave."
-  state="$(jq -c '.mode = "parametric" | .parametric += [{ type: "peaking", freq: 1000, q: 1.0, gain: 0 }]' <<<"$state")"
+  state="$(jq -c --argjson f "$freq" --argjson g "$gain" --argjson q "$q" --arg t "$type" \
+    '.mode = "parametric" | .parametric += [{ type: $t, freq: $f, q: $q, gain: $g }]' <<<"$state")"
   state="$(apply_headroom "$state")" || exit 1
   state_write "$state"
   if sink_present; then live_apply_active "" "$state"; fi
@@ -2072,7 +2964,7 @@ need_preset_name() {
 }
 
 cmd_apply_preset() {
-  local name="$1" preset state mode from_bands to_bands from_preamp to_preamp from_layout relief
+  local name="$1" preset state mode from_state from_layout
   need_preset_name "$name"
   preset="$(preset_read "$name")" || die "No preset named '$name'."
 
@@ -2085,8 +2977,7 @@ cmd_apply_preset() {
   state="$(state_read)"
   # What is running right now: the ramp needs both ends, and the layout check
   # decides whether a live write is possible at all.
-  from_bands="$(active_bands "$state")"
-  from_preamp="$(jq -r '.preamp // 0' <<<"$state")"
+  from_state="$state"
   from_layout="$(running_layout)"
 
   state="$(jq -c --arg n "$name" --arg m "$mode" --argjson p "$preset" '
@@ -2098,11 +2989,60 @@ cmd_apply_preset() {
   # fragment, the live write and the headroom all see the same set.
   state="$(cap_parametric_state "$state")"
   state="$(apply_headroom "$state")" || exit 1
-  to_bands="$(active_bands "$state")"
-  to_preamp="$(jq -r '.preamp // 0' <<<"$state")"
-  relief="$(jq -r '.relief // 0' <<<"$state")"
   state_write "$state"
+  apply_curve_live "$state" "$from_state" "$from_layout"
+}
 
+# One curve into another of the same shape: the bands in eight steps, then the
+# flat gains walked (see gain walks). While the limiter is on the bands go
+# first under the old gains and the gains follow; without it the gains move
+# with the bands, so no step holds more gain than one of the two curves does.
+crossfade_curve() { # from-state to-state
+  local from="$1" to="$2" fb tb p0 p1 r0 r1 d0 d1 id steps=8
+  # PipeWire's builtin biquad clears its history on every update (measured: the
+  # output drops to the unfiltered input at the quantum boundary and recovers),
+  # so every write clicks once, whatever its size: on the biquad chain the bands
+  # change in one write. LSP's filters keep their state and are cross-faded.
+  running_pool || steps=1
+  # With the ramps collapsed (the tests) it is one write of everything.
+  if ((${OMARCHY_EQ_NO_RAMP:-0} == 1)); then
+    fb="$(active_bands "$from")"; tb="$(active_bands "$to")"
+    IFS=$'\t' read -r p1 r1 d1 < <(jq -r '[(.preamp // 0), (.relief // 0), (.deviceRelief // 0)] | @tsv' <<<"$to")
+    live_ramp_bands "$fb" "$tb" "$p1" "$p1" "$r1" "$d1" 1
+    return
+  fi
+  fb="$(active_bands "$from")"; tb="$(active_bands "$to")"
+  IFS=$'\t' read -r p0 r0 d0 < <(jq -r '[(.preamp // 0), (.relief // 0), (.deviceRelief // 0)] | @tsv' <<<"$from")
+  IFS=$'\t' read -r p1 r1 d1 < <(jq -r '[(.preamp // 0), (.relief // 0), (.deviceRelief // 0)] | @tsv' <<<"$to")
+  # Where the gains are now: a walk still running has them somewhere between.
+  read -r p0 r0 d0 < <(gain_walk_position "$p0" "$r0" "$d0")
+  if gains_may_walk "$to" "$p0" "$p1" "$r0" "$r1" "$d0" "$d1"; then
+    # The bands under the old gains, then the gains walked to the new ones.
+    live_ramp_bands "$fb" "$tb" "$p0" "$p0" "$r0" "$d0" "$steps" || return 1
+    id="$(find_node_id)"
+    [[ -n $id ]] && gain_walk_detached "$id" "$p0" "$p1" "$r0" "$r1" "$d0" "$d1"
+    return 0
+  fi
+  # A deeper cut with no limiter to lean on: the new gains first, at once, and
+  # the bands under them.
+  live_ramp_bands "$fb" "$tb" "$p1" "$p1" "$r1" "$d1" "$steps"
+}
+
+# Whether two band sets differ only in values: the same count, and per band the
+# same type, slope and bypass. Only those can be cross-faded by index.
+same_shape() { # bands-a bands-b
+  [[ $(jq -n --argjson a "$1" --argjson b "$2" '
+    def shape: map([(.type // "peaking"), (.slope // 1), (.enabled // true)]);
+    ($a | shape) == ($b | shape)') == true ]]
+}
+
+# Put a new curve into the running graph the cheapest way its layout allows: a
+# rebuild for another shape, one write into the pool, a cross-fade on a biquad
+# chain of the same labels. A preset, an undo and a redo all land through here.
+apply_curve_live() { # state from-state from-layout
+  local state="$1" from_state="$2" from_layout="$3" from_bands to_bands
+  from_bands="$(active_bands "$from_state")"
+  to_bands="$(active_bands "$state")"
   sink_present || return 0
   if [[ $(desired_layout "$state") != "$from_layout" ]]; then
     # Another shape: into or out of the pool, or a biquad chain of other
@@ -2111,22 +3051,65 @@ cmd_apply_preset() {
     service_restart >/dev/null 2>&1
   elif running_pool; then
     # The pool already holds all 16 slots, so a preset is a values change and
-    # lands live, without the ramp the biquad chain needs.
+    # lands live. One write of a whole new set clicks, though -- measured on
+    # tests/dsp-check.sh's rig, a preset switch under a 50 Hz tone stepped
+    # 10.5 dB above the tone's own largest step -- so a set of the same shape
+    # (band count, types, slopes, bypass) is cross-faded like the biquad chain;
+    # another shape is one write.
     sync_fragment "$state"
-    live_apply_bands "$state" || service_restart >/dev/null 2>&1
+    if same_shape "$from_bands" "$to_bands"; then
+      crossfade_curve "$from_state" "$state" || service_restart >/dev/null 2>&1
+    else
+      live_apply_bands "$state" || service_restart >/dev/null 2>&1
+    fi
   else
-    # The same biquad labels: cross-fade in place instead of dropping audio
-    # through a restart. Bands are interpolated by index, so the fade needs the
-    # same band count too; the same labels from a different band split (one
-    # band of slope 2 against two bands) is still one live write.
+    # The same biquad labels: a live write instead of dropping audio through a
+    # restart, with the flat gains walked (crossfade_curve); the same labels from
+    # a different band split (one band of slope 2 against two bands) is one
+    # live write of everything.
     sync_fragment "$state"
     if [[ $(jq 'length' <<<"$from_bands") -eq $(jq 'length' <<<"$to_bands") ]]; then
-      live_ramp_bands "$from_bands" "$to_bands" "$from_preamp" "$to_preamp" "$relief" || service_restart >/dev/null 2>&1
+      crossfade_curve "$from_state" "$state" || service_restart >/dev/null 2>&1
     else
       live_apply_bands "$state" || service_restart >/dev/null 2>&1
     fi
   fi
 }
+
+# Back to the loaded preset as it was saved.
+cmd_revert_preset() {
+  local name
+  name="$(state_read | jq -r '.preset // ""')"
+  if [[ -z $name ]] || ! preset_read "$name" >/dev/null 2>&1; then
+    die "The loaded preset '${name:-?}' no longer exists, so there is nothing to revert to."
+  fi
+  cmd_apply_preset "$name"
+}
+
+# One step back (undo) or forward (redo): the snapshot comes off one stack, the
+# curve playing now goes onto the other, and the snapshot is applied like a
+# preset. It ends an A/B or a solo, as every curve edit does.
+history_step() { # from-stack to-stack verb
+  local from="$1" to="$2" verb="$3" hist state entry from_state from_layout
+  hist="$(history_read)"
+  [[ $(jq --arg f "$from" '(.[$f] // []) | length' <<<"$hist") -gt 0 ]] || die "Nothing to $verb."
+  state="$(state_read)"
+  entry="$(jq -c --arg f "$from" '.[$f][-1].curve' <<<"$hist")"
+  hist="$(jq -c --arg f "$from" --arg t "$to" --argjson cur "$(jq -c "$jq_curve" <<<"$state")" \
+    --argjson now "$(now_ms)" --argjson max "$history_max" '
+    .[$f] = .[$f][:-1] | .[$t] = (((.[$t] // []) + [{ key: "history", at: $now, curve: $cur }]) | .[-$max:])' <<<"$hist")"
+  from_state="$state"
+  from_layout="$(running_layout)"
+  state="$(jq -c --argjson c "$entry" '. + ($c | with_entries(select(.value != null)))' <<<"$state")"
+  state="$(cap_parametric_state "$state")"
+  state="$(apply_headroom "$state")" || exit 1
+  history_key="" state_write "$state"
+  history_write "$hist"
+  apply_curve_live "$state" "$from_state" "$from_layout"
+}
+
+cmd_undo() { history_step undo redo undo; }
+cmd_redo() { history_step redo undo redo; }
 
 cmd_save_preset() {
   local name="$1" state entry
@@ -2208,11 +3191,10 @@ need_numeric_bands_in() {
 }
 
 cmd_reset() {
-  local state mode from_bands to_bands from_preamp to_preamp relief
+  local state mode from_state
   state="$(state_read)"
   mode="$(jq -r '.mode' <<<"$state")"
-  from_bands="$(active_bands "$state")"
-  from_preamp="$(jq -r '.preamp // 0' <<<"$state")"
+  from_state="$state"
   # Reset means flat, so the preamp goes back to unity with the bands -- an
   # imported profile's cut left behind would quietly halve the output.
   state="$(jq -c --arg m "$mode" '
@@ -2223,21 +3205,10 @@ cmd_reset() {
         .graphic = [ .graphic[] | .gain = 0 ]
       end' <<<"$state")"
   state="$(apply_headroom "$state")" || exit 1
-  to_bands="$(active_bands "$state")"
-  to_preamp="$(jq -r '.preamp // 0' <<<"$state")"
-  relief="$(jq -r '.relief // 0' <<<"$state")"
   state_write "$state"
-  if sink_present; then
-    # Reset only flattens gains, so the running chain already has the right
-    # shape: write it live rather than dropping audio through a restart. The
-    # biquad chain gets the crossfade; the pool gets one whole-set write.
-    if running_pool || ! layout_live "$state"; then
-      live_apply_active "" "$state"
-    else
-      sync_fragment "$state"
-      live_ramp_bands "$from_bands" "$to_bands" "$from_preamp" "$to_preamp" "$relief" || true
-    fi
-  fi
+  # Reset only flattens gains, so the running chain already has the right
+  # shape: it is cross-faded live, on the pool as on the biquad chain.
+  apply_curve_live "$state" "$from_state" "$(running_layout)"
 }
 
 # ---------------------------------------------------------------- listening
@@ -2270,6 +3241,7 @@ cmd_compare() {
     printf 'Playing the curve.\n'
   fi
   state_write "$state"
+  walk_flat_gains=0
   if sink_present; then live_apply_active "" "$state"; fi
 }
 
@@ -2294,6 +3266,7 @@ cmd_solo() {
     printf 'Soloing band %s.\n' "$((value + 1))"
   fi
   state_write "$state"
+  walk_flat_gains=0
   if sink_present; then live_apply_active "" "$state"; fi
 }
 
@@ -2337,8 +3310,8 @@ cmd_set_preamp() {
 cmd_set_headroom() {
   local value="${1:-}" state had_listen
   case "$value" in
-    auto | manual) ;;
-    *) die "Headroom must be auto or manual." ;;
+    auto | balanced | manual) ;;
+    *) die "Headroom must be auto, balanced or manual." ;;
   esac
   state="$(state_read)"
   had_listen="$(jq -r '.listen != null' <<<"$state")"
@@ -2356,7 +3329,7 @@ cmd_set_headroom() {
 # The preamp and the relief that goes with it, in one live write.
 live_apply_preamp() {
   local state="$1"
-  live_send_params "$(preamp_params "$(jq -r '.preamp // 0' <<<"$state")") $(relief_params "$(jq -r '.relief // 0' <<<"$state")")"
+  live_send_params "$(preamp_params "$(jq -r '.preamp // 0' <<<"$state")") $(relief_params "$(jq -r '.relief // 0' <<<"$state")") $(drelief_params "$(jq -r '.deviceRelief // 0' <<<"$state")")"
 }
 
 # ---------------------------------------------------------------- output stage commands
@@ -2372,14 +3345,27 @@ lsp_inactive_warn() {
 
 # Store one output-stage setting and send its controls live.
 set_stage_value() { # key value params
-  local key="$1" value="$2" params="$3" state relief
+  local key="$1" value="$2" params="$3" state relief drelief preamp
   state="$(state_read)"
   relief="$(jq -r '.relief // 0' <<<"$state")"
+  drelief="$(jq -r '.deviceRelief // 0' <<<"$state")"
+  preamp="$(jq -r '.preamp // 0' <<<"$state")"
   state="$(jq -c --arg k "$key" --arg v "$value" '.[$k] = $v' <<<"$state")"
+  # Balanced headroom needs the limiter, so switching it moves the preamp: the
+  # balanced cut with it, the full cut without.
+  if [[ $(jq -r '.headroom // "auto"' <<<"$state") == balanced ]]; then
+    state="$(jq -c --argjson p "$(policy_preamp_db "$state" "$(active_bands "$state")")" '.preamp = $p' <<<"$state")"
+    if [[ $(jq -r '.preamp // 0' <<<"$state") != "$preamp" ]]; then
+      params+=" $(preamp_params "$(jq -r '.preamp // 0' <<<"$state")")"
+    fi
+  fi
   # The limiter is the relief's safety net, so switching it moves the relief.
   state="$(with_relief "$state")"
   if [[ $(jq -r '.relief // 0' <<<"$state") != "$relief" ]]; then
     params+=" $(relief_params "$(jq -r '.relief // 0' <<<"$state")")"
+  fi
+  if [[ $(jq -r '.deviceRelief // 0' <<<"$state") != "$drelief" ]]; then
+    params+=" $(drelief_params "$(jq -r '.deviceRelief // 0' <<<"$state")")"
   fi
   state_write "$state"
   # Like the preamp, the toggle is live-only: rewrite the fragment so a restart
@@ -2448,6 +3434,25 @@ cmd_set_balance() {
 }
 
 # ---------------------------------------------------------------- devices and apps
+
+# The device relief (see device_relief_db) is off until switched on: on, it
+# changes what is heard below full device volume.
+cmd_set_device_relief() {
+  local value="${1:-}" state
+  case "$value" in
+    on | off) ;;
+    *) die "Device volume relief must be on or off." ;;
+  esac
+  state="$(state_read)"
+  state="$(jq -c --arg v "$value" '.followDeviceVolume = $v' <<<"$state")"
+  state="$(with_relief "$state")"
+  state_write "$state"
+  sync_fragment "$state"
+  if sink_present && ((!graph_rebuilt)); then
+    live_send_params "$(drelief_params "$(jq -r '.deviceRelief // 0' <<<"$state")")" || true
+  fi
+  if [[ $value == on ]] && ! lsp_available; then lsp_inactive_warn; fi
+}
 
 cmd_set_device_memory() {
   local value="${1:-}" state
@@ -2750,9 +3755,12 @@ cmd_status() {
   # failing or treating the absence as a difference.
   preset_name="$(jq -r '.preset // "Flat"' <<<"$state")"
   preset_doc="$(preset_read "$preset_name" 2>/dev/null)" || preset_doc='null'
+  local hist_arg=(--argjson h '[]')
+  [[ -s $history_file ]] && jq -e . "$history_file" >/dev/null 2>&1 && hist_arg=(--slurpfile h "$history_file")
   jq -c -n --argjson s "$state" --argjson b "$bands" --argjson p "$(preset_list_json)" \
-     --argjson d "$preset_doc" \
+     --argjson d "$preset_doc" "${hist_arg[@]}" \
      --argjson r "$(graph_rate)" --argjson ap "$(auto_preamp_db "$bands")" \
+     --argjson pg "$(program_gain_db "$bands")" --argjson bp "$(balanced_preamp_db "$bands")" \
      --argjson oa "$(lsp_available && echo true || echo false)" \
      --argjson maxslots "$max_slots" --argjson v "$state_version" "$jq_slots"'
     # A band written with its defaults spelled out (enabled true, slope 1) is the
@@ -2779,7 +3787,18 @@ cmd_status() {
       # actually played under.
       preamp: ($s.preamp // 0),
       relief: ($s.relief // 0),
-      appliedPreamp: ((($s.preamp // 0) + ($s.relief // 0)) * 10 | round / 10),
+      # The device relief (off unless followDeviceVolume is on) gives the cut
+      # back after the limiter, as far as the volume of the device allows.
+      deviceRelief: ($s.deviceRelief // 0),
+      followDeviceVolume: ($s.followDeviceVolume // "off"),
+      appliedPreamp: ((($s.preamp // 0) + ($s.relief // 0) + ($s.deviceRelief // 0)) * 10 | round / 10),
+      # The preamp the curve will settle at: the preamp itself outside a drag,
+      # which is all the backend ever sees (the panel computes the rest).
+      settlePreamp: ($s.preamp // 0),
+      programGainDb: $pg,
+      balancedPreamp: $bp,
+      canUndo: ((($h[0] // {}).undo // []) | length > 0),
+      canRedo: ((($h[0] // {}).redo // []) | length > 0),
       autoPreamp: $ap,
       # The most gain manual headroom may hold for these bands. Same number as
       # autoPreamp by construction (preamp_ceiling_db is auto_preamp_db), named
@@ -2836,20 +3855,23 @@ apps_json() {
 }
 
 cmd_status_full() {
-  local out target vol
+  local out target vol dvol=""
   out="$(cmd_status)"
   target="$(jq -r '.targetSink // ""' <<<"$out")"
   vol="$(sink_volume_db)"
+  # The device's own volume, which the device relief follows.
+  [[ -n $target ]] && dvol="$(device_volume_info "$target" | awk '{ print $4 }')"
   jq -c --argjson present "$(sink_present && echo true || echo false)" \
      --arg default "$(current_default_sink)" \
      --arg physical "$(physical_output)" \
      --arg key "$( [[ -n $target ]] && device_key "$target")" \
      --arg label "$(sink_description "$target")" \
-     --arg vol "$vol" \
+     --arg vol "$vol" --arg dvol "$dvol" \
      --argjson apps "$(apps_json "$(jq -c '.excludedApps' <<<"$out")")" \
     '.sinkPresent = $present | .defaultSink = $default | .physicalSink = $physical
      | .deviceKey = $key | .deviceLabel = $label | .apps = $apps
-     | .volumeDb = (($vol | tonumber? | . * 100 | round / 100) // null)' <<<"$out"
+     | .volumeDb = (($vol | tonumber? | . * 100 | round / 100) // null)
+     | .deviceVolumeDb = (($dvol | tonumber? | . * 100 | round / 100) // null)' <<<"$out"
 }
 
 cmd_toggle() {
@@ -2872,10 +3894,11 @@ Usage: omarchy-equalizer <command> [args]
   follow                          Watch for output changes (run by systemd)
   set-mode <graphic|parametric>   Choose which band set is processed
   set-gain <index> <dB>           Set one band's gain (live, no restart)
-  set-band <index> <gain|freq|q|type|enabled|slope> <value>
+  set-gains <dB> ...              Set every band's gain at once (one per band)
                                   Set one band property; enabled on|off bypasses
                                   a band, slope 1-4 is 12-48 dB/oct (pass filters)
-  add-band                        Append a parametric band (16 filter slots)
+  add-band [freq] [gain] [q] [type]
+                                  Append a parametric band (16 filter slots)
   remove-band <index>             Drop a parametric band
   compare [on|off|toggle]         A/B: hear Flat at the curve's own loudness
   solo <index|off>                Hear one band alone
@@ -2885,9 +3908,13 @@ Usage: omarchy-equalizer <command> [args]
   export-preset <name> [file]     Write a preset to a file (or stdout)
   import-preset <file> [name]     Save a preset file as a user preset
   reset                           Flatten the current mode's gains
+  undo | redo                     Step the curve's history
+  revert-preset                   Back to the loaded preset as saved
   presets                         List preset names
   set-preamp <dB>                 Whole-chain preamp (live, no restart)
-  set-headroom <auto|manual>      Auto-track the preamp to the band peaks
+  set-headroom <auto|balanced|manual>
+                                  How the preamp follows the curve: the peak (auto),
+                                  programme level with the limiter (balanced), or not
   set-limiter <on|off>            Brickwall output limiter (live, no restart)
   set-boost <off|low|medium|high|night|voice>
                                   Dynamics: boost strength, or a night/voice character
@@ -2895,6 +3922,8 @@ Usage: omarchy-equalizer <command> [args]
   set-channels <stereo|mono|swap> Channel handling ahead of the bands
   set-balance <-1..1>             Left/right balance
   set-device-memory <on|off>      Give every output device its own curve
+  set-device-relief <on|off>      Give the headroom back as the device volume allows
+  live                            Streamed edits on stdin (run by the panel)
   devices                         Devices that remember a curve
   forget-device <device>          Drop a device's remembered curve
   exclude-app <name>              Keep an app off the equalizer
@@ -2919,8 +3948,16 @@ take_lock() {
   flock -w 30 9 || die "Another equalizer command is still running."
 }
 case "$command" in
-  status | follow | presets | autoeq-search | devices | excluded-apps | export-preset | help | --help | -h | "") ;;
+  # The follower and the live editor take the lock per pass and per commit.
+  status | follow | live | presets | autoeq-search | devices | excluded-apps | export-preset | help | --help | -h | "") ;;
   *) take_lock ;;
+esac
+
+# The commands that edit the curve, named for the undo stack (history_note).
+case "$command" in
+  set-gain | set-band) history_key="$command:${1:-}" ;;
+  set-gains | add-band | remove-band | set-mode | apply-preset | revert-preset | reset | set-preamp | set-headroom | import-autoeq)
+    history_key="$command" ;;
 esac
 
 case "$command" in
@@ -2932,8 +3969,14 @@ case "$command" in
   follow) cmd_follow ;;
   set-mode) cmd_set_mode "${1:-}" ;;
   set-gain) cmd_set_gain "${1:-0}" "${2:-0}" ;;
+  set-gains) cmd_set_gains "$@" ;;
+  live) cmd_live ;;
+  undo) cmd_undo ;;
+  redo) cmd_redo ;;
+  revert-preset) cmd_revert_preset ;;
+  set-device-relief) cmd_set_device_relief "${1:-}" ;;
   set-band) cmd_set_band "${1:-0}" "${2:-}" "${3:-0}" ;;
-  add-band) cmd_add_band ;;
+  add-band) cmd_add_band "$@" ;;
   remove-band) cmd_remove_band "${1:-0}" ;;
   apply-preset) cmd_apply_preset "${1:-}" ;;
   save-preset) cmd_save_preset "${1:-}" ;;

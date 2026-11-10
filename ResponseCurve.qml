@@ -8,64 +8,97 @@ import "Model.js" as Model
 // own source by tests/curve-check.js).
 //
 // One framed console. The plot is the top region: a recessed rect with the dB
-// scale in a left gutter, one point of curve per pixel of width, numbered
-// handles on the line, and the output the preamp leaves behind as a second,
-// dashed line. In graphic mode the ten faders sit below the plot *inside the
-// same frame*, each column on the log position its own band occupies on the
-// frequency axis -- so a fader's number is directly under the part of the curve
-// it moves, instead of a linear row whose columns drifted 31 px (nearly an
-// octave) from the plot's axis at the bass end.
+// scale in a left gutter, one point of curve per pixel of width, a handle per
+// band, and the output the preamp leaves behind as a second, dashed line.
+// Behind the curve, softly, the shape of what is playing (the spectrum the
+// meter helper reads off the equalizer's own output). In graphic mode the ten
+// faders sit below the plot *inside the same frame*, each column on the log
+// position its own band occupies on the frequency axis -- so a fader's number
+// is directly under the part of the curve it moves.
 //
-// The curve is drawn from the bands alone, with the preamp as its own offset:
-// a handle has to sit on the line it drags, and a curve that carried the preamp
-// floated every handle above its own band by the whole preamp.
+// The curve and the handles are drawn from one array, `bands`, and nothing
+// else: the panel echoes every move of a drag into it before the backend has
+// heard of it, so the line follows the hand on every frame and nothing snaps
+// back on release. In graphic mode the handles and faders show what the curve
+// does at each band's centre (`handleGains`, the panel's fit) rather than the
+// bells' own gains, which overlap; in parametric mode a handle is its band's
+// gain, as in any parametric equalizer.
 Item {
   id: root
 
   property var bands: []
+  // Graphic mode: the response at each band's centre, which is what a handle
+  // and a fader show and set. Empty means "the bands' own gains".
+  property var handleGains: []
   property real preamp: 0
   property int sampleRate: 48000
+  // The spectrum helper's levels, 0..1, low bands first (empty when idle).
+  property var spectrum: []
 
   property color foreground: 'white'
   property color accent: 'white'
   property color handleBorder: 'black'
   property color background: 'black'
   property string fontFamily: Style.font.family
+  // Secondary text, at the dimmest shade that still reads (Model.dimColor).
+  property color dimText: Qt.darker(foreground, 1.6)
 
   property bool editable: false
   property bool freqEditable: false
+  // Parametric mode: Q on the wheel and on [ ], and the band keys (b, s, Delete).
+  property bool qEditable: freqEditable
   // The fader bank: graphic mode's control, on the plot's own axis.
   property bool showFaders: false
   // Wheel scroll passthrough: the panel injects its scrollByDelta here and the
   // bank's faders call it when the wheel is not theirs.
   property var scrollBy: null
 
-  property real minDb: -18
-  property real maxDb: 18
+  // The plot is ±18 dB, and ±30 dB while a band or the curve is outside that.
+  readonly property real span: wideScale ? 30 : 18
+  property real minDb: -span
+  property real maxDb: span
   property real floorDb: -42
   property real gainStep: 0.5
 
   property int dragIndex: -1
-  property real draftGain: 0
-  property real draftFreq: 0
   property int hoverIndex: -1
   // The band the keyboard acts on: set by a press on its handle or by ←/→
   // while the curve has focus. -1 until one is chosen.
   property int selectedIndex: -1
-  // The range a band's gain may take, the same one the faders and the panel
-  // clamp to; the plot itself is drawn wider so a +12 handle is not on the edge.
-  property real gainMin: -12
-  property real gainMax: 12
+
+  // The eased spectrum the backdrop draws.
+  property var backdropLevels: []
 
   signal bandGainMoved(int index, real gain)
   signal bandGainCommitted(int index, real gain)
+  signal bandFreqMoved(int index, real freq)
   signal bandFreqCommitted(int index, real freq)
+  signal bandQCommitted(int index, real q)
+  signal addBandRequested(real freq, real gain)
+  signal bandBypassToggled(int index)
+  signal bandSoloToggled(int index)
+  signal bandRemoveRequested(int index)
 
   readonly property real minFreq: 20
   readonly property real maxFreq: 20000
-  readonly property color dim: Qt.darker(foreground, 1.6)
+  readonly property color dim: dimText
   readonly property var gridFreqs: [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
   readonly property var minorFreqs: [40, 50, 80, 100, 200, 300, 400, 600, 800, 3000, 5000, 6000, 10000, 12000]
+
+  readonly property var curveMetrics: Model.metrics(bands, sampleRate)
+  readonly property bool wideScale: {
+    if (curveMetrics.peakDb > 18 || curveMetrics.troughDb < -18) return true
+    for (var i = 0; i < bands.length; i++) {
+      if (Math.abs(bandGainAt(i)) > 18) return true
+      if (bands[i] && Math.abs(Number(bands[i].gain) || 0) > 18) return true
+    }
+    return false
+  }
+  // The bank's range: ±12 dB, or ±24 dB while any band reads outside ±12.
+  readonly property real faderSpan: {
+    for (var i = 0; i < bands.length; i++) if (Model.gainSpan(bandGainAt(i)) > 12) return 24
+    return 12
+  }
 
   // Every coordinate helper maps into these rectangles, so hit-testing, the
   // curve, the grid and the faders can never disagree about where a frequency
@@ -116,36 +149,51 @@ Item {
     return maxDb - t * (maxDb - minDb)
   }
 
-  function snapGain(db) {
-    var step = Number(gainStep) > 0 ? Number(gainStep) : 0.5
-    return Math.round(db / step) * step
+  function snapGain(db, step) {
+    var s = Number(step) > 0 ? Number(step) : (Number(gainStep) > 0 ? Number(gainStep) : 0.5)
+    return Math.round(db / s) * s
   }
 
-  function snapFreq(f) { return Math.round(Number(f) || 1000) }
+  function snapFreq(f) { return Math.round(Math.max(minFreq, Math.min(maxFreq, Number(f) || 1000))) }
 
+  // What a band's handle shows: the response at its centre in graphic mode
+  // (the panel's handleGains), its own gain otherwise.
   function bandGainAt(index) {
-    if (index === dragIndex) return draftGain
+    if (handleGains && index >= 0 && index < handleGains.length && handleGains[index] !== undefined)
+      return Number(handleGains[index]) || 0
     var b = bands[index]
     return b ? Number(b.gain) || 0 : 0
+  }
+
+  function bandFreqAt(index) {
+    var b = bands[index]
+    return b ? Number(b.freq) || 1000 : 1000
+  }
+
+  function bandQAt(index) {
+    var b = bands[index]
+    return b ? Number(b.q) || 1 : 1
+  }
+
+  // Every band has a handle: a bypassed one is hollow and can still be moved
+  // (that is how it is tuned before it is switched back on), and a filter
+  // without a gain sits on the 0 dB line and moves sideways only.
+  function hasHandle(index) { return !!bands[index] }
+  function handleHasGain(index) {
+    var b = bands[index]
+    return !!b && (b.type === undefined || Model.typeHasGain(b.type))
+  }
+
+  // A band's gain range: ±12 dB, or ±24 dB for a band already outside that.
+  function gainLimitFor(index) {
+    var b = bands[index]
+    return Model.gainSpan(Math.max(Math.abs(bandGainAt(index)), b ? Math.abs(Number(b.gain) || 0) : 0))
   }
 
   // Where a band's handle is drawn. drawHandles() and the tests read the same
   // function, so a test on it is a test on the drawing.
   function handleXFor(index) { return xFor(bandFreqAt(index)) }
-  function handleYFor(index) { return yFor(bandGainAt(index)) }
-
-  function bandFreqAt(index) {
-    if (index === dragIndex) return draftFreq
-    var b = bands[index]
-    return b ? Number(b.freq) || 1000 : 1000
-  }
-
-  // Pass filters have no gain, so they have no handle.
-  // A bypassed band shapes nothing, so it has nothing to drag either.
-  function hasHandle(index) {
-    var b = bands[index]
-    return !!b && b.enabled !== false && (b.type === undefined || Model.typeHasGain(b.type))
-  }
+  function handleYFor(index) { return yFor(handleHasGain(index) ? bandGainAt(index) : 0) }
 
   // The grab radius: 18 px, but never more than half the gap between the two
   // closest handles, so a press between neighbours cannot reach past the one it
@@ -155,7 +203,7 @@ Item {
     var pts = []
     for (var i = 0; i < bands.length; i++) {
       if (!hasHandle(i)) continue
-      pts.push({ x: xFor(bands[i].freq), y: yFor(bands[i].gain) })
+      pts.push({ x: handleXFor(i), y: handleYFor(i) })
     }
     for (var a = 0; a < pts.length; a++) {
       for (var c = a + 1; c < pts.length; c++) {
@@ -171,17 +219,16 @@ Item {
     var best = -1, bestDistance = hitRadius()
     for (var i = 0; i < bands.length; i++) {
       if (!hasHandle(i)) continue
-      var b = bands[i]
-      var dx = xFor(b.freq) - x
-      var dy = yFor(b.gain) - y
+      var dx = handleXFor(i) - x
+      var dy = handleYFor(i) - y
       var d = Math.sqrt(dx * dx + dy * dy)
       if (d < bestDistance) { bestDistance = d; best = i }
     }
     return best
   }
 
-  // ←/→ walk the handles, skipping pass filters; from nothing selected the
-  // first step lands on the first or last handle.
+  // ←/→ walk the handles; from nothing selected the first step lands on the
+  // first or last handle.
   function stepSelection(direction) {
     var n = bands.length
     if (n === 0) return
@@ -193,22 +240,52 @@ Item {
     }
   }
 
+  function selectedOk() { return selectedIndex >= 0 && selectedIndex < bands.length && hasHandle(selectedIndex) }
+
   function nudgeSelected(delta) {
-    if (selectedIndex < 0 || selectedIndex >= bands.length || !hasHandle(selectedIndex)) return
-    var g = Math.max(gainMin, Math.min(gainMax, snapGain(bandGainAt(selectedIndex) + delta)))
+    if (!selectedOk() || !handleHasGain(selectedIndex)) return
+    var lim = gainLimitFor(selectedIndex)
+    var step = Math.abs(delta) < gainStep ? Math.abs(delta) : gainStep
+    var g = Math.max(-lim, Math.min(lim, snapGain(bandGainAt(selectedIndex) + delta, step)))
     bandGainCommitted(selectedIndex, g)
   }
 
+  function nudgeFreq(steps) {
+    if (!freqEditable || !selectedOk()) return
+    bandFreqCommitted(selectedIndex, Model.stepFreq(bandFreqAt(selectedIndex), steps))
+  }
+
+  function nudgeQ(steps) {
+    if (!qEditable || !selectedOk()) return
+    bandQCommitted(selectedIndex, Model.stepQ(bandQAt(selectedIndex), steps))
+  }
+
   activeFocusOnTab: editable
-  Keys.onLeftPressed: stepSelection(-1)
-  Keys.onRightPressed: stepSelection(1)
-  Keys.onUpPressed: nudgeSelected(gainStep)
-  Keys.onDownPressed: nudgeSelected(-gainStep)
-  // Every other key goes on to the panel's key catcher (e / m / r, Escape).
+  // Every other key goes on to the panel's key catcher (e / m / r / a / u, Escape).
   Keys.onPressed: function(event) {
-    if (event.key === Qt.Key_0 && selectedIndex >= 0 && hasHandle(selectedIndex)) {
+    var shift = (event.modifiers & Qt.ShiftModifier) !== 0
+    var plain = (event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) === 0
+    event.accepted = true
+    if (plain && event.key === Qt.Key_Left) {
+      if (shift && freqEditable) nudgeFreq(-1); else stepSelection(-1)
+    } else if (plain && event.key === Qt.Key_Right) {
+      if (shift && freqEditable) nudgeFreq(1); else stepSelection(1)
+    } else if (plain && event.key === Qt.Key_Up) {
+      nudgeSelected(shift ? 0.1 : gainStep)
+    } else if (plain && event.key === Qt.Key_Down) {
+      nudgeSelected(shift ? -0.1 : -gainStep)
+    } else if (plain && event.key === Qt.Key_0 && selectedOk() && handleHasGain(selectedIndex)) {
       bandGainCommitted(selectedIndex, 0)
-      event.accepted = true
+    } else if (plain && qEditable && event.key === Qt.Key_BracketLeft) {
+      nudgeQ(-1)
+    } else if (plain && qEditable && event.key === Qt.Key_BracketRight) {
+      nudgeQ(1)
+    } else if (plain && !shift && qEditable && event.key === Qt.Key_B && selectedOk()) {
+      bandBypassToggled(selectedIndex)
+    } else if (plain && !shift && qEditable && event.key === Qt.Key_S && selectedOk()) {
+      bandSoloToggled(selectedIndex)
+    } else if (plain && qEditable && event.key === Qt.Key_Delete && selectedOk()) {
+      bandRemoveRequested(selectedIndex)
     } else {
       event.accepted = false
     }
@@ -224,15 +301,60 @@ Item {
     if (selectedIndex >= bands.length) selectedIndex = -1
     repaint()
   }
+  onHandleGainsChanged: repaint()
   onPreampChanged: repaint()
   onSampleRateChanged: repaint()
-  onWidthChanged: repaint()
-  onHeightChanged: repaint()
+  onWidthChanged: { repaint(); backdrop.requestPaint() }
+  onHeightChanged: { repaint(); backdrop.requestPaint() }
   onDragIndexChanged: repaint()
   onHoverIndexChanged: repaint()
   onSelectedIndexChanged: repaint()
   onForegroundChanged: repaint()
   onAccentChanged: repaint()
+  onMinDbChanged: repaint()
+  onSpectrumChanged: {
+    backdropLevels = Model.easeLevels(backdropLevels, spectrum, 0.18)
+    backdrop.requestPaint()
+  }
+
+  // The spectrum behind the curve: a canvas of its own, so the curve is not
+  // repainted 40 times a second. Its scale is the helper's own relative one --
+  // it shows the shape of what is playing, so it carries no dB labels.
+  Canvas {
+    id: backdrop
+    anchors.fill: parent
+    onPaint: {
+      var ctx = getContext('2d')
+      ctx.reset()
+      var pts = Model.spectrumPoints(root.backdropLevels)
+      if (pts.length < 2) return
+      ctx.save()
+      ctx.beginPath()
+      ctx.rect(root.plotX, root.plotY, root.plotW, root.plotH)
+      ctx.clip()
+      var base = root.plotY + root.plotH
+      var top = root.plotH * 0.82
+      ctx.beginPath()
+      ctx.moveTo(root.xFor(pts[0].freq), base)
+      var prevX = root.xFor(pts[0].freq), prevY = base - pts[0].level * top
+      ctx.lineTo(prevX, prevY)
+      for (var i = 1; i < pts.length; i++) {
+        var x = root.xFor(pts[i].freq), y = base - pts[i].level * top
+        var mx = (prevX + x) / 2, my = (prevY + y) / 2
+        ctx.quadraticCurveTo(prevX, prevY, mx, my)
+        prevX = x; prevY = y
+      }
+      ctx.lineTo(prevX, prevY)
+      ctx.lineTo(prevX, base)
+      ctx.closePath()
+      var grad = ctx.createLinearGradient(0, root.plotY, 0, base)
+      grad.addColorStop(0, root.rgba(root.foreground, 0.10))
+      grad.addColorStop(1, root.rgba(root.foreground, 0.03))
+      ctx.fillStyle = grad
+      ctx.fill()
+      ctx.restore()
+    }
+  }
 
   Canvas {
     id: canvas
@@ -286,7 +408,6 @@ Item {
       Item {
         id: faderColumn
         required property int index
-        readonly property var band: root.bands[index]
         readonly property bool hot: fader.hot
 
         width: root.faderColumnWidth
@@ -321,6 +442,8 @@ Item {
           // on it exactly.
           anchors.top: parent.top
           anchors.topMargin: root.faderLabelH
+          minimum: -root.faderSpan
+          maximum: root.faderSpan
           gain: root.bandGainAt(index)
           foreground: root.foreground
           accent: root.accent
@@ -390,7 +513,8 @@ Item {
       var x = Math.round(xFor(gridFreqs[i])) + 0.5
       ctx.beginPath(); ctx.moveTo(x, plotY); ctx.lineTo(x, consoleBottom); ctx.stroke()
     }
-    for (var db = minDb + 6; db < maxDb; db += 6) {
+    var stepDb = span > 18 ? 10 : 6
+    for (var db = minDb + stepDb; db < maxDb; db += stepDb) {
       var y = Math.round(yFor(db)) + 0.5
       var zero = Math.abs(db) < 0.001
       // 0 dB is the reference everything is measured against, so it is the one
@@ -409,7 +533,8 @@ Item {
     ctx.font = caption + 'px ' + fontFamily
     ctx.textAlign = 'right'
     ctx.textBaseline = 'middle'
-    for (var db = minDb + 6; db < maxDb; db += 6) {
+    var stepDb = span > 18 ? 10 : 6
+    for (var db = minDb + stepDb; db < maxDb; db += stepDb) {
       var zero = Math.abs(db) < 0.001
       ctx.fillStyle = rgba(foreground, zero ? 0.75 : 0.42)
       ctx.fillText(zero ? '0' : (db > 0 ? '+' : '') + db, plotX - Style.space(6), yFor(db))
@@ -472,14 +597,14 @@ Item {
 
   // The band under the pointer, as its own bell. Ten octave bands overlap, so the
   // sum runs a dB or two above a band's own gain in the middle of a cluster; this
-  // is the line the handle sits on, and how much of the sum is its neighbours.
+  // is the band's own share of the line.
   function drawFocusBand(ctx, samples) {
     var index = dragIndex >= 0 ? dragIndex : hoverIndex
     if (index < 0 || index >= bands.length) return
     var b = bands[index]
-    if (!b) return
-    if (b.type !== undefined && !Model.typeHasGain(b.type)) return
-    if (Math.abs(Number(b.gain) || 0) < 0.05) return
+    if (!b || b.enabled === false) return
+    if (b.type !== undefined && !Model.typeHasGain(b.type) && !Model.typeHasSlope(b.type)) return
+    if (Model.typeHasGain(b.type || "peaking") && Math.abs(Number(b.gain) || 0) < 0.05) return
 
     var one = Model.responseSeries(Model.chainCoefficients([b], sampleRate),
                                    0, sampleRate, samples, minFreq, maxFreq)
@@ -551,16 +676,19 @@ Item {
     var numberSize = Math.max(8, Style.font.caption - 1)
     for (var i = 0; i < bands.length; i++) {
       var b = bands[i]
-      if (!b || b.enabled === false) continue
-      if (b.type !== undefined && !Model.typeHasGain(b.type)) continue
+      if (!b) continue
       var x = handleXFor(i)
       var y = handleYFor(i)
+      var bypassed = b.enabled === false
+      var gainType = handleHasGain(i)
       var dragging = (i === dragIndex)
       var hot = dragging || (i === hoverIndex && dragIndex < 0)
         || (activeFocus && i === selectedIndex && dragIndex < 0)
-      var shaped = Math.abs(bandGainAt(i)) >= 0.05
+      var shaped = gainType ? Math.abs(bandGainAt(i)) >= 0.05 : true
       var r = hot ? radius * 1.2 : radius
 
+      ctx.save()
+      if (bypassed && !hot) ctx.globalAlpha = 0.5
       if (hot) {
         ctx.beginPath()
         ctx.arc(x, y, r + Style.space(5), 0, Math.PI * 2)
@@ -568,34 +696,48 @@ Item {
         ctx.fill()
       }
       ctx.beginPath()
-      ctx.arc(x, y, r, 0, Math.PI * 2)
-      ctx.fillStyle = dragging ? accent : handleBorder
-      ctx.fill()
+      if (gainType) {
+        ctx.arc(x, y, r, 0, Math.PI * 2)
+      } else {
+        // A filter without a gain: a diamond on the 0 dB line, moved sideways.
+        var d = r * 1.15
+        ctx.moveTo(x, y - d); ctx.lineTo(x + d, y); ctx.lineTo(x, y + d); ctx.lineTo(x - d, y); ctx.closePath()
+      }
+      ctx.fillStyle = bypassed ? 'transparent' : (dragging ? accent : handleBorder)
+      if (!bypassed) ctx.fill()
       ctx.lineWidth = Math.max(1.5, Style.space(1.75))
+      if (bypassed) ctx.setLineDash([Style.space(2), Style.space(2)])
       ctx.strokeStyle = (shaped || hot) ? accent : rgba(foreground, 0.45)
       ctx.stroke()
+      ctx.setLineDash([])
 
       ctx.font = 'bold ' + numberSize + 'px ' + fontFamily
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
-      ctx.fillStyle = dragging ? handleBorder : (shaped || hot ? foreground : rgba(foreground, 0.6))
+      ctx.fillStyle = dragging && !bypassed ? handleBorder : (shaped || hot ? foreground : rgba(foreground, 0.6))
       ctx.fillText(String(i + 1), x, y + 0.5)
+      ctx.restore()
     }
     var readout = dragIndex >= 0 ? dragIndex : hoverIndex
     if (readout < 0 && activeFocus) readout = selectedIndex
     if (readout >= 0 && readout < bands.length) drawReadout(ctx, readout)
   }
 
-  // Floating tag with the band's frequency and gain, kept inside the plot.
+  // Floating tag with the band's frequency, Q (parametric) and gain, kept
+  // inside the plot.
   function drawReadout(ctx, index) {
-    var text = Model.formatFreq(bandFreqAt(index)) + ' Hz   ' + Model.formatGain(bandGainAt(index)) + ' dB'
+    var b = bands[index] || {}
+    var text = Model.formatFreq(bandFreqAt(index)) + ' Hz'
+    if (qEditable) text += '   Q ' + (Math.round(bandQAt(index) * 100) / 100)
+    if (handleHasGain(index)) text += '   ' + Model.formatGain(bandGainAt(index)) + ' dB'
+    if (b.enabled === false) text += '   off'
     var caption = Style.font.caption
     ctx.font = 'bold ' + caption + 'px ' + fontFamily
     var padX = Style.space(8)
     var boxH = caption + Style.space(10)
     var boxW = ctx.measureText(text).width + padX * 2
-    var hx = xFor(bandFreqAt(index))
-    var hy = yFor(bandGainAt(index))
+    var hx = handleXFor(index)
+    var hy = handleYFor(index)
     var gap = Style.space(16)
     var bx = Math.max(plotX + Style.space(4), Math.min(plotX + plotW - boxW - Style.space(4), hx - boxW / 2))
     var by = hy - gap - boxH
@@ -613,6 +755,26 @@ Item {
     ctx.fillText(text, bx + boxW / 2, by + boxH / 2 + 0.5)
   }
 
+  // ---- the drag -------------------------------------------------------------
+  // Relative to where the press landed, so grabbing a handle never makes it
+  // jump to the pointer. Shift is the fine mode -- 0.1 dB steps and a quarter of
+  // the pointer's travel -- and pressing or releasing it mid-drag re-anchors at
+  // the current values, so the change of scale makes no jump either.
+  property real anchorX: 0
+  property real anchorY: 0
+  property real anchorGain: 0
+  property real anchorFreq: 1000
+  property bool dragFine: false
+  property bool dragMoved: false
+  property real lastGain: 0
+  property real lastFreq: 1000
+
+  function anchorAt(x, y, fine) {
+    anchorX = x; anchorY = y
+    anchorGain = lastGain; anchorFreq = lastFreq
+    dragFine = fine
+  }
+
   MouseArea {
     id: mouse
     anchors.fill: parent
@@ -627,14 +789,12 @@ Item {
       // A press on the plot takes keyboard focus, so ←/→ ↑/↓ and 0 work next.
       root.forceActiveFocus()
       if (index < 0) return
-      // Read the band's frequency before dragIndex marks it as dragged: bandFreqAt()
-      // returns draftFreq for that band, so the old order read back the previous
-      // drag's frequency (0 on the first drag) and drew the handle at 1 kHz.
-      root.draftFreq = root.bandFreqAt(index)
+      root.lastGain = root.bandGainAt(index)
+      root.lastFreq = root.bandFreqAt(index)
+      root.anchorAt(m.x, m.y, (m.modifiers & Qt.ShiftModifier) !== 0)
+      root.dragMoved = false
       root.dragIndex = index
       root.selectedIndex = index
-      root.draftGain = root.snapGain(root.dbForY(m.y))
-      root.bandGainMoved(index, root.draftGain)
     }
 
     onPositionChanged: function(m) {
@@ -642,20 +802,48 @@ Item {
         root.hoverIndex = root.nearestBand(m.x, m.y)
         return
       }
-      root.draftGain = root.snapGain(root.dbForY(m.y))
-      if (root.freqEditable) root.draftFreq = root.snapFreq(root.freqForX(m.x))
-      root.bandGainMoved(root.dragIndex, root.draftGain)
+      var index = root.dragIndex
+      var fine = (m.modifiers & Qt.ShiftModifier) !== 0
+      if (fine !== root.dragFine) root.anchorAt(m.x, m.y, fine)
+      var scale = fine ? 0.25 : 1
+      if (root.handleHasGain(index)) {
+        var lim = root.gainLimitFor(index)
+        var ddb = -(m.y - root.anchorY) / root.plotH * (root.maxDb - root.minDb) * scale
+        var g = Math.max(-lim, Math.min(lim, root.snapGain(root.anchorGain + ddb, fine ? 0.1 : root.gainStep)))
+        g = Math.round(g * 10) / 10
+        if (g !== root.lastGain) {
+          root.lastGain = g
+          root.dragMoved = true
+          root.bandGainMoved(index, g)
+        }
+      }
+      if (root.freqEditable) {
+        var dlog = (m.x - root.anchorX) / root.plotW * Math.log(root.maxFreq / root.minFreq) * scale
+        var f = root.snapFreq(root.anchorFreq * Math.exp(dlog))
+        if (f !== root.lastFreq) {
+          root.lastFreq = f
+          root.dragMoved = true
+          root.bandFreqMoved(index, f)
+        }
+      }
       root.repaint()
     }
 
     onExited: if (root.dragIndex < 0) root.hoverIndex = -1
 
-    onReleased: {
+    // A drag the window lost (the panel closed under it) ends like a release.
+    onCanceled: finish()
+    onReleased: finish()
+
+    function finish() {
       if (root.dragIndex < 0) return
       var index = root.dragIndex
-      root.bandGainCommitted(index, root.draftGain)
-      if (root.freqEditable) root.bandFreqCommitted(index, root.draftFreq)
       root.dragIndex = -1
+      if (root.dragMoved) {
+        if (root.handleHasGain(index)) root.bandGainCommitted(index, root.lastGain)
+        if (root.freqEditable) root.bandFreqCommitted(index, root.lastFreq)
+      }
+      root.dragMoved = false
       root.repaint()
     }
 
@@ -664,14 +852,31 @@ Item {
       // Drop the drag the second press began, so its release cannot commit the
       // pressed position over the reset.
       root.dragIndex = -1
-      if (index >= 0) root.bandGainCommitted(index, 0)
+      root.dragMoved = false
+      if (index >= 0) {
+        if (root.handleHasGain(index)) root.bandGainCommitted(index, 0)
+      } else if (root.freqEditable && m.y >= root.plotY && m.y <= root.plotY + root.plotH) {
+        // Empty plot, parametric mode: a band where the pointer is.
+        var lim = 12
+        var g = Math.max(-lim, Math.min(lim, root.snapGain(root.dbForY(m.y))))
+        root.addBandRequested(root.snapFreq(root.freqForX(m.x)), g)
+      }
       root.repaint()
     }
 
-    // The plot never adjusts on the wheel; it scrolls the panel itself rather
-    // than trusting a declined event to reach the Flickable.
+    // The wheel over a selected handle (or any handle, with Alt) changes its
+    // Q, a sixth of an octave of bandwidth per notch; anywhere else it scrolls
+    // the panel, so a wheel crossing the plot never edits.
     onWheel: function(wheel) {
-      if (root.scrollBy) root.scrollBy(-wheel.angleDelta.y / 2)
+      var dy = Model.wheelDelta(wheel.angleDelta.x, wheel.angleDelta.y, wheel.modifiers)
+      var index = root.nearestBand(wheel.x, wheel.y)
+      if (root.qEditable && index >= 0
+          && Model.wheelOwns("handle", wheel.modifiers, index === root.selectedIndex && root.activeFocus, dy)) {
+        root.selectedIndex = index
+        root.bandQCommitted(index, Model.stepQ(root.bandQAt(index), dy > 0 ? 1 : -1))
+      } else if (root.scrollBy) {
+        root.scrollBy(-wheel.angleDelta.y / 2)
+      }
       wheel.accepted = true
     }
   }

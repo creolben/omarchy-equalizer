@@ -10,7 +10,13 @@ Item {
   property bool selected: false
   property bool hot: false
   property color foreground: "white"
+  property real fontSize: 12
+  property real horizontalPadding: 10
+  property real verticalPadding: 6
+  property bool focusable: false
+  property bool active: false
   signal clicked()
+  signal rightClicked()
   implicitWidth: 40
   implicitHeight: 24
 }
