@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """Live spectrum and beat track of the equalizer's output, for the panel's meter.
 
-Reads the equalizer sink's monitor with parec and prints one line per frame:
+Reads what the equalizer plays -- its own output stream, after the preamp, every
+band and the output stage -- with parec, and prints one line per frame:
 
     BEAT V1 V2 ... V24
 
 BEAT is 0 or an onset strength 1..100. V1..V24 are band levels 0..100, low
 frequencies first, log-spaced 40 Hz .. 11 kHz. The panel runs this only while
 it is open and the equalizer is on.
+
+The sink's monitor would be the wrong tap: it carries what the apps send INTO
+the equalizer, so the bars never showed the curve. The output stream is a sink
+input, which parec reads with --monitor-stream; when the graph is rebuilt the
+stream comes back under a new index, so a capture that ends is started again on
+the new one. Only when no output stream can be found does it fall back to the
+sink's monitor.
 
 Levels are decibels, not a raw magnitude: each band is placed on a 48 dB scale
 whose top sits a little above a slowly tracked loud level, so ordinary music
@@ -29,6 +37,7 @@ import math
 import signal
 import subprocess
 import sys
+import time
 
 RATE = 24000
 HOP = 600                 # 40 frames per second
@@ -59,10 +68,33 @@ for f in freqs:
 BASS = [i for i, f in enumerate(freqs) if f < 160]
 MAX_N = [max([b[1] for b in bands if b[0] == lv] or [0]) for lv in range(LEVELS)]
 
-proc = subprocess.Popen(
-    ["parec", "-d", SINK + ".monitor", "--format=float32le", "--rate=%d" % RATE,
-     "--channels=1", "--latency-msec=20"],
-    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+def output_stream():
+    """The sink-input index of the equalizer's own output stream, or None."""
+    try:
+        listing = subprocess.run(["pactl", "list", "sink-inputs"], capture_output=True,
+                                 text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    current = None
+    want = 'node.name = "%s.output"' % SINK
+    for line in listing.splitlines():
+        if line.startswith("Sink Input #"):
+            current = line[len("Sink Input #"):].strip()
+        elif want in line and current:
+            return current
+    return None
+
+
+def capture():
+    stream = output_stream()
+    source = ["--monitor-stream=%s" % stream] if stream else ["-d", SINK + ".monitor"]
+    return subprocess.Popen(
+        ["parec"] + source + ["--format=float32le", "--rate=%d" % RATE,
+                              "--channels=1", "--latency-msec=20"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+proc = capture()
 
 
 def stop(*_):
@@ -103,7 +135,12 @@ def push(level, samples):
 while True:
     chunk = proc.stdout.read1(HOP * 4)
     if not chunk:
-        break
+        # The stream went away (a rebuilt graph, a moved stream): start again on
+        # whatever is there now, a little later so a missing sink is not polled hot.
+        proc.wait()
+        time.sleep(1.0)
+        proc = capture()
+        continue
     pending += chunk
     usable = len(pending) - len(pending) % 4
     got = array.array("f")

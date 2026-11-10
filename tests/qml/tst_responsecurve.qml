@@ -1,12 +1,19 @@
 import QtQuick
 import QtTest
 import "../.."
+import "../../Model.js" as Model
 
 // ResponseCurve, offscreen against the shell-kit stand-ins in tests/qml/imports.
 //
 // - GitHub issue #3: the first drag of a band drew its handle at the 1 kHz
 //   fallback, because the press marked the band as dragged before reading its
 //   frequency. The handle must stay on the band's own frequency.
+// - The handle and the line come from one array: during a drag (the scene
+//   echoes every move into it, as the panel does) the handle sits on the
+//   curve, and after the release it stays where it was let go.
+// - Parametric gestures: a double-click on empty plot adds a band there, a
+//   pass filter's handle moves sideways only, the wheel over the selected
+//   handle sets its Q, and a band outside ±12 dB is never clamped by a touch.
 // - The graphic-mode faders sit inside the plot's area; a press on one must
 //   reach the fader (drag, focus for the wheel arm), not the plot.
 // - Keyboard: ←/→ select a handle, ↑/↓ move it 0.5 dB, 0 resets it; every
@@ -20,7 +27,22 @@ Item {
 
   property var moved: []
   property var committed: []
+  property var freqMoved: []
+  property var freqCommitted: []
+  property var qCommitted: []
+  property var added: []
   property var passedKeys: []
+  // When set, the scene echoes moves back into the curve's bands like the panel.
+  property bool echo: false
+
+  function echoed(i, key, v) {
+    var next = curve.bands.slice()
+    var b = {}
+    for (var k in next[i]) b[k] = next[i][k]
+    b[key] = v
+    next[i] = b
+    curve.bands = next
+  }
 
   readonly property var tenBands: [
     { freq: 31, gain: 4, q: 1.41 },  { freq: 62, gain: 2, q: 1.41 },
@@ -46,8 +68,12 @@ Item {
       editable: true
       showFaders: true
       bands: scene.tenBands
-      onBandGainMoved: function(i, g) { scene.moved = scene.moved.concat([[i, g]]) }
-      onBandGainCommitted: function(i, g) { scene.committed = scene.committed.concat([[i, g]]) }
+      onBandGainMoved: function(i, g) { scene.moved = scene.moved.concat([[i, g]]); if (scene.echo) scene.echoed(i, "gain", g) }
+      onBandGainCommitted: function(i, g) { scene.committed = scene.committed.concat([[i, g]]); if (scene.echo) scene.echoed(i, "gain", g) }
+      onBandFreqMoved: function(i, f) { scene.freqMoved = scene.freqMoved.concat([[i, f]]); if (scene.echo) scene.echoed(i, "freq", f) }
+      onBandFreqCommitted: function(i, f) { scene.freqCommitted = scene.freqCommitted.concat([[i, f]]); if (scene.echo) scene.echoed(i, "freq", f) }
+      onBandQCommitted: function(i, q) { scene.qCommitted = scene.qCommitted.concat([[i, q]]) }
+      onAddBandRequested: function(f, g) { scene.added = scene.added.concat([[f, g]]) }
     }
   }
 
@@ -57,13 +83,18 @@ Item {
 
     function init() {
       curve.bands = scene.tenBands
+      curve.handleGains = []
       curve.showFaders = true
       curve.freqEditable = false
       curve.dragIndex = -1
       curve.selectedIndex = -1
-      curve.draftFreq = 0
+      scene.echo = false
       scene.moved = []
       scene.committed = []
+      scene.freqMoved = []
+      scene.freqCommitted = []
+      scene.qCommitted = []
+      scene.added = []
       scene.passedKeys = []
       catcher.forceActiveFocus()
     }
@@ -115,6 +146,117 @@ Item {
       mouseDoubleClickSequence(curve, hx, hy)
       compare(scene.committed[scene.committed.length - 1], [2, 0], "the reset is the last commit")
       compare(curve.dragIndex, -1)
+    }
+
+    function test_bypassedBandKeepsAHollowHandle() {
+      // A bypassed band shapes nothing, but it can still be selected and moved:
+      // that is how it is tuned before it is switched back on.
+      var bands = []
+      for (var i = 0; i < scene.tenBands.length; i++) {
+        var b = {}
+        for (var k in scene.tenBands[i]) b[k] = scene.tenBands[i][k]
+        if (i === 3) b.enabled = false
+        bands.push(b)
+      }
+      curve.bands = bands
+      verify(curve.hasHandle(3), "a bypassed band keeps its handle")
+      compare(curve.nearestBand(curve.handleXFor(3), curve.handleYFor(3)), 3, "and it can be grabbed")
+    }
+
+    function test_theHandleRidesTheLineDuringADrag() {
+      // Parametric: one band, so the line at its frequency is its own gain.
+      curve.showFaders = false
+      curve.freqEditable = true
+      curve.bands = [{ type: "peaking", freq: 1000, gain: 0, q: 1 }]
+      scene.echo = true
+      var hx = curve.handleXFor(0), hy = curve.handleYFor(0)
+      mousePress(curve, hx, hy)
+      mouseMove(curve, hx + 30, hy - 40)
+      verify(scene.moved.length > 0 && scene.freqMoved.length > 0, "the drag moved gain and frequency")
+      var g = Number(curve.bands[0].gain)
+      verify(g > 0, "dragging up boosts")
+      fuzzyCompare(curve.handleYFor(0), curve.yFor(g), 0.001, "the handle is drawn at the echoed gain")
+      var series = Model.responseSeries(Model.chainCoefficients(curve.bands, 48000), 0, 48000, 2,
+                                        curve.bands[0].freq, curve.bands[0].freq * 1.0001)
+      fuzzyCompare(series[0], g, 0.01, "and the line passes through it at the band's frequency")
+      mouseRelease(curve, hx + 30, hy - 40)
+      compare(scene.freqCommitted.length, 1, "the release commits the frequency once")
+      var f = scene.freqCommitted[0][1]
+      fuzzyCompare(curve.handleXFor(0), curve.xFor(f), 0.001, "after the release the handle stays where it was let go")
+      compare(scene.committed[scene.committed.length - 1][1], g, "and the gain it was let go at")
+    }
+
+    function test_aPressWithoutAMoveCommitsNothing() {
+      curve.showFaders = false
+      curve.freqEditable = true
+      curve.bands = [{ type: "peaking", freq: 1000, gain: -15, q: 1 }]
+      var hx = curve.handleXFor(0), hy = curve.handleYFor(0)
+      mousePress(curve, hx + 3, hy + 3)
+      mouseRelease(curve, hx + 3, hy + 3)
+      compare(scene.committed.length, 0, "a touch is not an edit")
+      compare(scene.moved.length, 0, "and the handle did not jump to the pointer")
+      // An imported -15 dB cut is outside ±12, so its range is ±24, not a clamp.
+      keyClick(Qt.Key_Up)
+      compare(scene.committed[scene.committed.length - 1], [0, -14.5], "a nudge from -15 keeps it near -15")
+    }
+
+    function test_doubleClickOnEmptyPlotAddsABand() {
+      curve.showFaders = false
+      curve.freqEditable = true
+      curve.bands = [{ type: "peaking", freq: 100, gain: 0, q: 1 }]
+      var x = curve.xFor(3000), y = curve.yFor(6)
+      mouseDoubleClickSequence(curve, x, y)
+      compare(scene.added.length, 1, "one band is asked for")
+      verify(Math.abs(scene.added[0][0] - 3000) < 40, "at the pointer's frequency: " + scene.added[0][0])
+      compare(scene.added[0][1], 6, "and its gain")
+      // Graphic mode has no free frequency, so it adds nothing.
+      curve.freqEditable = false
+      curve.showFaders = true
+      curve.bands = scene.tenBands
+      mouseDoubleClickSequence(curve, curve.xFor(90), curve.yFor(-15))
+      compare(scene.added.length, 1, "graphic mode does not add bands")
+    }
+
+    function test_aPassFilterHandleMovesSidewaysOnly() {
+      curve.showFaders = false
+      curve.freqEditable = true
+      curve.bands = [{ type: "highpass", freq: 80, gain: 0, q: 0.707 }]
+      verify(!curve.handleHasGain(0), "a high-pass has no gain to set")
+      compare(curve.handleYFor(0), curve.yFor(0), "its handle sits on the 0 dB line")
+      var hx = curve.handleXFor(0), hy = curve.handleYFor(0)
+      mousePress(curve, hx, hy)
+      mouseMove(curve, hx + 40, hy - 50)
+      mouseRelease(curve, hx + 40, hy - 50)
+      compare(scene.moved.length, 0, "no gain is sent")
+      verify(scene.freqMoved.length > 0 && scene.freqMoved[scene.freqMoved.length - 1][1] > 80, "the corner moved up")
+    }
+
+    function test_theWheelOverTheSelectedHandleSetsItsQ() {
+      curve.showFaders = false
+      curve.freqEditable = true
+      curve.bands = [{ type: "peaking", freq: 1000, gain: 6, q: 1.41 }]
+      var hx = curve.handleXFor(0), hy = curve.handleYFor(0)
+      // Not selected yet: the wheel is the panel's.
+      mouseWheel(curve, hx, hy, 0, 120)
+      compare(scene.qCommitted.length, 0, "an unselected handle does not take the wheel")
+      mouseClick(curve, hx, hy)
+      compare(curve.selectedIndex, 0)
+      mouseWheel(curve, hx, hy, 0, 120)
+      compare(scene.qCommitted.length, 1, "the selected handle does")
+      compare(scene.qCommitted[0][1], Model.stepQ(1.41, 1), "one notch narrows it a sixth of an octave")
+      keyClick(Qt.Key_BracketLeft)
+      compare(scene.qCommitted[scene.qCommitted.length - 1][1], Model.stepQ(1.41, -1), "[ widens it")
+    }
+
+    function test_graphicHandlesShowTheResponse() {
+      // The panel hands the response at each centre; the handles sit there.
+      var shown = [5, 4, 3, 2, 1, 0, -1, -2, -3, -4]
+      curve.handleGains = shown
+      fuzzyCompare(curve.handleYFor(0), curve.yFor(5), 0.001, "band 1's handle is at its response")
+      compare(curve.bandGainAt(9), -4)
+      mouseClick(curve, curve.xFor(700), curve.yFor(-15))
+      keyClick(Qt.Key_Up)
+      compare(scene.committed[scene.committed.length - 1], [0, 5.5], "a nudge steps from the response shown")
     }
 
     function test_keyboardSelectsNudgesAndResets() {
