@@ -598,16 +598,19 @@ run enable >/dev/null
 export PACTL_DEFAULT_SINK=omarchy_equalizer
 export PACTL_LOG="$T/pactl-follow.log"; : >"$PACTL_LOG"
 export PACTL_EQ_AIM=drifted PACTL_EQ_AIM_SINK_ID=1   # the stream never stays put
-export PACTL_SUBSCRIBE_COUNT=6
+# Events a second apart: one that lands while the pass before it is still
+# running must not fall into the next one's 0.4 s drain, however slow the
+# machine (at 0.5 s a pass over 0.2 s swallowed one on the CI runner).
+export PACTL_SUBSCRIBE_COUNT=6 PACTL_SUBSCRIBE_GAP=1
 out="$(run follow)"
-# Start + 4 events = 5 passes, then the backoff; the 2 events that arrive during
-# it are drained as one pass.
+# Start + 4 events = 5 passes, then the 2 s backoff; the 2 events that arrive
+# during it are drained as one pass.
 check "events during the backoff coalesce into one pass" "6" \
   "$(grep -c 'move-sink-input 99 bluez_output.12_34_56_78_9A.BC' "$PACTL_LOG")"
 check "a stream that keeps drifting is logged" "1" "$(grep -c 'keeps drifting; backing off' <<<"$out")"
 check "each convergence move is logged" "6" "$(grep -c 'moving it to bluez_output' <<<"$out")"
 run disable >/dev/null
-unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG PACTL_SUBSCRIBE_COUNT
+unset PACTL_DEFAULT_SINK PACTL_DEVICE_SINK PACTL_EQ_AIM PACTL_EQ_AIM_SINK_ID PACTL_LOG PACTL_SUBSCRIBE_COUNT PACTL_SUBSCRIBE_GAP
 
 echo "== routing: a vanished target adopts the sink WirePlumber chose, not listing order =="
 run disable >/dev/null
