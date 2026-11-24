@@ -19,7 +19,8 @@ import qs.Ui
 // `value` is the model's current text. The field follows it while it is not
 // being edited; `text` holds what the user typed. Typing emits textEdited();
 // Return emits accepted(); leaving the field emits editingFinished(); Escape
-// restores the model's text and emits cancelled().
+// restores the model's text and emits cancelled(). A `steppable` field turns
+// ↑/↓ into stepRequested(+1/-1), for a number to be nudged in place.
 Item {
   id: root
 
@@ -36,13 +37,16 @@ Item {
   property real verticalPadding: Style.spacing.inputPaddingY
   property string fontFamily: Style.font.family
   property real fontSize: Style.font.body
+  property bool steppable: false
 
   signal textEdited()
   signal accepted()
   signal editingFinished()
   signal cancelled()
+  signal stepRequested(int direction)
 
   readonly property bool _hot: mouse.containsMouse
+  readonly property bool hovered: mouse.containsMouse
   readonly property var _borderSpec: Border.controlSpec(activeFocus ? "focus" : (_hot ? "hover-cursor" : "normal"), root.foreground, root.accent)
 
   // Typed text from a key event, or "" for anything that is not plain input.
@@ -83,6 +87,9 @@ Item {
       // Only accepted(); the focus-loss path emits editingFinished(), and one
       // commit per gesture is what the callers' backends expect.
       root.accepted()
+      event.accepted = true
+    } else if (root.steppable && (event.key === Qt.Key_Up || event.key === Qt.Key_Down)) {
+      root.stepRequested(event.key === Qt.Key_Up ? 1 : -1)
       event.accepted = true
     } else if (event.key === Qt.Key_Escape) {
       root.edit(root.value)

@@ -164,6 +164,12 @@ Item {
       root.dragging = false
       root.released(root.liveValue)
     }
+    // A drag the window lost ends like a release.
+    onCanceled: {
+      if (!root.dragging) return
+      root.dragging = false
+      root.released(root.liveValue)
+    }
     onWheel: function(wheel) {
       // Never rely on a declined wheel reaching the Flickable: accept it either
       // way, and scroll ourselves when the policy says the wheel is not ours.

@@ -68,8 +68,11 @@ Item {
     return Math.max(minimum, Math.min(maximum, Math.round(raw / step) * step))
   }
 
+  // On the step grid: a fitted fader can read +7.4, and the next step up from
+  // there lands on +8.0, not on +7.9.
   function nudge(delta) {
-    var next = Math.max(minimum, Math.min(maximum, liveGain + delta))
+    var size = Number(step) > 0 ? Number(step) : 0.5
+    var next = Math.max(minimum, Math.min(maximum, Math.round((liveGain + delta) / size) * size))
     liveGain = next
     root.gainMoved(next)
     root.gainCommitted(next)
@@ -216,6 +219,12 @@ Item {
       root.gainMoved(next)
     }
     onReleased: {
+      if (!root.dragging) return
+      root.dragging = false
+      root.gainCommitted(root.liveGain)
+    }
+    // A drag the window lost ends like a release.
+    onCanceled: {
       if (!root.dragging) return
       root.dragging = false
       root.gainCommitted(root.liveGain)

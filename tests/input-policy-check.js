@@ -5,6 +5,7 @@
 //           is never a deliberate edit; the panel scrolls instead)
 //   fader   owns it only when focused (a click aimed at it) or when Alt is held
 //           (declared intent); otherwise the panel scrolls
+//   handle  the same, for a handle's Q on the curve: the selected handle, or Alt
 //
 // The rule is a pure function in Model.js so these cases can run without Qt.
 // tests/run-tests.sh runs this file and also checks that the panel uses the
@@ -66,7 +67,15 @@ check('fader, Shift+Ctrl+Meta without Alt: unarmed',
 check('fader, Alt combined with another modifier: armed',
   model.wheelOwns('fader', ALT | SHIFT, false), true);
 
-// 7. The delta a fader acts on: vertical first; with Alt held, a wheel the
+// 7. A handle on the curve follows the fader's rule: its Q takes the wheel
+// only when it is the selected handle, or with Alt.
+check('handle not selected, no modifier: the wheel scrolls', model.wheelOwns('handle', 0, false, 120), false);
+check('handle selected, no modifier: the wheel sets its Q', model.wheelOwns('handle', 0, true, 120), true);
+check('handle not selected, Alt held: the wheel sets its Q', model.wheelOwns('handle', ALT, false, -120), true);
+check('handle selected, zero delta: nobody\'s edit', model.wheelOwns('handle', 0, true, 0), false);
+check('handle, Shift alone: the wheel scrolls', model.wheelOwns('handle', SHIFT, false, 120), false);
+
+// 8. The delta a fader acts on: vertical first; with Alt held, a wheel the
 // platform turned horizontal still counts, so Alt can always arm.
 check('wheelDelta: vertical delta passes through', model.wheelDelta(0, -120, 0), -120);
 check('wheelDelta: vertical wins over horizontal', model.wheelDelta(60, 120, ALT), 120);

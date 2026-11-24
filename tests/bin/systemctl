@@ -5,4 +5,10 @@ printf "%s\n" "$*" >> "$SYSTEMCTL_LOG"
 if [[ -n ${SYSTEMCTL_RESTART_FAILS:-} && " $* " == *" restart "* ]]; then
   : >"$SYSTEMCTL_RESTART_FAILS"
 fi
+# SYSTEMCTL_PARKED_SNAPSHOT names a file a restart copies the parked-stream record
+# into, so a test can see what was on disk at the moment the restart began.
+if [[ -n ${SYSTEMCTL_PARKED_SNAPSHOT:-} && " $* " == *" restart "* ]]; then
+  cat "$XDG_STATE_HOME/omarchy-equalizer/parked-streams" >"$SYSTEMCTL_PARKED_SNAPSHOT" 2>/dev/null ||
+    printf 'none\n' >"$SYSTEMCTL_PARKED_SNAPSHOT"
+fi
 exit 0

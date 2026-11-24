@@ -158,6 +158,13 @@ Item {
       root.released(root.liveValue)
       root.liveValue = root.value
     }
+    // A drag the window lost ends like a release.
+    onCanceled: {
+      if (!root.dragging) return
+      root.dragging = false
+      root.released(root.liveValue)
+      root.liveValue = root.value
+    }
     onWheel: function(wheel) {
       // A horizontal control under a vertical wheel is never a deliberate edit:
       // the policy always declines "preamp", so the wheel belongs to the panel.
